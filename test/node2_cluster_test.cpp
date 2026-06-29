@@ -124,7 +124,7 @@ int main() {
     // ── propose one block; every node signs + broadcasts its ACCEPT vote ───────
     const VotePosition pos = make_pos(0x42, 1);
     for (auto& h : hosts) h->submit(pos);
-    for (auto& h : hosts) h->poll(pos, /*yes=*/5, /*total=*/5);
+    for (int r = 0; r < 4; ++r) for (auto& h : hosts) h->poll(pos, 5, 5);  // beta confirmation rounds
 
     // Decisive: each node now holds ONLY its own vote (self-echo) → NOT final.
     for (std::uint32_t i = 0; i < kN; ++i)
