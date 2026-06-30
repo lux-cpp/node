@@ -25,6 +25,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Sanitizer for node2's + consensus2's OWN code (NOT the reused blst/bls assembly
+# crypto). TSan here is load-bearing: the mesh setup is multi-threaded and the gate
+# mutex is exercised across threads. Usage: -DNODE2_SANITIZE=thread  (or address,undefined)
+set(NODE2_SANITIZE "" CACHE STRING "Sanitizer for node2+consensus2 code (e.g. thread | address,undefined)")
+# Propagate to the consensus2 subdir so the reused gate is instrumented to match,
+# while blst/bls_signature stay clean (consensus2 scopes it the same way).
+if (NODE2_SANITIZE AND NOT CONSENSUS2_SANITIZE)
+  set(CONSENSUS2_SANITIZE "${NODE2_SANITIZE}" CACHE STRING "" FORCE)
+endif()
+
 # Locate the reused luxcpp assets (default: the parent of this dir).
 get_filename_component(_default_luxcpp "${CMAKE_SOURCE_DIR}/.." ABSOLUTE)
 set(LUXCPP_ROOT      "${_default_luxcpp}"                      CACHE PATH "luxcpp checkout root")
@@ -68,3 +78,19 @@ add_executable(node2_cluster_test test/node2_cluster_test.cpp)
 target_link_libraries(node2_cluster_test PRIVATE node2)
 target_compile_options(node2_cluster_test PRIVATE -Wall -Wextra)
 add_test(NAME node2_cluster COMMAND node2_cluster_test)
+
+# over-the-wire liveness: down + wedged-but-present validators routed around
+add_executable(node2_liveness_test test/node2_liveness_test.cpp)
+target_link_libraries(node2_liveness_test PRIVATE node2)
+target_compile_options(node2_liveness_test PRIVATE -Wall -Wextra)
+add_test(NAME node2_liveness COMMAND node2_liveness_test)
+
+# Apply NODE2_SANITIZE to node2's own targets only (the consensus2 subdir scopes
+# its own; blst/bls stay clean). One place for the whole node2 surface.
+if (NODE2_SANITIZE)
+    set(_n2_san -fsanitize=${NODE2_SANITIZE} -fno-omit-frame-pointer)
+    foreach(_t node2 node2d frame_reader_test node2_cluster_test node2_liveness_test)
+        target_compile_options(${_t} PRIVATE ${_n2_san})
+        target_link_options(${_t} PRIVATE ${_n2_san})
+    endforeach()
+endif()

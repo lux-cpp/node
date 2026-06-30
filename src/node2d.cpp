@@ -105,11 +105,18 @@ int main(int argc, char** argv) {
     pos.epoch  = 1;
 
     host.submit(pos);
-    host.poll(pos, /*yes=*/5, /*total=*/5);  // sign + broadcast our ACCEPT vote
 
+    // Drive the wave to its β-confirmed decision: WaveConfig.beta consecutive
+    // α-supermajority rounds are required before the node signs (consensus2 red
+    // C1 — a node never votes on a single transient round). poll() is idempotent
+    // once the slot is committed, so calling it every loop iteration both reaches
+    // β and is a no-op afterwards. The earlier single poll() left wave at
+    // confidence 1 with beta=4 ⇒ the node never voted ⇒ the cluster never
+    // finalized (caught only by scripts/cluster_5.sh, not the in-binary test).
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms);
     while (!host.isFinal(pos.block_id)) {
-        host.pump();
+        host.poll(pos, /*yes=*/5, /*total=*/5);  // β-confirmation rounds → sign+broadcast once decided
+        host.pump();                             // drain peers' votes into the gate
         if (std::chrono::steady_clock::now() >= deadline) {
             std::printf("node %ld: NOT FINAL before deadline\n", index);
             return 1;
