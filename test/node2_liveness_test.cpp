@@ -60,7 +60,7 @@ Key make_key(std::uint8_t tag) {
     return k;
 }
 VotePosition make_pos(std::uint8_t tag, std::uint64_t h) {
-    VotePosition p{}; p.block_id.fill(tag); p.height = h; p.epoch = 1; return p;
+    VotePosition p{}; p.block_id.fill(tag); p.height = h; return p;
 }
 
 // The shared validator set (all 5 validators, whether or not their host runs).
@@ -76,7 +76,6 @@ std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
     cfg.validators = g_set;
     cfg.alpha      = kAlpha;
     cfg.wave       = WaveConfig{5, 0.8, 4};
-    cfg.epoch      = 1;
     return std::make_unique<Node2Host>(std::move(cfg));
 }
 

@@ -106,7 +106,7 @@ int main() {
 
         HostConfig cfg;
         cfg.index = 1; cfg.port = 0; cfg.sk = k1.sk; cfg.pk = k1.pk;
-        cfg.validators = set; cfg.alpha = 2; cfg.wave = WaveConfig{5, 0.8, 4}; cfg.epoch = 1;
+        cfg.validators = set; cfg.alpha = 2; cfg.wave = WaveConfig{5, 0.8, 4};
         Node2Host host(std::move(cfg));
         host.listen_bind();
 

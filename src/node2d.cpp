@@ -81,7 +81,6 @@ int main(int argc, char** argv) {
     cfg.validators = set;
     cfg.alpha      = std::uint32_t(alpha);
     cfg.wave       = WaveConfig{5, 0.8, 4};
-    cfg.epoch      = 1;
 
     Node2Host host(std::move(cfg));
     const std::uint16_t port = host.listen_bind();
@@ -102,7 +101,6 @@ int main(int argc, char** argv) {
     VotePosition pos{};
     pos.block_id.fill(0x42);
     pos.height = 1;
-    pos.epoch  = 1;
 
     host.submit(pos);
 
