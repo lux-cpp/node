@@ -46,7 +46,6 @@ struct HostConfig {
     std::vector<lux::consensus2::Validator>    validators;  // the full, agreed validator set
     std::uint32_t                              alpha;       // distinct-voter floor (gate)
     lux::consensus2::WaveConfig                wave;        // liveness/voting committee config
-    std::uint64_t                              epoch;       // bound into each vote's message
 };
 
 class Node2Host {
