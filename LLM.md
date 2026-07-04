@@ -2,7 +2,7 @@
 
 `node2` hosts the **consensus2** engine and disseminates its votes over a **full
 mesh of real TCP sockets**, framed by the canonical **ZAP** wire codec. It is the
-live-mesh step beyond `consensus2-seed`'s socketpair test: N validators, each on a
+live-mesh step beyond `consensus2`'s socketpair test: N validators, each on a
 real loopback listener, dial each other and independently reach BLS quorum-cert
 finality over the wire.
 
@@ -18,10 +18,10 @@ finality over the wire.
   reassembler  FrameReader        NEW  include/.../frame_reader.hpp (header-only)
                                        the ONE place that knows non-blocking framing:
                                        reassembles ZAP frames from recv(MSG_DONTWAIT).
-  codec/wire   encode/decode_vote REUSE consensus2-seed/.../zap/vote_codec.hpp
+  codec/wire   encode/decode_vote REUSE consensus2/.../zap/vote_codec.hpp
                Writer/Reader/           zap-cpp-core/.../zap/wire.hpp
                write_frame_locked
-  consensus    Node / Wave /      REUSE consensus2-seed (the gate, unmodified)
+  consensus    Node / Wave /      REUSE consensus2 (the gate, unmodified)
                QuorumCertEngine
   crypto       cevm::crypto::bls  REUSE crypto/bls/cpp + blst
 ```
@@ -56,7 +56,7 @@ required by `write_frame_locked` (uncontended here).
 ## Build & test (on spark; links the reused checkout, no vendoring)
 
 ```
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # auto-finds ../{consensus2-seed,zap-cpp-core,blst,crypto}
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # auto-finds ../{consensus2,zap-cpp-core,blst,crypto}
 cmake --build build -j
 ctest --test-dir build --output-on-failure       # frame_reader + node2_cluster (+ reused suite)
 ./scripts/cluster_5.sh build/node2d 19310         # 5 real PROCESSES over loopback TCP

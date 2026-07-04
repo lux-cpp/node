@@ -5,14 +5,14 @@
 # real TCP sockets. Layering (each layer below is REUSED unmodified):
 #
 #   blst → bls_signature (cevm::crypto::bls) → consensus2 (the gate + Node)
-#     [all three built by consensus2-seed/CMakeLists, added as a subdirectory]
+#     [all three built by consensus2/CMakeLists, added as a subdirectory]
 #   lux::zap wire codec (zap-cpp-core, header-only)
 #     ──────────────────────── NEW in node2 ────────────────────────
 #   FrameReader (non-blocking reassembler, header-only)
 #   MeshVoteTransport (VoteTransport over N TCP sockets, header-only)
 #   Node2Host (listen/accept/dial mesh + drive the Node)   ← the one .cpp
 #
-# Reused checkout layout (NOT vendored): ${LUXCPP_ROOT}/{consensus2-seed,zap-cpp-core,blst,crypto}.
+# Reused checkout layout (NOT vendored): ${LUXCPP_ROOT}/{consensus2,zap-cpp-core,blst,crypto}.
 
 cmake_minimum_required(VERSION 3.20)
 project(node2 LANGUAGES C CXX ASM)
@@ -38,7 +38,7 @@ endif()
 # Locate the reused luxcpp assets (default: the parent of this dir).
 get_filename_component(_default_luxcpp "${CMAKE_SOURCE_DIR}/.." ABSOLUTE)
 set(LUXCPP_ROOT      "${_default_luxcpp}"                      CACHE PATH "luxcpp checkout root")
-set(CONSENSUS2_DIR   "${LUXCPP_ROOT}/consensus2-seed"          CACHE PATH "consensus2 seed source dir")
+set(CONSENSUS2_DIR   "${LUXCPP_ROOT}/consensus2"               CACHE PATH "consensus2 source dir")
 set(ZAP_DIR          "${LUXCPP_ROOT}/zap-cpp-core/include"     CACHE PATH "zap-cpp-core include root")
 
 foreach(_p "${CONSENSUS2_DIR}/CMakeLists.txt" "${ZAP_DIR}/lux/zap/wire.hpp")
@@ -50,7 +50,7 @@ endforeach()
 
 find_package(Threads REQUIRED)
 
-# ── Reuse consensus2-seed's build (brings the blst / bls_signature / consensus2
+# ── Reuse consensus2's build (brings the blst / bls_signature / consensus2
 #    targets with correct include + link propagation). One build definition for
 #    the reused layers — no duplication here.
 add_subdirectory("${CONSENSUS2_DIR}" consensus2-build)
