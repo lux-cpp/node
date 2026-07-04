@@ -65,7 +65,6 @@ VotePosition make_pos(std::uint8_t tag, std::uint64_t h) {
     VotePosition p{};
     p.block_id.fill(tag);
     p.height = h;
-    p.epoch  = 1;
     return p;
 }
 
@@ -93,7 +92,6 @@ int main() {
         cfg.validators = set;
         cfg.alpha      = kAlpha;
         cfg.wave       = WaveConfig{5, 0.8, 4};  // threshold int(5*0.8)=4: poll(5,5) triggers a vote
-        cfg.epoch      = 1;
         hosts.push_back(std::make_unique<Node2Host>(std::move(cfg)));
         ports[i] = hosts[i]->listen_bind();
         std::printf("  node %u  listening on 127.0.0.1:%u\n", i, ports[i]);

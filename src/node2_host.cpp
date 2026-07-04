@@ -55,7 +55,7 @@ Node2Host::Node2Host(HostConfig cfg) : cfg_(std::move(cfg)) {
 
     node_ = std::make_unique<lux::consensus2::Node>(
         cfg_.index, cfg_.sk, cfg_.pk, cfg_.validators,
-        cfg_.alpha, cfg_.wave, cfg_.epoch, *mesh_);
+        cfg_.alpha, cfg_.wave, *mesh_);
 }
 
 Node2Host::~Node2Host() {
