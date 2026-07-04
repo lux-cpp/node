@@ -13,7 +13,9 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>  // TCP_NODELAY
+#include <poll.h>         // poll — bound the accept wait
 #include <sys/socket.h>
+#include <sys/time.h>     // timeval — SO_RCVTIMEO on the handshake
 #include <unistd.h>
 
 namespace lux::node2 {
@@ -86,9 +88,23 @@ std::uint16_t Node2Host::listen_bind() {
     return cfg_.port;
 }
 
-int Node2Host::accept_one() {
+int Node2Host::accept_one(int deadline_ms) {
+    // Bound the wait: the DAG no-deadlock argument assumes every lower-index peer
+    // actually dials. If one crashed before dialing, a bare blocking accept() would
+    // hang this node forever. poll() the listen fd so a missing dialer fails the
+    // mesh gracefully (caller aborts) instead of wedging it.
+    pollfd pfd{listen_fd_, POLLIN, 0};
+    const int pr = ::poll(&pfd, 1, deadline_ms);
+    if (pr <= 0) return -1;  // timeout (0) or error (<0) → give up on this inbound
+
     const int fd = ::accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) return -1;
+
+    // Bound the handshake read too: a peer that connects then stalls before sending
+    // its 4 index bytes must not hang us. SO_RCVTIMEO makes read_exact's recv return
+    // EAGAIN (which read_exact treats as failure) once the deadline elapses.
+    const timeval tv{deadline_ms / 1000, (deadline_ms % 1000) * 1000};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
     // Consume the dialer's 4-byte index handshake so the ZAP frame stream that
     // follows is clean. (We accept the value for symmetry/observability; routing
@@ -96,6 +112,11 @@ int Node2Host::accept_one() {
     std::uint8_t hdr[4];
     if (!lux::zap::read_exact(fd, hdr, sizeof hdr)) { ::close(fd); return -1; }
     (void)get_u32_be(hdr);
+
+    // Restore an unbounded blocking read: from here the fd carries the ZAP stream
+    // and its blocking writes/reads must not be cut short by the handshake deadline.
+    const timeval none{0, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof none);
 
     set_nodelay(fd);
     return fd;
@@ -141,7 +162,7 @@ bool Node2Host::connect_mesh(const std::map<std::uint32_t, PeerAddr>& peers, int
     // (rooted at index 0, which only dials) progresses. No deadlock — the wait-for
     // relation (i waits on j<i) is a DAG.
     for (std::size_t k = 0; k < inbound; ++k) {
-        const int fd = accept_one();
+        const int fd = accept_one(deadline_ms);
         if (fd < 0) return false;
         mesh_->add_peer(fd);
     }

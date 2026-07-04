@@ -90,9 +90,10 @@ public:
     std::size_t   peer_count() const noexcept { return mesh_->peer_count(); }
 
 private:
-    // accept one inbound peer: accept() + read its 4-byte BE index handshake +
-    // TCP_NODELAY. Returns the connected fd, or -1 on error.
-    int accept_one();
+    // accept one inbound peer: poll(deadline_ms) + accept() + read its 4-byte BE
+    // index handshake (also deadline-bounded) + TCP_NODELAY. Returns the connected
+    // fd, or -1 on timeout/error so a missing dialer fails the mesh, not hangs it.
+    int accept_one(int deadline_ms);
     // dial one peer: connect() with retry to `deadline_ms` + write our 4-byte BE
     // index handshake + TCP_NODELAY. Returns the connected fd, or -1 on failure.
     int dial_one(const PeerAddr& a, int deadline_ms);
