@@ -93,6 +93,11 @@ public:
     // blocking (MSG_DONTWAIT keeps the fd itself blocking — so writes elsewhere
     // stay robust — while this read returns immediately when the socket is dry).
     Drain drain_fd(int fd) {
+        // Once an oversize length has latched error(), the stream is unusable and
+        // MUST NOT keep growing buf_ — otherwise the MaxMessageSize guard in next()
+        // is defeated (a peer streams past a bogus header → unbounded allocation).
+        // Report Closed so the caller drops the peer.
+        if (bad_) return Drain::Closed;
         std::uint8_t tmp[4096];
         bool any = false;
         for (;;) {

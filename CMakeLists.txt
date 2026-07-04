@@ -85,11 +85,17 @@ target_link_libraries(node2_liveness_test PRIVATE node2)
 target_compile_options(node2_liveness_test PRIVATE -Wall -Wextra)
 add_test(NAME node2_liveness COMMAND node2_liveness_test)
 
+# fault-boundary robustness: closed-peer SIGPIPE, oversize-frame buffer bound, accept deadline
+add_executable(node2_robustness_test test/node2_robustness_test.cpp)
+target_link_libraries(node2_robustness_test PRIVATE node2)
+target_compile_options(node2_robustness_test PRIVATE -Wall -Wextra)
+add_test(NAME node2_robustness COMMAND node2_robustness_test)
+
 # Apply NODE2_SANITIZE to node2's own targets only (the consensus2 subdir scopes
 # its own; blst/bls stay clean). One place for the whole node2 surface.
 if (NODE2_SANITIZE)
     set(_n2_san -fsanitize=${NODE2_SANITIZE} -fno-omit-frame-pointer)
-    foreach(_t node2 node2d frame_reader_test node2_cluster_test node2_liveness_test)
+    foreach(_t node2 node2d frame_reader_test node2_cluster_test node2_liveness_test node2_robustness_test)
         target_compile_options(${_t} PRIVATE ${_n2_san})
         target_link_options(${_t} PRIVATE ${_n2_san})
     endforeach()
