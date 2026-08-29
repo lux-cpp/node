@@ -11,6 +11,11 @@
 # cannot reach, and the one where a mesh that demands every peer deadlocks a
 # cluster whose remaining stake clears the ⅔ floor.
 #
+# A node with an absent validator waits out the mesh window before starting
+# consensus — it cannot tell "not started yet" from "not coming". Loopback
+# processes are up in milliseconds, so the window here is 5 s, not the daemon's
+# 15 s default.
+#
 # Usage: scripts/cluster.sh [node2d] [base-port] [n] [down-index]
 set -euo pipefail
 
@@ -38,7 +43,7 @@ want="${#running[@]}"
 echo "== launching $want of $N node2d processes, base port $BASE_PORT${DOWN:+, validator $DOWN held down} =="
 pids=()
 for i in "${running[@]}"; do
-  "$NODE2D" --index "$i" --n "$N" --base-port "$BASE_PORT" --deadline-ms 15000 \
+  "$NODE2D" --index "$i" --n "$N" --base-port "$BASE_PORT" --deadline-ms 5000 \
       >"$TMP/node$i.log" 2>&1 &
   pids+=("$!")
 done
