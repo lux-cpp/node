@@ -12,7 +12,9 @@
 #   MeshVoteTransport (VoteTransport over N TCP sockets, header-only)
 #   Node2Host (listen/accept/dial mesh + drive the Node)   ← the one .cpp
 #
-# Reused checkout layout (NOT vendored): ${LUXCPP_ROOT}/{consensus2-seed,zap-cpp-core,blst,crypto}.
+# Reused, NOT vendored: the consensus2 checkout (the engine) and the luxcpp
+# checkout (blst, cevm::crypto::bls, zap-cpp-core). Both are found automatically
+# where they actually sit; -DCONSENSUS2_DIR / -DLUXCPP_ROOT override.
 
 cmake_minimum_required(VERSION 3.20)
 project(node2 LANGUAGES C CXX ASM)
@@ -35,18 +37,47 @@ if (NODE2_SANITIZE AND NOT CONSENSUS2_SANITIZE)
   set(CONSENSUS2_SANITIZE "${NODE2_SANITIZE}" CACHE STRING "" FORCE)
 endif()
 
-# Locate the reused luxcpp assets (default: the parent of this dir).
-get_filename_component(_default_luxcpp "${CMAKE_SOURCE_DIR}/.." ABSOLUTE)
-set(LUXCPP_ROOT      "${_default_luxcpp}"                      CACHE PATH "luxcpp checkout root")
-set(CONSENSUS2_DIR   "${LUXCPP_ROOT}/consensus2-seed"          CACHE PATH "consensus2 seed source dir")
-set(ZAP_DIR          "${LUXCPP_ROOT}/zap-cpp-core/include"     CACHE PATH "zap-cpp-core include root")
+# find_checkout(VAR MARKER candidate...) — first candidate holding MARKER wins.
+# One search, used for both reused trees, so "where does X live" is stated once.
+function(find_checkout out marker)
+  foreach(_root ${ARGN})
+    get_filename_component(_abs "${_root}" ABSOLUTE)
+    if(EXISTS "${_abs}/${marker}")
+      set(${out} "${_abs}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+  set(${out} "${out}-NOTFOUND" PARENT_SCOPE)
+endfunction()
 
-foreach(_p "${CONSENSUS2_DIR}/CMakeLists.txt" "${ZAP_DIR}/lux/zap/wire.hpp")
+# consensus2 — sibling of node2 in the lux checkout, or inside a luxcpp checkout.
+find_checkout(_consensus2 "include/lux/consensus2/node.hpp"
+  "${CMAKE_SOURCE_DIR}/../consensus2"
+  "${CMAKE_SOURCE_DIR}/../../luxcpp/consensus2"
+  "${CMAKE_SOURCE_DIR}/../luxcpp/consensus2")
+
+# luxcpp — blst + cevm::crypto::bls + zap-cpp-core all live under one root.
+find_checkout(_luxcpp "blst/bindings/blst.h"
+  "${CMAKE_SOURCE_DIR}/../../luxcpp"
+  "${CMAKE_SOURCE_DIR}/../luxcpp"
+  "${CMAKE_SOURCE_DIR}/..")
+
+set(CONSENSUS2_DIR "${_consensus2}"                    CACHE PATH "consensus2 checkout")
+set(LUXCPP_ROOT    "${_luxcpp}"                        CACHE PATH "luxcpp checkout root")
+set(ZAP_DIR        "${LUXCPP_ROOT}/zap-cpp-core/include" CACHE PATH "zap-cpp-core include root")
+
+foreach(_p "${CONSENSUS2_DIR}/CMakeLists.txt"
+           "${ZAP_DIR}/lux/zap/wire.hpp"
+           "${LUXCPP_ROOT}/blst/bindings/blst.h"
+           "${LUXCPP_ROOT}/crypto/bls/cpp/bls_signature.cpp")
   if(NOT EXISTS "${_p}")
     message(FATAL_ERROR "node2: required reused asset not found: ${_p}\n"
-                        "set -DLUXCPP_ROOT=/path/to/luxcpp")
+                        "searched for consensus2 and luxcpp beside this checkout; "
+                        "set -DCONSENSUS2_DIR=/path/to/consensus2 -DLUXCPP_ROOT=/path/to/luxcpp")
   endif()
 endforeach()
+message(STATUS "node2: consensus2 = ${CONSENSUS2_DIR}")
+message(STATUS "node2: luxcpp     = ${LUXCPP_ROOT}")
 
 find_package(Threads REQUIRED)
 
