@@ -1,20 +1,20 @@
 # Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause-Eco
 #
-# node2 — a running consensus2 node: the consensus2 engine + a ZAP vote mesh over
+# node2 — a running consensus node: the consensus engine + a ZAP vote mesh over
 # real TCP sockets. Layering (each layer below is REUSED unmodified):
 #
-#   blst → bls_signature → consensus2 (the gate + Node, and its BLS domain)
-#     [all built by the consensus2 checkout's CMakeLists, added as a subdirectory]
+#   blst → bls_signature → consensus (the gate + Node, and its BLS domain)
+#     [all built by the consensus checkout's CMakeLists, added as a subdirectory]
 #   lux::zap wire codec (zap-cpp-core, header-only)
 #     ──────────────────────── NEW in node2 ────────────────────────
 #   FrameReader (non-blocking reassembler, header-only)
 #   MeshVoteTransport (VoteTransport over N TCP sockets, header-only)
 #   Node2Host (listen/accept/dial mesh + drive the Node)   ← the one .cpp
 #
-# Reused, NOT vendored: the consensus2 checkout (the engine) and the luxcpp
+# Reused, NOT vendored: the consensus checkout (the engine) and the luxcpp
 # checkout (blst, cevm::crypto::bls, zap-cpp-core). Both are found automatically
-# where they actually sit; -DCONSENSUS2_DIR / -DLUXCPP_ROOT override.
+# where they actually sit; -DCONSENSUS_DIR / -DLUXCPP_ROOT override.
 
 cmake_minimum_required(VERSION 3.20)
 project(node2 LANGUAGES C CXX ASM)
@@ -27,14 +27,14 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Sanitizer for node2's + consensus2's OWN code (NOT the reused blst/bls assembly
+# Sanitizer for node2's + consensus's OWN code (NOT the reused blst/bls assembly
 # crypto). TSan here is load-bearing: the mesh setup is multi-threaded and the gate
 # mutex is exercised across threads. Usage: -DNODE2_SANITIZE=thread  (or address,undefined)
-set(NODE2_SANITIZE "" CACHE STRING "Sanitizer for node2+consensus2 code (e.g. thread | address,undefined)")
-# Propagate to the consensus2 subdir so the reused gate is instrumented to match,
-# while blst/bls_signature stay clean (consensus2 scopes it the same way).
-if (NODE2_SANITIZE AND NOT CONSENSUS2_SANITIZE)
-  set(CONSENSUS2_SANITIZE "${NODE2_SANITIZE}" CACHE STRING "" FORCE)
+set(NODE2_SANITIZE "" CACHE STRING "Sanitizer for node2+consensus code (e.g. thread | address,undefined)")
+# Propagate to the consensus subdir so the reused gate is instrumented to match,
+# while blst/bls_signature stay clean (consensus scopes it the same way).
+if (NODE2_SANITIZE AND NOT CONSENSUS_SANITIZE)
+  set(CONSENSUS_SANITIZE "${NODE2_SANITIZE}" CACHE STRING "" FORCE)
 endif()
 
 # find_checkout(VAR MARKER candidate...) — first candidate holding MARKER wins.
@@ -50,11 +50,15 @@ function(find_checkout out marker)
   set(${out} "${out}-NOTFOUND" PARENT_SCOPE)
 endfunction()
 
-# consensus2 — sibling of node2 in the lux checkout, or inside a luxcpp checkout.
-find_checkout(_consensus2 "include/lux/consensus2/node.hpp"
-  "${CMAKE_SOURCE_DIR}/../consensus2"
-  "${CMAKE_SOURCE_DIR}/../../luxcpp/consensus2"
-  "${CMAKE_SOURCE_DIR}/../luxcpp/consensus2")
+# consensus — the C++ consensus lives in the luxcpp checkout, so look there first.
+# The sibling candidate stays for a side-by-side checkout, but it is LAST and it is
+# why the marker is a header rather than a directory name: beside node2 in the lux
+# checkout sits luxfi/consensus, the GO implementation, under the very same name.
+# Matching on include/lux/consensus/node.hpp is what tells the two apart.
+find_checkout(_consensus "include/lux/consensus/node.hpp"
+  "${CMAKE_SOURCE_DIR}/../../luxcpp/consensus"
+  "${CMAKE_SOURCE_DIR}/../luxcpp/consensus"
+  "${CMAKE_SOURCE_DIR}/../consensus")
 
 # luxcpp — blst + cevm::crypto::bls + zap-cpp-core all live under one root.
 find_checkout(_luxcpp "blst/bindings/blst.h"
@@ -62,34 +66,34 @@ find_checkout(_luxcpp "blst/bindings/blst.h"
   "${CMAKE_SOURCE_DIR}/../luxcpp"
   "${CMAKE_SOURCE_DIR}/..")
 
-set(CONSENSUS2_DIR "${_consensus2}"                    CACHE PATH "consensus2 checkout")
+set(CONSENSUS_DIR "${_consensus}"                    CACHE PATH "consensus checkout")
 set(LUXCPP_ROOT    "${_luxcpp}"                        CACHE PATH "luxcpp checkout root")
 set(ZAP_DIR        "${LUXCPP_ROOT}/zap-cpp-core/include" CACHE PATH "zap-cpp-core include root")
 
-foreach(_p "${CONSENSUS2_DIR}/CMakeLists.txt"
+foreach(_p "${CONSENSUS_DIR}/CMakeLists.txt"
            "${ZAP_DIR}/lux/zap/wire.hpp"
            "${LUXCPP_ROOT}/blst/bindings/blst.h"
            "${LUXCPP_ROOT}/crypto/bls/cpp/bls_signature.cpp")
   if(NOT EXISTS "${_p}")
     message(FATAL_ERROR "node2: required reused asset not found: ${_p}\n"
-                        "searched for consensus2 and luxcpp beside this checkout; "
-                        "set -DCONSENSUS2_DIR=/path/to/consensus2 -DLUXCPP_ROOT=/path/to/luxcpp")
+                        "searched for consensus and luxcpp beside this checkout; "
+                        "set -DCONSENSUS_DIR=/path/to/consensus -DLUXCPP_ROOT=/path/to/luxcpp")
   endif()
 endforeach()
-message(STATUS "node2: consensus2 = ${CONSENSUS2_DIR}")
+message(STATUS "node2: consensus = ${CONSENSUS_DIR}")
 message(STATUS "node2: luxcpp     = ${LUXCPP_ROOT}")
 
 find_package(Threads REQUIRED)
 
-# ── Reuse consensus2's build (brings the blst / bls_signature / consensus2 targets
+# ── Reuse consensus's build (brings the blst / bls_signature / consensus targets
 #    with correct include + link propagation). One build definition for the reused
 #    layers — no duplication here.
-add_subdirectory("${CONSENSUS2_DIR}" consensus2-build)
+add_subdirectory("${CONSENSUS_DIR}" consensus-build)
 
 # ── node2 — the NEW host library (the only compiled unit; the rest is header-only)
 add_library(node2 STATIC src/node2_host.cpp)
 target_include_directories(node2 PUBLIC include "${ZAP_DIR}")
-target_link_libraries(node2 PUBLIC consensus2 Threads::Threads)
+target_link_libraries(node2 PUBLIC consensus Threads::Threads)
 target_compile_options(node2 PRIVATE -Wall -Wextra -Wpedantic)
 
 # ── node2d — the standalone daemon process
@@ -114,7 +118,7 @@ foreach(_t ${NODE2_TESTS})
     add_test(NAME ${_t} COMMAND ${_t}_test)
 endforeach()
 
-# Apply NODE2_SANITIZE to node2's own targets only (the consensus2 subdir scopes
+# Apply NODE2_SANITIZE to node2's own targets only (the consensus subdir scopes
 # its own; blst/bls stay clean). One place for the whole node2 surface.
 if (NODE2_SANITIZE)
     set(_n2_san -fsanitize=${NODE2_SANITIZE} -fno-omit-frame-pointer)

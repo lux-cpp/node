@@ -38,7 +38,7 @@
 #include <unistd.h>
 
 using namespace lux::node2;
-using namespace lux::consensus2;
+using namespace lux::consensus;
 
 namespace {
 

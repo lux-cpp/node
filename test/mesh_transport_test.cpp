@@ -20,7 +20,7 @@
 //       of writing to it again every round.
 //   [5] eviction is per-peer — the rest of the mesh is untouched.
 
-#include "lux/consensus2/zap/vote_codec.hpp"
+#include "lux/consensus/zap/vote_codec.hpp"
 #include "lux/node2/mesh_vote_transport.hpp"
 #include "lux/zap/wire.hpp"
 
@@ -33,7 +33,7 @@
 #include <unistd.h>
 
 using namespace lux::node2;
-using namespace lux::consensus2;
+using namespace lux::consensus;
 
 namespace {
 
@@ -76,9 +76,9 @@ std::vector<std::uint8_t> vote_frame(std::uint8_t tag) {
     v.block_id.fill(tag);
     v.voter.fill(0x01);
     v.sig.fill(0x02);
-    const std::vector<std::uint8_t> payload = lux::consensus2::zap::encode_vote(v);
+    const std::vector<std::uint8_t> payload = lux::consensus::zap::encode_vote(v);
     std::vector<std::uint8_t> f = header(static_cast<std::uint32_t>(payload.size()),
-                                         lux::consensus2::zap::kVoteMsgType);
+                                         lux::consensus::zap::kVoteMsgType);
     f.insert(f.end(), payload.begin(), payload.end());
     return f;
 }
@@ -97,7 +97,7 @@ int main() {
         MeshVoteTransport tx(counting_sink);
         Link l;
         tx.add_peer(l.ours);
-        send_raw(l.theirs, header(0xFFFFFFFFu, lux::consensus2::zap::kVoteMsgType));
+        send_raw(l.theirs, header(0xFFFFFFFFu, lux::consensus::zap::kVoteMsgType));
 
         // Flood as hard as the peer can while the transport keeps pumping. The
         // old reader latched its error flag and then went on buffering every one
@@ -123,7 +123,7 @@ int main() {
         tx.add_peer(l.ours);
         const std::uint32_t over = kMaxVoteFrame + 1;
         check(over < lux::zap::MaxMessageSize, "[2] the test length is legal ZAP, illegal here");
-        send_raw(l.theirs, header(over, lux::consensus2::zap::kVoteMsgType));
+        send_raw(l.theirs, header(over, lux::consensus::zap::kVoteMsgType));
         tx.pump();
         check(tx.peer_count() == 0, "[2] a frame too large for a vote link drops the peer");
     }
@@ -166,7 +166,7 @@ int main() {
         Link bad, good;
         tx.add_peer(bad.ours);
         tx.add_peer(good.ours);
-        send_raw(bad.theirs, header(0xFFFFFFFFu, lux::consensus2::zap::kVoteMsgType));
+        send_raw(bad.theirs, header(0xFFFFFFFFu, lux::consensus::zap::kVoteMsgType));
         send_raw(good.theirs, vote_frame(0x44));
         tx.pump();
         check(tx.peer_count() == 1, "[5] the honest peer kept its seat");

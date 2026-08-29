@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// node2d — a standalone consensus2 node process. Booted N times (one OS process
+// node2d — a standalone consensus node process. Booted N times (one OS process
 // each) on distinct loopback ports, the processes form a real TCP mesh and each
 // independently finalizes one proposed block, proving the host works across true
 // process boundaries (not just threads in one test binary). scripts/cluster.sh
@@ -30,7 +30,7 @@
 #include <vector>
 
 using namespace lux::node2;
-using namespace lux::consensus2;
+using namespace lux::consensus;
 
 namespace {
 
@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
     // 3-node or a 33-node cluster on the same rule instead of a literal 5.
     cfg.wave       = WaveConfig{std::uint32_t(n), 0.8, 4};
 
-    // consensus2 throws at its boundary on a set/α/wave combination that cannot
+    // consensus throws at its boundary on a set/α/wave combination that cannot
     // reach a decision. A daemon says so and exits; it does not abort.
     std::unique_ptr<Node2Host> hostp;
     try {
@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
     host.submit(pos);
 
     // Drive the wave to its β-confirmed decision: WaveConfig.beta consecutive
-    // supermajority rounds are required before the node signs (consensus2 red C1
+    // supermajority rounds are required before the node signs (consensus red C1
     // — a node never votes on a single transient round). round() is idempotent
     // once the slot is committed, so calling it every iteration both reaches β and
     // is a no-op afterwards. A single round left confidence at 1 with beta=4 ⇒ the
