@@ -65,7 +65,7 @@ VotePosition make_pos(std::uint8_t tag, std::uint64_t h) {
     VotePosition p{};
     p.block_id.fill(tag);
     p.height = h;
-    p.epoch  = 1;
+    p.round  = 1;
     return p;
 }
 
@@ -93,7 +93,6 @@ int main() {
         cfg.validators = set;
         cfg.alpha      = kAlpha;
         cfg.wave       = WaveConfig{kN, 0.8, 4};  // threshold int(5*0.8)=4: a 5-reachable round votes
-        cfg.epoch      = 1;
         hosts.push_back(std::make_unique<Node2Host>(std::move(cfg)));
         ports[i] = hosts[i]->listen_bind();
         std::printf("  node %u  listening on 127.0.0.1:%u\n", i, ports[i]);
@@ -124,7 +123,7 @@ int main() {
     // ── propose one block; every node signs + broadcasts its ACCEPT vote ───────
     const VotePosition pos = make_pos(0x42, 1);
     for (auto& h : hosts) h->submit(pos);
-    for (int r = 0; r < 4; ++r) for (auto& h : hosts) h->round(pos);  // beta confirmation rounds
+    for (int r = 0; r < 4; ++r) for (auto& h : hosts) h->round(pos.block_id);  // beta confirmation rounds
 
     // Decisive: each node now holds ONLY its own vote (self-echo) → NOT final.
     for (std::uint32_t i = 0; i < kN; ++i)

@@ -59,7 +59,6 @@ struct HostConfig {
     std::vector<lux::consensus2::Validator>    validators;  // the full, agreed validator set
     std::uint32_t                              alpha;       // distinct-voter floor (gate)
     lux::consensus2::WaveConfig                wave;        // liveness/voting committee config
-    std::uint64_t                              epoch;       // bound into each vote's message
 };
 
 class Node2Host {
@@ -86,16 +85,16 @@ public:
     // ── consensus driving (single-threaded) ─────────────────────────────────
     void submit(const lux::consensus2::VotePosition& pos) { node_->submit(pos); }
 
-    // One liveness round for `pos`, driven by the committee this node can reach
+    // One liveness round for `block`, driven by the committee this node can reach
     // RIGHT NOW — itself plus its live peers. Say plainly what this is: node2 has
     // no sampling layer, so this is a connectivity measure, not a poll of anyone's
     // opinion. A node keeps confirming only while it can still see a supermajority
     // of the set, and stops the moment it cannot; it never votes on a set it
     // cannot reach. When photon sampling lands it replaces exactly this one
     // expression, and nothing above it changes.
-    lux::consensus2::Decision round(const lux::consensus2::VotePosition& pos) {
+    lux::consensus2::Decision round(const lux::consensus2::BlockId& block) {
         const auto reachable = static_cast<std::uint32_t>(mesh_->peer_count() + 1);
-        return node_->poll(pos, reachable, reachable);
+        return node_->poll(block, reachable, reachable);
     }
 
     // Drain inbound votes from every peer into the gate. Returns votes delivered.

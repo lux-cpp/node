@@ -87,7 +87,6 @@ int main(int argc, char** argv) {
     // "can I still reach int(0.8·n) of the set". Deriving k from n keeps a
     // 3-node or a 33-node cluster on the same rule instead of a literal 5.
     cfg.wave       = WaveConfig{std::uint32_t(n), 0.8, 4};
-    cfg.epoch      = 1;
 
     // consensus2 throws at its boundary on a set/α/wave combination that cannot
     // reach a decision. A daemon says so and exits; it does not abort.
@@ -131,7 +130,7 @@ int main(int argc, char** argv) {
     VotePosition pos{};
     pos.block_id.fill(0x42);
     pos.height = 1;
-    pos.epoch  = 1;
+    pos.round  = 1;
 
     host.submit(pos);
 
@@ -144,7 +143,7 @@ int main(int argc, char** argv) {
     // cluster script, not the in-binary test).
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms);
     while (!host.isFinal(pos.block_id)) {
-        host.round(pos);  // β-confirmation rounds → sign + broadcast once decided
+        host.round(pos.block_id);  // β-confirmation rounds → sign + broadcast once decided
         host.pump();      // drain peers' votes into the gate
         if (std::chrono::steady_clock::now() >= deadline) {
             std::printf("node %ld: NOT FINAL before deadline\n", index);
