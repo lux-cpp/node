@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -117,16 +118,19 @@ std::uint16_t Node2Host::listen_bind() {
     return bound_port_;
 }
 
-int Node2Host::accept_one() {
+int Node2Host::accept_one(std::uint32_t& peer_index) {
     const int fd = ::accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) return -1;
     bound_peer_io(fd);  // before the handshake read: a silent dialer times out
 
     // Consume the dialer's index handshake so the ZAP frame stream that follows is
-    // clean. (We accept the value for symmetry/observability; routing does not
-    // depend on it — votes self-identify by voter pubkey and the gate verifies BLS
-    // + set membership.)
-    std::uint32_t peer_index = 0;
+    // clean, and hand the caller the index it claimed. The claim is not proof —
+    // the handshake is four plaintext bytes and node2 has no peer authentication
+    // yet — but the caller checks it against the slots it is actually waiting on,
+    // so one connection can occupy at most the one slot it names, and never two.
+    // Safety never rests on it: votes self-identify by voter pubkey and the gate
+    // verifies BLS + set membership.
+    peer_index = 0;
     if (!read_index(fd, peer_index)) { ::close(fd); return -1; }
     return fd;
 }
@@ -164,11 +168,11 @@ int Node2Host::dial_once(const PeerAddr& a, int wait_ms) {
 std::size_t Node2Host::connect_mesh(const std::map<std::uint32_t, PeerAddr>& peers, int deadline_ms) {
     // Per-pair direction: lower index dials, higher index accepts. So this node
     // accepts from every peer with a smaller index and dials every larger one.
-    std::size_t inbound = 0;
-    std::vector<PeerAddr> pending;
+    std::set<std::uint32_t> awaited;   // inbound slots still open, by validator index
+    std::vector<PeerAddr> pending;     // peers still to dial
     for (const auto& [idx, addr] : peers) {
         if (idx == cfg_.index) continue;
-        if (idx < cfg_.index) ++inbound;
+        if (idx < cfg_.index) awaited.insert(idx);
         else                  pending.push_back(addr);
     }
 
@@ -177,13 +181,17 @@ std::size_t Node2Host::connect_mesh(const std::map<std::uint32_t, PeerAddr>& pee
     // the retry policy for a dial lives here — in one place — rather than inside
     // the dial.
     const Deadline deadline = Clock::now() + std::chrono::milliseconds(deadline_ms);
-    std::size_t accepted = 0;
     for (;;) {
-        while (accepted < inbound && readable(listen_fd_, 0)) {
-            const int fd = accept_one();
+        while (!awaited.empty() && readable(listen_fd_, 0)) {
+            std::uint32_t claimed = 0;
+            const int fd = accept_one(claimed);
             if (fd < 0) continue;  // a connection that failed its handshake costs only itself
+            // One connection fills at most the one slot it named. A second claim
+            // on a slot already filled — a retrying dialer, or a stranger — is
+            // dropped rather than counted as another peer, which is how the mesh
+            // used to believe it was complete while a validator was still missing.
+            if (awaited.erase(claimed) == 0) { ::close(fd); continue; }
             mesh_->add_peer(fd);
-            ++accepted;
         }
         for (std::size_t k = 0; k < pending.size();) {
             const int fd = dial_once(pending[k], std::min(ms_until(deadline), kPeerIoTimeoutMs));
@@ -191,7 +199,7 @@ std::size_t Node2Host::connect_mesh(const std::map<std::uint32_t, PeerAddr>& pee
             mesh_->add_peer(fd);
             pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(k));
         }
-        if (accepted == inbound && pending.empty()) break;
+        if (awaited.empty() && pending.empty()) break;
         if (ms_until(deadline) == 0) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }

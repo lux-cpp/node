@@ -124,8 +124,10 @@ private:
     using Deadline = Clock::time_point;
 
     // Take one inbound peer off the listen backlog: accept() + its 4-byte BE index
-    // handshake, both bounded. Returns the connected fd, or -1.
-    int accept_one();
+    // handshake, both bounded. Sets `peer_index` to the index the dialer claimed —
+    // a claim, not a proof, which connect_mesh checks against the slots it is
+    // waiting on. Returns the connected fd, or -1.
+    int accept_one(std::uint32_t& peer_index);
     // One dial attempt (no retry — the sweep in connect_mesh owns the retry policy):
     // non-blocking connect bounded by `wait_ms`, then our 4-byte BE index handshake.
     // Returns the connected fd, or -1.
