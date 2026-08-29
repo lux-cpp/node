@@ -52,8 +52,9 @@ the same encoder the frames use); the acceptor consumes it so the frame stream
 starts clean, and matches the claimed index against the slots it is waiting on —
 so one connection fills at most the slot it names. Accepts and dials are swept
 together each round, so an absent low-indexed peer starves nothing, and the retry
-policy lives in the sweep rather than inside the dial. A node with an absent validator waits out the mesh window
-before starting consensus: it cannot tell "not started yet" from "not coming".
+policy lives in the sweep rather than inside the dial. A node with an absent
+validator waits out the mesh window before starting consensus: it cannot tell
+"not started yet" from "not coming".
 
 ## What one hostile socket can do (and what it costs)
 
@@ -85,7 +86,7 @@ are found automatically; `-DCONSENSUS2_DIR` / `-DLUXCPP_ROOT` override.
 ```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure       # node2's five + the reused consensus2 suite
+ctest --test-dir build --output-on-failure       # node2's six + the reused consensus2 suite
 ./scripts/cluster.sh build/node2d 19310 5        # 5 real PROCESSES over loopback TCP
 ./scripts/cluster.sh build/node2d 19310 5 4      # ...with validator 4 held down
 ```
