@@ -86,6 +86,21 @@ int main() {
     std::printf("================ node2 — WIRE VECTOR (the bytes, from the spec) ================\n");
     std::printf("what a Go peer reads off this socket, pinned byte for byte\n\n");
 
+    // ── the framing constants node2 depends on, as Go records them ────────────
+    // github.com/luxfi/api/zap: header_size 5, max_message_size 16777216,
+    // response_flag 0x80, error_flag 0x40, type_mask 0x3F. A service id must stay
+    // under 0x40 or both ends read it as a flag and dispatch it somewhere else.
+    {
+        check(lux::zap::HeaderSize == 5, "ZAP header is 5 bytes (4 BE length + 1 type)");
+        check(lux::zap::MaxMessageSize == 16u * 1024u * 1024u, "ZAP ceiling is 16 MiB");
+        check(lux::zap::MsgResponseFlag == 0x80 && lux::zap::MsgErrorFlag == 0x40 &&
+              lux::zap::MsgTypeMask == 0x3F, "the flag bits and the type mask are Go's");
+        check(lux::consensus2::zap::kVoteMsgType < 0x40,
+              "the vote type fits the low six bits, so the flags OR in cleanly");
+        check(kMaxVoteFrame <= lux::zap::MaxMessageSize,
+              "the vote link's cap sits under the ZAP ceiling");
+    }
+
     // ── the vote frame, as the real transport writes it ───────────────────────
     {
         int fds[2];
