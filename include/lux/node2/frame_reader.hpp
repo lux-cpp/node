@@ -15,9 +15,20 @@
 // This is the ONE place in node2 that knows non-blocking stream framing. It is
 // orthogonal to the vote codec (which parses the payload) and to consensus.
 //
-// Wire layout (must match lux/zap/wire.hpp byte-for-byte):
+// Wire layout (lux/zap/wire.hpp, decoded with that header's own Reader so the
+// four length bytes are read by the codec that wrote them):
 //
 //   [4-byte BE length][1-byte msg_type][`length` bytes payload]
+//
+// MEMORY IS BOUNDED BY CONSTRUCTION. Two limits, both enforced here:
+//   - `max_frame` caps the announced length. A stream carries frames of a known
+//     shape; the caller states that shape, so a peer cannot announce 16 MiB on a
+//     link that only ever carries 188-byte votes.
+//   - a reader that has latched `error()` accepts no further bytes: feed() is a
+//     no-op. Without that, a caller that keeps draining a rejected stream grows
+//     the buffer without limit while next() reports nothing — the failure mode
+//     this comment used to merely deny. The peer-eviction rule that acts on
+//     error() lives in MeshVoteTransport; this is the belt under it.
 //
 // The byte-handling core (feed + next) is socket-free, so it is unit-testable by
 // feeding arbitrary byte slices — including a frame split across many feeds and
@@ -25,8 +36,9 @@
 
 #pragma once
 
-#include "lux/zap/wire.hpp"  // HeaderSize, MaxMessageSize
+#include "lux/zap/wire.hpp"  // HeaderSize, MaxMessageSize, Reader
 
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -53,26 +65,32 @@ enum class Drain {
 
 class FrameReader {
 public:
+    // `max_frame` is the largest payload this stream will ever legitimately
+    // carry. Anything larger is a protocol violation, not a big message: it
+    // latches error() and the peer is dropped. Clamped to the ZAP ceiling.
+    explicit FrameReader(std::uint32_t max_frame = lux::zap::MaxMessageSize) noexcept
+        : max_frame_(std::min(max_frame, lux::zap::MaxMessageSize)) {}
+
     // ── socket-free core (unit-testable without a network) ───────────────────
 
-    // Append freshly-read bytes to the reassembly buffer.
+    // Append freshly-read bytes to the reassembly buffer. A reader that has
+    // already rejected this stream takes nothing more: the buffer of a failed
+    // peer never grows, whatever the peer keeps sending.
     void feed(const std::uint8_t* data, std::size_t len) {
+        if (bad_) return;
         buf_.insert(buf_.end(), data, data + len);
     }
 
     // Pop the next complete frame, or nullopt if one is not yet fully buffered.
-    // A length exceeding MaxMessageSize latches error() and yields nothing — a
-    // peer cannot make us allocate an unbounded buffer.
+    // A length exceeding max_frame latches error() and yields nothing.
     std::optional<Frame> next() {
         if (bad_) return std::nullopt;
         if (buf_.size() < lux::zap::HeaderSize) return std::nullopt;
 
-        const std::uint32_t length =
-            static_cast<std::uint32_t>(buf_[0]) << 24 |
-            static_cast<std::uint32_t>(buf_[1]) << 16 |
-            static_cast<std::uint32_t>(buf_[2]) << 8  |
-            static_cast<std::uint32_t>(buf_[3]);
-        if (length > lux::zap::MaxMessageSize) { bad_ = true; return std::nullopt; }
+        lux::zap::Reader hdr(buf_.data(), lux::zap::HeaderSize);
+        std::uint32_t length = 0;
+        hdr.read_u32(length);  // cannot fail: HeaderSize bytes are present
+        if (length > max_frame_) { fail(); return std::nullopt; }
 
         const std::size_t need = lux::zap::HeaderSize + length;
         if (buf_.size() < need) return std::nullopt;  // frame not fully arrived yet
@@ -86,13 +104,16 @@ public:
 
     bool error() const noexcept { return bad_; }
     std::size_t buffered() const noexcept { return buf_.size(); }
+    std::uint32_t max_frame() const noexcept { return max_frame_; }
 
     // ── non-blocking socket drain on top of the core ─────────────────────────
 
     // Read every currently-available byte from `fd` into the buffer WITHOUT
     // blocking (MSG_DONTWAIT keeps the fd itself blocking — so writes elsewhere
     // stay robust — while this read returns immediately when the socket is dry).
+    // A stream already rejected reads nothing: it is closed, not drained.
     Drain drain_fd(int fd) {
+        if (bad_) return Drain::Closed;
         std::uint8_t tmp[4096];
         bool any = false;
         for (;;) {
@@ -106,7 +127,15 @@ public:
     }
 
 private:
+    // Reject the stream and release what it has already cost us.
+    void fail() noexcept {
+        bad_ = true;
+        buf_.clear();
+        buf_.shrink_to_fit();
+    }
+
     std::vector<std::uint8_t> buf_;
+    std::uint32_t max_frame_;
     bool bad_ = false;
 };
 

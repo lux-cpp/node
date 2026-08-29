@@ -4,8 +4,9 @@
 // node2d — a standalone consensus2 node process. Booted N times (one OS process
 // each) on distinct loopback ports, the processes form a real TCP mesh and each
 // independently finalizes one proposed block, proving the host works across true
-// process boundaries (not just threads in one test binary). scripts/cluster_5.sh
-// launches five and checks every one prints FINAL.
+// process boundaries (not just threads in one test binary). scripts/cluster.sh
+// launches a cluster — optionally with a validator held down — and checks that
+// every process that should finalize does.
 //
 //   node2d --index I --n N --base-port P [--alpha A] [--stake S] [--deadline-ms D]
 //
@@ -22,6 +23,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -80,10 +83,22 @@ int main(int argc, char** argv) {
     cfg.pk         = keys[index].pk;
     cfg.validators = set;
     cfg.alpha      = std::uint32_t(alpha);
-    cfg.wave       = WaveConfig{5, 0.8, 4};
+    // The committee IS the validator set: node2 samples nobody, so a round is
+    // "can I still reach int(0.8·n) of the set". Deriving k from n keeps a
+    // 3-node or a 33-node cluster on the same rule instead of a literal 5.
+    cfg.wave       = WaveConfig{std::uint32_t(n), 0.8, 4};
     cfg.epoch      = 1;
 
-    Node2Host host(std::move(cfg));
+    // consensus2 throws at its boundary on a set/α/wave combination that cannot
+    // reach a decision. A daemon says so and exits; it does not abort.
+    std::unique_ptr<Node2Host> hostp;
+    try {
+        hostp = std::make_unique<Node2Host>(std::move(cfg));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "node %ld: cannot start — %s\n", index, e.what());
+        return 2;
+    }
+    Node2Host& host = *hostp;
     const std::uint16_t port = host.listen_bind();
     std::printf("node %ld: listening 127.0.0.1:%u, forming %ld-node mesh...\n", index, port, n - 1);
     std::fflush(stdout);
@@ -92,11 +107,25 @@ int main(int argc, char** argv) {
     for (long j = 0; j < n; ++j)
         if (j != index) peers[std::uint32_t(j)] = PeerAddr{"127.0.0.1", std::uint16_t(base_port + j)};
 
-    if (!host.connect_mesh(peers, int(deadline_ms))) {
-        std::printf("node %ld: MESH FAILED (peers=%zu/%ld)\n", index, host.peer_count(), n - 1);
+    // The mesh reaches whoever is there; the FINALITY RULE — already stated in
+    // the gate — says whether that is enough. Demanding every peer would be the
+    // same rule said a second time and worse: one absent validator would take
+    // down a cluster whose remaining stake clears the ⅔ floor with room to spare.
+    const std::size_t reached = host.connect_mesh(peers, int(deadline_ms));
+    const std::uint64_t total_stake  = std::uint64_t(n) * std::uint64_t(stake);
+    const std::uint64_t reachable    = std::uint64_t(reached + 1) * std::uint64_t(stake);  // peers + self
+    if (reachable <= two_thirds_stake_floor(total_stake)) {
+        std::printf("node %ld: NO QUORUM REACHABLE (peers=%zu/%ld, stake %llu of %llu, floor %llu)\n",
+                    index, reached, n - 1,
+                    static_cast<unsigned long long>(reachable),
+                    static_cast<unsigned long long>(total_stake),
+                    static_cast<unsigned long long>(two_thirds_stake_floor(total_stake)));
         return 1;
     }
-    std::printf("node %ld: mesh up (%zu peers)\n", index, host.peer_count());
+    std::printf("node %ld: mesh up (%zu of %ld peers, reachable stake %llu > floor %llu)\n",
+                index, reached, n - 1,
+                static_cast<unsigned long long>(reachable),
+                static_cast<unsigned long long>(two_thirds_stake_floor(total_stake)));
     std::fflush(stdout);
 
     VotePosition pos{};
@@ -107,16 +136,16 @@ int main(int argc, char** argv) {
     host.submit(pos);
 
     // Drive the wave to its β-confirmed decision: WaveConfig.beta consecutive
-    // α-supermajority rounds are required before the node signs (consensus2 red
-    // C1 — a node never votes on a single transient round). poll() is idempotent
-    // once the slot is committed, so calling it every loop iteration both reaches
-    // β and is a no-op afterwards. The earlier single poll() left wave at
-    // confidence 1 with beta=4 ⇒ the node never voted ⇒ the cluster never
-    // finalized (caught only by scripts/cluster_5.sh, not the in-binary test).
+    // supermajority rounds are required before the node signs (consensus2 red C1
+    // — a node never votes on a single transient round). round() is idempotent
+    // once the slot is committed, so calling it every iteration both reaches β and
+    // is a no-op afterwards. A single round left confidence at 1 with beta=4 ⇒ the
+    // node never voted ⇒ the cluster never finalized (caught only by the process
+    // cluster script, not the in-binary test).
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms);
     while (!host.isFinal(pos.block_id)) {
-        host.poll(pos, /*yes=*/5, /*total=*/5);  // β-confirmation rounds → sign+broadcast once decided
-        host.pump();                             // drain peers' votes into the gate
+        host.round(pos);  // β-confirmation rounds → sign + broadcast once decided
+        host.pump();      // drain peers' votes into the gate
         if (std::chrono::steady_clock::now() >= deadline) {
             std::printf("node %ld: NOT FINAL before deadline\n", index);
             return 1;
@@ -124,12 +153,13 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
-    auto c = host.cert(pos.block_id);
-    const bool cert_ok = c.has_value() && host.verifyCert(*c);
+    // Certified ⇒ decided: take the witness AND advance the decided-height
+    // frontier, so this validator can never sign a sibling at this height.
+    auto c = host.accept(pos);
     std::printf("node %ld: FINAL  voters=%zu  stake=%llu  cert=%s\n",
                 index,
                 c ? c->voters.size() : 0,
                 static_cast<unsigned long long>(c ? c->voted_stake : 0),
-                cert_ok ? "VERIFIED" : "INVALID");
-    return cert_ok ? 0 : 1;
+                c ? "VERIFIED" : "INVALID");
+    return c ? 0 : 1;
 }

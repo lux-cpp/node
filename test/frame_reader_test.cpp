@@ -96,6 +96,43 @@ int main() {
         check(!r.next().has_value() && r.error(), "oversize frame rejected, error latched");
     }
 
+    // [5] a REJECTED stream never grows again, however much the peer keeps
+    //     sending. Latching the error and going on buffering is the difference
+    //     between a peer that wasted its own bandwidth and a peer that chose how
+    //     much of our memory to spend: 8 MiB fed here used to be 8 MiB held.
+    {
+        FrameReader r;
+        const std::uint32_t huge = 0xFFFFFFFFu;
+        const auto bad = frame(0x11, {});  // header only, rewritten with a huge length
+        std::uint8_t hdr[5] = {std::uint8_t(huge >> 24), std::uint8_t(huge >> 16),
+                               std::uint8_t(huge >> 8), std::uint8_t(huge), bad[4]};
+        r.feed(hdr, sizeof hdr);
+        check(!r.next().has_value() && r.error(), "the stream is rejected");
+        const std::vector<std::uint8_t> junk(1u << 20, 'A');
+        for (int i = 0; i < 8; ++i) r.feed(junk.data(), junk.size());
+        check(r.buffered() == 0, "8 MiB fed after the rejection is 0 bytes held");
+        check(!r.next().has_value(), "and nothing is ever yielded from it again");
+    }
+
+    // [6] the cap is the CALLER's, not ZAP's ceiling: a link that only carries
+    //     small frames says so, and a length ZAP would allow is still a lie here.
+    {
+        FrameReader r(1024);
+        check(r.max_frame() == 1024, "the stream states its own frame size");
+        const std::uint32_t over = 1025;
+        std::uint8_t hdr[5] = {std::uint8_t(over >> 24), std::uint8_t(over >> 16),
+                               std::uint8_t(over >> 8), std::uint8_t(over), 0x11};
+        r.feed(hdr, sizeof hdr);
+        check(!r.next().has_value() && r.error(),
+              "a frame legal for ZAP but too big for this link is rejected");
+
+        FrameReader ok(1024);
+        const auto fit = frame(0x11, std::vector<std::uint8_t>(1024, 0x7F));
+        ok.feed(fit.data(), fit.size());
+        auto got = ok.next();
+        check(got && got->payload.size() == 1024 && !ok.error(), "a frame exactly at the cap passes");
+    }
+
     std::printf("-------------------------------------------------------------------------------\n");
     if (g_fail) { std::printf("==== FrameReader: FAIL (%d) ====\n", g_fail); return 1; }
     std::printf("==== FrameReader: PASS — fragmentation & batching handled at the byte layer ====\n");

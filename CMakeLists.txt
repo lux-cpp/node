@@ -97,30 +97,31 @@ add_executable(node2d src/node2d.cpp)
 target_link_libraries(node2d PRIVATE node2)
 target_compile_options(node2d PRIVATE -Wall -Wextra)
 
-# ── tests
+# ── tests — one registration, one list
+#   frame_reader    the reassembler in isolation (fragmentation, batching, limits)
+#   mesh_transport  what one hostile or dead socket can do to this node
+#   mesh_formation  mesh setup is bounded, and a missing validator is not a dead cluster
+#   node2_cluster   five hosts finalize over a real loopback mesh
+#   node2_liveness  down + wedged-but-present validators routed around, on the wire
 enable_testing()
 
-add_executable(frame_reader_test test/frame_reader_test.cpp)
-target_link_libraries(frame_reader_test PRIVATE node2)
-target_compile_options(frame_reader_test PRIVATE -Wall -Wextra)
-add_test(NAME frame_reader COMMAND frame_reader_test)
-
-add_executable(node2_cluster_test test/node2_cluster_test.cpp)
-target_link_libraries(node2_cluster_test PRIVATE node2)
-target_compile_options(node2_cluster_test PRIVATE -Wall -Wextra)
-add_test(NAME node2_cluster COMMAND node2_cluster_test)
-
-# over-the-wire liveness: down + wedged-but-present validators routed around
-add_executable(node2_liveness_test test/node2_liveness_test.cpp)
-target_link_libraries(node2_liveness_test PRIVATE node2)
-target_compile_options(node2_liveness_test PRIVATE -Wall -Wextra)
-add_test(NAME node2_liveness COMMAND node2_liveness_test)
+set(NODE2_TESTS frame_reader mesh_transport mesh_formation node2_cluster node2_liveness)
+foreach(_t ${NODE2_TESTS})
+    add_executable(${_t}_test test/${_t}_test.cpp)
+    target_link_libraries(${_t}_test PRIVATE node2)
+    target_compile_options(${_t}_test PRIVATE -Wall -Wextra)
+    add_test(NAME ${_t} COMMAND ${_t}_test)
+endforeach()
 
 # Apply NODE2_SANITIZE to node2's own targets only (the consensus2 subdir scopes
 # its own; blst/bls stay clean). One place for the whole node2 surface.
 if (NODE2_SANITIZE)
     set(_n2_san -fsanitize=${NODE2_SANITIZE} -fno-omit-frame-pointer)
-    foreach(_t node2 node2d frame_reader_test node2_cluster_test node2_liveness_test)
+    set(_n2_targets node2 node2d)
+    foreach(_t ${NODE2_TESTS})
+        list(APPEND _n2_targets ${_t}_test)
+    endforeach()
+    foreach(_t ${_n2_targets})
         target_compile_options(${_t} PRIVATE ${_n2_san})
         target_link_options(${_t} PRIVATE ${_n2_san})
     endforeach()
