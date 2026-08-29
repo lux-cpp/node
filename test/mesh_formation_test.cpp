@@ -186,6 +186,49 @@ int main() {
         std::printf("  [C] 2 of 3 up: host 0 reached %zu, host 2 reached %zu, in %ld ms\n", r0, r2, took);
     }
 
+    // [E] a connection fills at most the slot it names. The handshake index is a
+    //     claim, not a proof — node2 has no peer authentication — but checking it
+    //     against the slots actually being waited on means one socket cannot take
+    //     two, and a claim on a validator that is not expected is refused rather
+    //     than counted. Without the check, two connections from a retrying dialer
+    //     left the mesh believing it was complete while a validator was missing.
+    {
+        auto h = make_host(2);  // awaits inbound from validators 0 and 1
+        const std::uint16_t port = h->listen_bind();
+        DownPeer d0, d1;
+        std::map<std::uint32_t, PeerAddr> peers{
+            {0, {"127.0.0.1", d0.port}},
+            {1, {"127.0.0.1", d1.port}},
+        };
+
+        std::size_t reached = 0;
+        std::thread forming([&] { reached = h->connect_mesh(peers, kDeadlineMs); });
+
+        // Claim validator 0 twice, and a validator that is not in the set at all.
+        std::vector<int> conns;
+        for (std::uint32_t claim : {0u, 0u, 9u}) {
+            const int c = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            a.sin_port = htons(port);
+            if (::connect(c, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0) {
+                const std::uint8_t hs[4] = {std::uint8_t(claim >> 24), std::uint8_t(claim >> 16),
+                                            std::uint8_t(claim >> 8), std::uint8_t(claim)};
+                (void)::send(c, hs, sizeof hs, 0);
+                conns.push_back(c);
+            } else {
+                ::close(c);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        }
+        forming.join();
+        for (int c : conns) ::close(c);
+
+        check(reached == 1, "[E] three connections claiming {0, 0, 9} filled exactly one slot");
+        std::printf("  [E] claims {0,0,9} against slots {0,1}: %zu peer(s) admitted\n", reached);
+    }
+
     // [D] regression: a complete set still forms a complete mesh, fast.
     {
         std::vector<std::unique_ptr<Node2Host>> hosts;

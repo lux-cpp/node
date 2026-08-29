@@ -4,8 +4,8 @@
 # node2 — a running consensus2 node: the consensus2 engine + a ZAP vote mesh over
 # real TCP sockets. Layering (each layer below is REUSED unmodified):
 #
-#   blst → bls_signature (cevm::crypto::bls) → consensus2 (the gate + Node)
-#     [all three built by consensus2-seed/CMakeLists, added as a subdirectory]
+#   blst → bls_signature → consensus2 (the gate + Node, and its BLS domain)
+#     [all built by the consensus2 checkout's CMakeLists, added as a subdirectory]
 #   lux::zap wire codec (zap-cpp-core, header-only)
 #     ──────────────────────── NEW in node2 ────────────────────────
 #   FrameReader (non-blocking reassembler, header-only)
@@ -81,9 +81,9 @@ message(STATUS "node2: luxcpp     = ${LUXCPP_ROOT}")
 
 find_package(Threads REQUIRED)
 
-# ── Reuse consensus2-seed's build (brings the blst / bls_signature / consensus2
-#    targets with correct include + link propagation). One build definition for
-#    the reused layers — no duplication here.
+# ── Reuse consensus2's build (brings the blst / bls_signature / consensus2 targets
+#    with correct include + link propagation). One build definition for the reused
+#    layers — no duplication here.
 add_subdirectory("${CONSENSUS2_DIR}" consensus2-build)
 
 # ── node2 — the NEW host library (the only compiled unit; the rest is header-only)
@@ -99,13 +99,14 @@ target_compile_options(node2d PRIVATE -Wall -Wextra)
 
 # ── tests — one registration, one list
 #   frame_reader    the reassembler in isolation (fragmentation, batching, limits)
+#   wire_vector     the bytes on the wire, written from the spec and read off a socket
 #   mesh_transport  what one hostile or dead socket can do to this node
 #   mesh_formation  mesh setup is bounded, and a missing validator is not a dead cluster
 #   node2_cluster   five hosts finalize over a real loopback mesh
 #   node2_liveness  down + wedged-but-present validators routed around, on the wire
 enable_testing()
 
-set(NODE2_TESTS frame_reader mesh_transport mesh_formation node2_cluster node2_liveness)
+set(NODE2_TESTS frame_reader wire_vector mesh_transport mesh_formation node2_cluster node2_liveness)
 foreach(_t ${NODE2_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node2)
