@@ -49,9 +49,10 @@ over the ⅔ floor of 66, would all refuse to start because the fifth was down.
 Per pair, the lower index dials and the higher index accepts → exactly one
 connection per pair. A dialer writes a 4-byte BE index handshake (ZAP `Writer`,
 the same encoder the frames use); the acceptor consumes it so the frame stream
-starts clean. Accepts and dials are swept together each round, so an absent
-low-indexed peer starves nothing, and the retry policy lives in the sweep rather
-than inside the dial. A node with an absent validator waits out the mesh window
+starts clean, and matches the claimed index against the slots it is waiting on —
+so one connection fills at most the slot it names. Accepts and dials are swept
+together each round, so an absent low-indexed peer starves nothing, and the retry
+policy lives in the sweep rather than inside the dial. A node with an absent validator waits out the mesh window
 before starting consensus: it cannot tell "not started yet" from "not coming".
 
 ## What one hostile socket can do (and what it costs)
@@ -91,11 +92,15 @@ ctest --test-dir build --output-on-failure       # node2's five + the reused con
 
 - `frame_reader_test` — the reassembler alone: fragmentation, batching, the
   rejection latch, and the per-link frame cap.
+- `wire_vector_test` — the two formats node2 owns end to end, written as literal
+  bytes from the spec and compared against a socket the real transport wrote: the
+  4-byte BE index handshake and the 193-byte vote frame.
 - `mesh_transport_test` — what one hostile or dead socket can do: oversize
   announce + flood, an over-cap frame, vote-then-hang-up, an unwritable peer, and
   that eviction is per-peer.
 - `mesh_formation_test` — setup is bounded (an absent peer, and a stranger that
-  connects and says nothing, each cost a deadline) and partial (2 of 3 report 1).
+  connects and says nothing, each cost a deadline), partial (2 of 3 report 1), and
+  slot-checked (claims {0,0,9} against slots {0,1} admit exactly one peer).
 - `node2_cluster_test` — 5 hosts, ephemeral ports, full TCP mesh; asserts **no
   node final before `pump()`**, then all 5 finalize with a verifying cert.
 - `node2_liveness_test` — a DOWN validator (in every host's configured set, and
