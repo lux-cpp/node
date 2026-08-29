@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 
-#include "lux/node2/node2_host.hpp"
+#include "lux/node/node_host.hpp"
 
 #include "lux/zap/wire.hpp"  // Writer/Reader (the one BE codec) + read_exact/write_exact
 
@@ -23,7 +23,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-namespace lux::node2 {
+namespace lux::node {
 
 namespace {
 
@@ -52,7 +52,7 @@ void bound_peer_io(int fd) {
 // which validator index owns the link AND the frame stream that follows starts
 // clean (the acceptor consumes exactly these 4 bytes before any ZAP frame). It is
 // written and read with the ZAP codec — the same big-endian encoder the frames
-// use, so node2 has one integer encoding and not three.
+// use, so node has one integer encoding and not three.
 constexpr std::size_t kHandshakeSize = 4;
 
 bool write_index(int fd, std::uint32_t index) {
@@ -95,7 +95,7 @@ Node2Host::~Node2Host() {
 
 std::uint16_t Node2Host::listen_bind() {
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) throw std::runtime_error("node2: socket() failed");
+    if (listen_fd_ < 0) throw std::runtime_error("node: socket() failed");
 
     int one = 1;
     ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -105,15 +105,15 @@ std::uint16_t Node2Host::listen_bind() {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(cfg_.port);
     if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0)
-        throw std::runtime_error("node2: bind() failed on port " + std::to_string(cfg_.port));
+        throw std::runtime_error("node: bind() failed on port " + std::to_string(cfg_.port));
 
     // Backlog must hold every inbound dialer until accept() drains it.
     if (::listen(listen_fd_, 16) != 0)
-        throw std::runtime_error("node2: listen() failed");
+        throw std::runtime_error("node: listen() failed");
 
     socklen_t len = sizeof addr;
     if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
-        throw std::runtime_error("node2: getsockname() failed");
+        throw std::runtime_error("node: getsockname() failed");
     bound_port_ = ntohs(addr.sin_port);
     return bound_port_;
 }
@@ -125,7 +125,7 @@ int Node2Host::accept_one(std::uint32_t& peer_index) {
 
     // Consume the dialer's index handshake so the ZAP frame stream that follows is
     // clean, and hand the caller the index it claimed. The claim is not proof —
-    // the handshake is four plaintext bytes and node2 has no peer authentication
+    // the handshake is four plaintext bytes and node has no peer authentication
     // yet — but the caller checks it against the slots it is actually waiting on,
     // so one connection can occupy at most the one slot it names, and never two.
     // Safety never rests on it: votes self-identify by voter pubkey and the gate
@@ -214,4 +214,4 @@ std::optional<lux::consensus::QuorumCert> Node2Host::accept(const lux::consensus
     return c;
 }
 
-}  // namespace lux::node2
+}  // namespace lux::node

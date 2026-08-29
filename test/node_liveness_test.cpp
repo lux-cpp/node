@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// node2_liveness_test.cpp — the PRODUCTION liveness proof OVER REAL TCP: a faulty
+// node_liveness_test.cpp — the PRODUCTION liveness proof OVER REAL TCP: a faulty
 // validator does not stall finality on the wire. consensus is leaderless, so the
 // "proposer-fallback" property is realized as "any >2/3-stake quorum finalizes
 // without waiting for the faulty node". Two faults, each over real loopback sockets
@@ -26,7 +26,7 @@
 // never flaky. Either every required host finalizes within a generous deadline or
 // the test fails hard.
 
-#include "lux/node2/node2_host.hpp"
+#include "lux/node/node_host.hpp"
 #include "bls_signature.hpp"
 
 #include <array>
@@ -44,7 +44,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-using namespace lux::node2;
+using namespace lux::node;
 using namespace lux::consensus;
 
 namespace {
@@ -143,7 +143,7 @@ bool drive_until_final(std::vector<Node2Host*>& drivers,
 }  // namespace
 
 int main() {
-    std::printf("================== node2 — LIVENESS over real TCP (route around faults) ==================\n");
+    std::printf("================== node — LIVENESS over real TCP (route around faults) ==================\n");
     std::printf("a down or wedged-but-present validator never stalls the >2/3-stake quorum on the wire\n\n");
 
     for (std::uint32_t i = 0; i < kN; ++i) g_keys.push_back(make_key(std::uint8_t(0xA0 + i)));
@@ -230,7 +230,7 @@ int main() {
     }
 
     std::printf("----------------------------------------------------------------------------------------\n");
-    if (g_fail) { std::printf("==== node2 LIVENESS: FAIL (%d) ====\n", g_fail); return 1; }
-    std::printf("==== node2 LIVENESS: PASS — down + wedged validators routed around over real TCP ====\n");
+    if (g_fail) { std::printf("==== node LIVENESS: FAIL (%d) ====\n", g_fail); return 1; }
+    std::printf("==== node LIVENESS: PASS — down + wedged validators routed around over real TCP ====\n");
     return 0;
 }

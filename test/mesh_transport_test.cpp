@@ -21,7 +21,7 @@
 //   [5] eviction is per-peer — the rest of the mesh is untouched.
 
 #include "lux/consensus/zap/vote_codec.hpp"
-#include "lux/node2/mesh_vote_transport.hpp"
+#include "lux/node/mesh_vote_transport.hpp"
 #include "lux/zap/wire.hpp"
 
 #include <cstdint>
@@ -32,7 +32,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-using namespace lux::node2;
+using namespace lux::node;
 using namespace lux::consensus;
 
 namespace {
@@ -86,7 +86,7 @@ std::vector<std::uint8_t> vote_frame(std::uint8_t tag) {
 }  // namespace
 
 int main() {
-    std::printf("=============== node2 — mesh transport under a hostile peer ===============\n");
+    std::printf("=============== node — mesh transport under a hostile peer ===============\n");
     std::printf("one socket must never cost this node unbounded memory, a stalled write, or a seat it kept\n\n");
 
     std::size_t delivered = 0;
@@ -177,7 +177,7 @@ int main() {
     }
 
     std::printf("---------------------------------------------------------------------------\n");
-    if (g_fail) { std::printf("==== node2 MESH TRANSPORT: FAIL (%d) ====\n", g_fail); return 1; }
-    std::printf("==== node2 MESH TRANSPORT: PASS — a hostile peer costs itself, not the node ====\n");
+    if (g_fail) { std::printf("==== node MESH TRANSPORT: FAIL (%d) ====\n", g_fail); return 1; }
+    std::printf("==== node MESH TRANSPORT: PASS — a hostile peer costs itself, not the node ====\n");
     return 0;
 }

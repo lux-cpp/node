@@ -12,7 +12,7 @@
 //   and yields a frame only once it is complete — so fragmentation is invisible
 //   to the consensus layer and a slow peer never stalls the loop.
 //
-// This is the ONE place in node2 that knows non-blocking stream framing. It is
+// This is the ONE place in node that knows non-blocking stream framing. It is
 // orthogonal to the vote codec (which parses the payload) and to consensus.
 //
 // Wire layout (lux/zap/wire.hpp, decoded with that header's own Reader so the
@@ -47,7 +47,7 @@
 
 #include <sys/socket.h>  // recv, MSG_DONTWAIT
 
-namespace lux::node2 {
+namespace lux::node {
 
 // One decoded ZAP frame: the raw 1-byte msg_type (response/error flags NOT
 // stripped — the caller decides) and the payload bytes.
@@ -139,4 +139,4 @@ private:
     bool bad_ = false;
 };
 
-}  // namespace lux::node2
+}  // namespace lux::node

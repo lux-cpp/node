@@ -19,7 +19,7 @@
 //   stake — comfortably over the ⅔ floor of 66 — all refused to start because the
 //   fifth was down.
 
-#include "lux/node2/node2_host.hpp"
+#include "lux/node/node_host.hpp"
 #include "bls_signature.hpp"
 
 #include <array>
@@ -37,7 +37,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-using namespace lux::node2;
+using namespace lux::node;
 using namespace lux::consensus;
 
 namespace {
@@ -111,7 +111,7 @@ long elapsed_ms(std::chrono::steady_clock::time_point t0) {
 }  // namespace
 
 int main() {
-    std::printf("============ node2 — mesh formation is bounded, and partial ============\n");
+    std::printf("============ node — mesh formation is bounded, and partial ============\n");
     std::printf("a validator that never starts costs a deadline, not the cluster\n\n");
 
     for (std::uint32_t i = 0; i < kN; ++i) g_keys.push_back(make_key(std::uint8_t(0xC0 + i)));
@@ -192,7 +192,7 @@ int main() {
     }
 
     // [E] a connection fills at most the slot it names. The handshake index is a
-    //     claim, not a proof — node2 has no peer authentication — but checking it
+    //     claim, not a proof — node has no peer authentication — but checking it
     //     against the slots actually being waited on means one socket cannot take
     //     two, and a claim on a validator that is not expected is refused rather
     //     than counted. Without the check, two connections from a retrying dialer
@@ -258,7 +258,7 @@ int main() {
     }
 
     std::printf("------------------------------------------------------------------------\n");
-    if (g_fail) { std::printf("==== node2 MESH FORMATION: FAIL (%d) ====\n", g_fail); return 1; }
-    std::printf("==== node2 MESH FORMATION: PASS — bounded, partial, and complete when it can be ====\n");
+    if (g_fail) { std::printf("==== node MESH FORMATION: FAIL (%d) ====\n", g_fail); return 1; }
+    std::printf("==== node MESH FORMATION: PASS — bounded, partial, and complete when it can be ====\n");
     return 0;
 }

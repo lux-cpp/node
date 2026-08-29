@@ -5,7 +5,7 @@
 // orthogonal: fragmentation and batching are handled purely at the byte layer,
 // so the mesh/consensus layers above never see a partial frame.
 
-#include "lux/node2/frame_reader.hpp"
+#include "lux/node/frame_reader.hpp"
 #include "lux/zap/wire.hpp"
 
 #include <cstdint>
@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-using namespace lux::node2;
+using namespace lux::node;
 
 namespace {
 int g_fail = 0;
@@ -36,7 +36,7 @@ std::vector<std::uint8_t> frame(std::uint8_t type, const std::vector<std::uint8_
 }  // namespace
 
 int main() {
-    std::printf("================ node2 — FrameReader (non-blocking reassembler) ================\n");
+    std::printf("================ node — FrameReader (non-blocking reassembler) ================\n");
 
     // [1] a whole frame fed at once round-trips.
     {

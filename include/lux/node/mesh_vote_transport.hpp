@@ -5,7 +5,7 @@
 // of real TCP sockets, framed by the canonical ZAP wire codec (zap-cpp-core).
 //
 // The existing zap::ZapVoteTransport is single-peer (one fd) and holds Node*
-// directly. node2 needs an N-peer mesh, and takes the chance to decomplect: this
+// directly. node needs an N-peer mesh, and takes the chance to decomplect: this
 // transport carries a vote SINK (std::function), not a Node — so it knows only
 // sockets + ZAP framing + the vote codec. It has no Node type, no gate, no
 // finality rule. The host supplies a sink wired to Node::onVote.
@@ -28,7 +28,7 @@
 // BEFORE the peer is dropped, so a validator that votes and then disconnects
 // still counts.
 //
-// Threading: in node2 each MeshVoteTransport is owned and driven by exactly one
+// Threading: in node each MeshVoteTransport is owned and driven by exactly one
 // thread (its host), so there is no shared-mutable consensus state. The per-peer
 // write mutex exists only to satisfy lux::zap::write_frame_locked's signature; it
 // is uncontended here.
@@ -37,7 +37,7 @@
 
 #include "lux/consensus/node.hpp"            // VoteTransport, SignedVote
 #include "lux/consensus/zap/vote_codec.hpp"  // encode_vote/decode_vote, kVoteMsgType
-#include "lux/node2/frame_reader.hpp"
+#include "lux/node/frame_reader.hpp"
 #include "lux/zap/wire.hpp"                    // write_frame_locked, strip_flags
 
 #include <csignal>
@@ -51,7 +51,7 @@
 
 #include <unistd.h>  // close
 
-namespace lux::node2 {
+namespace lux::node {
 
 // The vote codec writes three length-framed fixed-width fields — 32 + 48 + 96
 // bytes, each behind a 4-byte length — so a vote frame is exactly 188 bytes. A
@@ -64,7 +64,7 @@ inline constexpr std::uint32_t kMaxVoteFrame = 4096;
 // raises SIGPIPE, whose default disposition is process death — so any peer could
 // end a node by disconnecting at the moment it was broadcast to. The write already
 // reports EPIPE, and that return value is the whole signal the eviction rule needs.
-// Disarmed once per process, from the one place in node2 that writes to a socket.
+// Disarmed once per process, from the one place in node that writes to a socket.
 inline void ignore_sigpipe() {
     static const bool once = [] { return ::signal(SIGPIPE, SIG_IGN) != SIG_ERR; }();
     (void)once;
@@ -158,4 +158,4 @@ private:
     std::size_t evicted_ = 0;
 };
 
-}  // namespace lux::node2
+}  // namespace lux::node

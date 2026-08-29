@@ -1,20 +1,20 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// node2d — a standalone consensus node process. Booted N times (one OS process
+// noded — a standalone consensus node process. Booted N times (one OS process
 // each) on distinct loopback ports, the processes form a real TCP mesh and each
 // independently finalizes one proposed block, proving the host works across true
 // process boundaries (not just threads in one test binary). scripts/cluster.sh
 // launches a cluster — optionally with a validator held down — and checks that
 // every process that should finalize does.
 //
-//   node2d --index I --n N --base-port P [--alpha A] [--stake S] [--deadline-ms D]
+//   noded --index I --n N --base-port P [--alpha A] [--stake S] [--deadline-ms D]
 //
 // Node j listens on 127.0.0.1:(P+j). The validator set is derived deterministically
 // from the index scheme below, so every process agrees on the same set; in
 // production the set comes from genesis and keys from KMS (out of scope here).
 
-#include "lux/node2/node2_host.hpp"
+#include "lux/node/node_host.hpp"
 #include "bls_signature.hpp"
 
 #include <array>
@@ -29,7 +29,7 @@
 #include <thread>
 #include <vector>
 
-using namespace lux::node2;
+using namespace lux::node;
 using namespace lux::consensus;
 
 namespace {
@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
     const long n         = arg(argc, argv, "--n", -1);
     const long base_port = arg(argc, argv, "--base-port", -1);
     if (index < 0 || n <= 0 || base_port <= 0 || index >= n) {
-        std::fprintf(stderr, "usage: node2d --index I --n N --base-port P "
+        std::fprintf(stderr, "usage: noded --index I --n N --base-port P "
                              "[--alpha A] [--stake S] [--deadline-ms D]\n");
         return 2;
     }
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     cfg.pk         = keys[index].pk;
     cfg.validators = set;
     cfg.alpha      = std::uint32_t(alpha);
-    // The committee IS the validator set: node2 samples nobody, so a round is
+    // The committee IS the validator set: node samples nobody, so a round is
     // "can I still reach int(0.8·n) of the set". Deriving k from n keeps a
     // 3-node or a 33-node cluster on the same rule instead of a literal 5.
     cfg.wave       = WaveConfig{std::uint32_t(n), 0.8, 4};

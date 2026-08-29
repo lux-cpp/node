@@ -1,14 +1,14 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// wire_vector_test.cpp — the bytes node2 puts on the wire, written down by hand
+// wire_vector_test.cpp — the bytes node puts on the wire, written down by hand
 // from the SPEC and compared against what the real send path actually emits.
 //
 // A round-trip test proves the encoder agrees with itself. Swap two same-width
 // fields, or move the length to little-endian on both sides, and it still passes
 // while every Go peer reads a different message. The Go reference pins its own
 // formats this way (consensus engine/chain/cert_wire_vector_test.go); this is the
-// same discipline for the two things node2 owns end to end:
+// same discipline for the two things node owns end to end:
 //
 //   the peer handshake   [4-byte BE validator index]
 //   a vote frame         [4-byte BE length][1-byte msg_type][payload]
@@ -23,8 +23,8 @@
 // is `github.com/luxfi/api/zap` verbatim (HeaderSize 5, big-endian length), which
 // is what makes a C++ frame parse on a Go node.
 
-#include "lux/node2/mesh_vote_transport.hpp"
-#include "lux/node2/node2_host.hpp"
+#include "lux/node/mesh_vote_transport.hpp"
+#include "lux/node/node_host.hpp"
 #include "bls_signature.hpp"
 
 #include <array>
@@ -40,7 +40,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-using namespace lux::node2;
+using namespace lux::node;
 using namespace lux::consensus;
 
 namespace {
@@ -83,10 +83,10 @@ std::vector<std::uint8_t> read_n(int fd, std::size_t n) {
 }  // namespace
 
 int main() {
-    std::printf("================ node2 — WIRE VECTOR (the bytes, from the spec) ================\n");
+    std::printf("================ node — WIRE VECTOR (the bytes, from the spec) ================\n");
     std::printf("what a Go peer reads off this socket, pinned byte for byte\n\n");
 
-    // ── the framing constants node2 depends on, as Go records them ────────────
+    // ── the framing constants node depends on, as Go records them ────────────
     // github.com/luxfi/api/zap: header_size 5, max_message_size 16777216,
     // response_flag 0x80, error_flag 0x40, type_mask 0x3F. A service id must stay
     // under 0x40 or both ends read it as a flag and dispatch it somewhere else.
@@ -185,7 +185,7 @@ int main() {
     }
 
     std::printf("--------------------------------------------------------------------------------\n");
-    if (g_fail) { std::printf("==== node2 WIRE VECTOR: FAIL (%d) ====\n", g_fail); return 1; }
-    std::printf("==== node2 WIRE VECTOR: PASS — the wire is what the spec says it is ====\n");
+    if (g_fail) { std::printf("==== node WIRE VECTOR: FAIL (%d) ====\n", g_fail); return 1; }
+    std::printf("==== node WIRE VECTOR: PASS — the wire is what the spec says it is ====\n");
     return 0;
 }
