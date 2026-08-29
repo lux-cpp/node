@@ -69,7 +69,7 @@ Key make_key(std::uint8_t tag) {
     return k;
 }
 VotePosition make_pos(std::uint8_t tag, std::uint64_t h) {
-    VotePosition p{}; p.block_id.fill(tag); p.height = h; p.epoch = 1; return p;
+    VotePosition p{}; p.block_id.fill(tag); p.height = h; p.round = 1; return p;
 }
 
 // The shared validator set (all 5 validators, whether or not their host runs).
@@ -85,7 +85,6 @@ std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
     cfg.validators = g_set;
     cfg.alpha      = kAlpha;
     cfg.wave       = WaveConfig{kN, 0.8, 4};
-    cfg.epoch      = 1;
     return std::make_unique<Node2Host>(std::move(cfg));
 }
 
@@ -132,7 +131,7 @@ bool drive_until_final(std::vector<Node2Host*>& drivers,
                        const VotePosition& pos, int seconds) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     for (;;) {
-        for (auto* h : drivers) { h->round(pos); h->pump(); }
+        for (auto* h : drivers) { h->round(pos.block_id); h->pump(); }
         std::size_t still = 0;
         for (auto* h : expectFinal) if (!h->isFinal(pos.block_id)) ++still;
         if (still == 0) return true;
@@ -208,7 +207,7 @@ int main() {
         for (auto& h : hosts) { h->submit(real); h->submit(forged); }
 
         // Wedged host 4 commits + broadcasts its forged vote over the wire first.
-        for (int r = 0; r < 4; ++r) { hosts[4]->round(forged); hosts[4]->pump(); }
+        for (int r = 0; r < 4; ++r) { hosts[4]->round(forged.block_id); hosts[4]->pump(); }
 
         std::vector<Node2Host*> honest;        // drivers + expected-final for `real`
         for (std::uint32_t i = 0; i < 4; ++i) honest.push_back(hosts[i].get());

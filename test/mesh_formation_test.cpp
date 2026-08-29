@@ -75,7 +75,6 @@ std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
     cfg.validators = g_set;
     cfg.alpha      = kAlpha;
     cfg.wave       = WaveConfig{kN, 0.8, 4};
-    cfg.epoch      = 1;
     return std::make_unique<Node2Host>(std::move(cfg));
 }
 
