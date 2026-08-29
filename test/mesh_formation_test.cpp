@@ -46,6 +46,11 @@ constexpr std::uint32_t kN     = 3;
 constexpr std::uint64_t kStake = 20;
 constexpr std::uint32_t kAlpha = 2;
 constexpr int kDeadlineMs = 1500;
+// What is being proven is BOUNDED, not fast: before the fix these calls did not
+// return at all. The bound allows the deadline plus a peer-I/O window per
+// connection attempt, generously, so a loaded machine cannot turn a proof about
+// termination into a proof about scheduling.
+constexpr int kBoundMs = kDeadlineMs + 4 * kPeerIoTimeoutMs;
 
 int g_fail = 0;
 void check(bool ok, const std::string& what) {
@@ -123,7 +128,7 @@ int main() {
         const std::size_t reached = h->connect_mesh(peers, kDeadlineMs);
         const long took = elapsed_ms(t0);
         check(reached == 0, "[A] no peer reached (the only configured peer is down)");
-        check(took < kDeadlineMs + 2 * kPeerIoTimeoutMs,
+        check(took < kBoundMs,
               "[A] accept returned by the deadline, not never (took " + std::to_string(took) + " ms)");
         std::printf("  [A] host 1 on :%u waited %ld ms for an absent host 0 (deadline %d ms)\n",
                     port, took, kDeadlineMs);
@@ -150,7 +155,7 @@ int main() {
         const long took = elapsed_ms(t0);
         ::close(mute);
         check(reached == 0, "[B] a connection with no handshake never becomes a peer");
-        check(took < kDeadlineMs + 2 * kPeerIoTimeoutMs,
+        check(took < kBoundMs,
               "[B] the mute stranger did not hold the acceptor (took " + std::to_string(took) + " ms)");
         std::printf("  [B] a socket that connected and stayed silent cost %ld ms, then was dropped\n", took);
     }
@@ -181,7 +186,7 @@ int main() {
         check(r0 == 1, "[C] host 0 reached exactly the one running peer");
         check(r2 == 1, "[C] host 2 reached exactly the one running peer");
         check(h0->peer_count() == 1 && h2->peer_count() == 1, "[C] both hold one peer");
-        check(took < kDeadlineMs + 2 * kPeerIoTimeoutMs,
+        check(took < kBoundMs,
               "[C] the absent validator cost a deadline, not a hang (took " + std::to_string(took) + " ms)");
         std::printf("  [C] 2 of 3 up: host 0 reached %zu, host 2 reached %zu, in %ld ms\n", r0, r2, took);
     }
