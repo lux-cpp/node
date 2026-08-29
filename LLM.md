@@ -1,6 +1,6 @@
-# node2 — a running consensus node (ZAP votes over real TCP)
+# node — a running consensus node (ZAP votes over real TCP)
 
-`node2` hosts the **consensus** engine and disseminates its votes over a **mesh
+`node` hosts the **consensus** engine and disseminates its votes over a **mesh
 of real TCP sockets**, framed by the canonical **ZAP** wire codec. N validators,
 each on a real listener, dial each other and independently reach BLS quorum-cert
 finality over the wire — as threads in one binary and as separate OS processes.
@@ -8,7 +8,7 @@ finality over the wire — as threads in one binary and as separate OS processes
 ## Layer decomposition (decomplected — each layer is independently testable)
 
 ```
-  node-host    Node2Host         NEW  src/node2_host.cpp   — listen/accept/dial the
+  node-host    Node2Host         NEW  src/node_host.cpp   — listen/accept/dial the
                                        mesh; own one Node; drive submit/round/pump.
   mesh         MeshVoteTransport  NEW  include/.../mesh_vote_transport.hpp (header-only)
                                        VoteTransport over N peer fds; broadcast→all,
@@ -44,7 +44,7 @@ returns how many. It does not demand all of them: the finality rule already says
 how many votes are enough, and "every peer must connect" is that rule said a
 second time and disagreeing with it — four validators holding 80 of 100 stake,
 over the ⅔ floor of 66, would all refuse to start because the fifth was down.
-`node2d` reads the returned count against `two_thirds_stake_floor`.
+`noded` reads the returned count against `two_thirds_stake_floor`.
 
 Per pair, the lower index dials and the higher index accepts → exactly one
 connection per pair. A dialer writes a 4-byte BE index handshake (ZAP `Writer`,
@@ -68,7 +68,7 @@ up still counts. Under it:
   after a rejection is 0 bytes held;
 - every peer socket carries a send and receive timeout, so a peer that stops
   reading makes `broadcast` fail rather than hang;
-- `SIGPIPE` is disarmed once, in the one place node2 writes to a socket — a peer
+- `SIGPIPE` is disarmed once, in the one place node writes to a socket — a peer
   that hangs up mid-broadcast used to kill the validator.
 
 ## Concurrency model
@@ -85,20 +85,20 @@ found automatically; `-DCONSENSUS_DIR` / `-DLUXCPP_ROOT` override.
 
 The search matches on `include/lux/consensus/node.hpp`, not on the directory
 name, because the name alone is ambiguous: `luxfi/consensus` is the **Go**
-implementation and sits beside node2 in the lux checkout, while the C++ one lives
+implementation and sits beside node in the lux checkout, while the C++ one lives
 under `luxcpp`. The header is what distinguishes them.
 
 ```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure       # node2's six + the reused consensus suite
-./scripts/cluster.sh build/node2d 19310 5        # 5 real PROCESSES over loopback TCP
-./scripts/cluster.sh build/node2d 19310 5 4      # ...with validator 4 held down
+ctest --test-dir build --output-on-failure       # node's six + the reused consensus suite
+./scripts/cluster.sh build/noded 19310 5        # 5 real PROCESSES over loopback TCP
+./scripts/cluster.sh build/noded 19310 5 4      # ...with validator 4 held down
 ```
 
 - `frame_reader_test` — the reassembler alone: fragmentation, batching, the
   rejection latch, and the per-link frame cap.
-- `wire_vector_test` — the two formats node2 owns end to end, written as literal
+- `wire_vector_test` — the two formats node owns end to end, written as literal
   bytes from the spec and compared against a socket the real transport wrote: the
   4-byte BE index handshake and the 193-byte vote frame.
 - `mesh_transport_test` — what one hostile or dead socket can do: oversize
@@ -107,22 +107,22 @@ ctest --test-dir build --output-on-failure       # node2's six + the reused cons
 - `mesh_formation_test` — setup is bounded (an absent peer, and a stranger that
   connects and says nothing, each cost a deadline), partial (2 of 3 report 1), and
   slot-checked (claims {0,0,9} against slots {0,1} admit exactly one peer).
-- `node2_cluster_test` — 5 hosts, ephemeral ports, full TCP mesh; asserts **no
+- `node_cluster_test` — 5 hosts, ephemeral ports, full TCP mesh; asserts **no
   node final before `pump()`**, then all 5 finalize with a verifying cert.
-- `node2_liveness_test` — a DOWN validator (in every host's configured set, and
+- `node_liveness_test` — a DOWN validator (in every host's configured set, and
   dialled) and a WEDGED-but-present one are both routed around on the wire.
 
 Verified clean under ThreadSanitizer and ASan+UBSan+Leak (run TSan under
-`setarch -R`; instrumentation covers node2 + consensus, never blst/bls).
+`setarch -R`; instrumentation covers node + consensus, never blst/bls).
 
 ## Conformance to Go
 
-Go is the network; node2 conforms to it, and the conformance is tested, not
+Go is the network; node conforms to it, and the conformance is tested, not
 asserted in a comment.
 
 - **The frame** is `[4-byte BE length][1-byte msg_type][payload]`, `HeaderSize=5`,
   `MaxMessageSize=16 MiB` — byte-identical to `github.com/luxfi/api/zap`. A frame
-  captured off a live `node2d` socket parses with Go's `zap.ReadMessage` with no
+  captured off a live `noded` socket parses with Go's `zap.ReadMessage` with no
   error and three fields of exactly 32/48/96 bytes, zero trailing.
 - **The signed message and the floors** are consensus's, checked against the
   Go-generated corpus by `conformance_test`, which runs in this suite.
@@ -139,13 +139,13 @@ Does NOT yet, in the order it matters:
   that connects first takes a validator's inbound slot, which is a liveness DoS
   even though safety holds (votes self-identify by pubkey and the gate verifies
   BLS + set membership). Go ZAP has an X25519 + ML-KEM-768 hybrid handshake with
-  AEAD; node2 uses only the frame layer — no reqID, no multiplexing, no ZAP RPC.
+  AEAD; node uses only the frame layer — no reqID, no multiplexing, no ZAP RPC.
 - **Sampling.** `Node2Host::round` drives the wave from the committee this node
   can *reach* — a connectivity measure, not a poll of anyone's opinion. It is one
   expression, in one place, and photon sampling replaces exactly it.
 - **Reconnection.** The peer set is one-shot: no discovery, no backoff, no
   re-dial after an eviction. An evicted peer is gone for the run.
-- **Multi-block operation and persistence.** `node2d` finalizes one block and
+- **Multi-block operation and persistence.** `noded` finalizes one block and
   exits. `Node::mark_finalized_through` is now called (via `Node2Host::accept`)
   when a height certifies, but the frontier is in memory: an embedder that
   restarts must re-seed it from a persisted decided height before signing.

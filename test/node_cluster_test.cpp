@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// node2_cluster_test.cpp — the live-mesh proof. Five Node2Host instances bind
+// node_cluster_test.cpp — the live-mesh proof. Five Node2Host instances bind
 // real loopback TCP listeners on distinct (ephemeral) ports, dial each other into
 // a full mesh (listen/accept/connect — no socketpair), and each runs a real
 // consensus::Node with its own BLS key. We propose one block, let every node
@@ -20,7 +20,7 @@
 // outcome is fixed: all five finalize within a generous deadline, or the test
 // fails hard. Never flaky.
 
-#include "lux/node2/node2_host.hpp"
+#include "lux/node/node_host.hpp"
 #include "bls_signature.hpp"
 
 #include <array>
@@ -32,7 +32,7 @@
 #include <thread>
 #include <vector>
 
-using namespace lux::node2;
+using namespace lux::node;
 using namespace lux::consensus;
 
 namespace {
@@ -72,7 +72,7 @@ VotePosition make_pos(std::uint8_t tag, std::uint64_t h) {
 }  // namespace
 
 int main() {
-    std::printf("====================== node2 — five-node finality over real TCP ======================\n");
+    std::printf("====================== node — five-node finality over real TCP ======================\n");
     std::printf("5 validators, full loopback mesh (listen/accept/connect), ZAP-framed votes, BLS quorum cert\n\n");
 
     // ── identities + the agreed validator set (every node holds the same set) ──
@@ -181,7 +181,7 @@ int main() {
     }
 
     std::printf("--------------------------------------------------------------------------------------\n");
-    if (g_fail) { std::printf("==== node2 CLUSTER: FAIL (%d) ====\n", g_fail); return 1; }
-    std::printf("==== node2 CLUSTER: PASS — 5 nodes finalized over real TCP with a verifying BLS quorum cert ====\n");
+    if (g_fail) { std::printf("==== node CLUSTER: FAIL (%d) ====\n", g_fail); return 1; }
+    std::printf("==== node CLUSTER: PASS — 5 nodes finalized over real TCP with a verifying BLS quorum cert ====\n");
     return 0;
 }

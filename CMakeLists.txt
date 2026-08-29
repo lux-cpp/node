@@ -1,13 +1,13 @@
 # Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause-Eco
 #
-# node2 — a running consensus node: the consensus engine + a ZAP vote mesh over
+# node — a running consensus node: the consensus engine + a ZAP vote mesh over
 # real TCP sockets. Layering (each layer below is REUSED unmodified):
 #
 #   blst → bls_signature → consensus (the gate + Node, and its BLS domain)
 #     [all built by the consensus checkout's CMakeLists, added as a subdirectory]
 #   lux::zap wire codec (zap-cpp-core, header-only)
-#     ──────────────────────── NEW in node2 ────────────────────────
+#     ──────────────────────── NEW in node ────────────────────────
 #   FrameReader (non-blocking reassembler, header-only)
 #   MeshVoteTransport (VoteTransport over N TCP sockets, header-only)
 #   Node2Host (listen/accept/dial mesh + drive the Node)   ← the one .cpp
@@ -17,7 +17,7 @@
 # where they actually sit; -DCONSENSUS_DIR / -DLUXCPP_ROOT override.
 
 cmake_minimum_required(VERSION 3.20)
-project(node2 LANGUAGES C CXX ASM)
+project(node LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,14 +27,14 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Sanitizer for node2's + consensus's OWN code (NOT the reused blst/bls assembly
+# Sanitizer for node's + consensus's OWN code (NOT the reused blst/bls assembly
 # crypto). TSan here is load-bearing: the mesh setup is multi-threaded and the gate
-# mutex is exercised across threads. Usage: -DNODE2_SANITIZE=thread  (or address,undefined)
-set(NODE2_SANITIZE "" CACHE STRING "Sanitizer for node2+consensus code (e.g. thread | address,undefined)")
+# mutex is exercised across threads. Usage: -DNODE_SANITIZE=thread  (or address,undefined)
+set(NODE_SANITIZE "" CACHE STRING "Sanitizer for node+consensus code (e.g. thread | address,undefined)")
 # Propagate to the consensus subdir so the reused gate is instrumented to match,
 # while blst/bls_signature stay clean (consensus scopes it the same way).
-if (NODE2_SANITIZE AND NOT CONSENSUS_SANITIZE)
-  set(CONSENSUS_SANITIZE "${NODE2_SANITIZE}" CACHE STRING "" FORCE)
+if (NODE_SANITIZE AND NOT CONSENSUS_SANITIZE)
+  set(CONSENSUS_SANITIZE "${NODE_SANITIZE}" CACHE STRING "" FORCE)
 endif()
 
 # find_checkout(VAR MARKER candidate...) — first candidate holding MARKER wins.
@@ -52,7 +52,7 @@ endfunction()
 
 # consensus — the C++ consensus lives in the luxcpp checkout, so look there first.
 # The sibling candidate stays for a side-by-side checkout, but it is LAST and it is
-# why the marker is a header rather than a directory name: beside node2 in the lux
+# why the marker is a header rather than a directory name: beside node in the lux
 # checkout sits luxfi/consensus, the GO implementation, under the very same name.
 # Matching on include/lux/consensus/node.hpp is what tells the two apart.
 find_checkout(_consensus "include/lux/consensus/node.hpp"
@@ -75,13 +75,13 @@ foreach(_p "${CONSENSUS_DIR}/CMakeLists.txt"
            "${LUXCPP_ROOT}/blst/bindings/blst.h"
            "${LUXCPP_ROOT}/crypto/bls/cpp/bls_signature.cpp")
   if(NOT EXISTS "${_p}")
-    message(FATAL_ERROR "node2: required reused asset not found: ${_p}\n"
+    message(FATAL_ERROR "node: required reused asset not found: ${_p}\n"
                         "searched for consensus and luxcpp beside this checkout; "
                         "set -DCONSENSUS_DIR=/path/to/consensus -DLUXCPP_ROOT=/path/to/luxcpp")
   endif()
 endforeach()
-message(STATUS "node2: consensus = ${CONSENSUS_DIR}")
-message(STATUS "node2: luxcpp     = ${LUXCPP_ROOT}")
+message(STATUS "node: consensus = ${CONSENSUS_DIR}")
+message(STATUS "node: luxcpp     = ${LUXCPP_ROOT}")
 
 find_package(Threads REQUIRED)
 
@@ -90,40 +90,40 @@ find_package(Threads REQUIRED)
 #    layers — no duplication here.
 add_subdirectory("${CONSENSUS_DIR}" consensus-build)
 
-# ── node2 — the NEW host library (the only compiled unit; the rest is header-only)
-add_library(node2 STATIC src/node2_host.cpp)
-target_include_directories(node2 PUBLIC include "${ZAP_DIR}")
-target_link_libraries(node2 PUBLIC consensus Threads::Threads)
-target_compile_options(node2 PRIVATE -Wall -Wextra -Wpedantic)
+# ── node — the NEW host library (the only compiled unit; the rest is header-only)
+add_library(node STATIC src/node_host.cpp)
+target_include_directories(node PUBLIC include "${ZAP_DIR}")
+target_link_libraries(node PUBLIC consensus Threads::Threads)
+target_compile_options(node PRIVATE -Wall -Wextra -Wpedantic)
 
-# ── node2d — the standalone daemon process
-add_executable(node2d src/node2d.cpp)
-target_link_libraries(node2d PRIVATE node2)
-target_compile_options(node2d PRIVATE -Wall -Wextra)
+# ── noded — the standalone daemon process
+add_executable(noded src/noded.cpp)
+target_link_libraries(noded PRIVATE node)
+target_compile_options(noded PRIVATE -Wall -Wextra)
 
 # ── tests — one registration, one list
 #   frame_reader    the reassembler in isolation (fragmentation, batching, limits)
 #   wire_vector     the bytes on the wire, written from the spec and read off a socket
 #   mesh_transport  what one hostile or dead socket can do to this node
 #   mesh_formation  mesh setup is bounded, and a missing validator is not a dead cluster
-#   node2_cluster   five hosts finalize over a real loopback mesh
-#   node2_liveness  down + wedged-but-present validators routed around, on the wire
+#   node_cluster   five hosts finalize over a real loopback mesh
+#   node_liveness  down + wedged-but-present validators routed around, on the wire
 enable_testing()
 
-set(NODE2_TESTS frame_reader wire_vector mesh_transport mesh_formation node2_cluster node2_liveness)
-foreach(_t ${NODE2_TESTS})
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness)
+foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
-    target_link_libraries(${_t}_test PRIVATE node2)
+    target_link_libraries(${_t}_test PRIVATE node)
     target_compile_options(${_t}_test PRIVATE -Wall -Wextra)
     add_test(NAME ${_t} COMMAND ${_t}_test)
 endforeach()
 
-# Apply NODE2_SANITIZE to node2's own targets only (the consensus subdir scopes
-# its own; blst/bls stay clean). One place for the whole node2 surface.
-if (NODE2_SANITIZE)
-    set(_n2_san -fsanitize=${NODE2_SANITIZE} -fno-omit-frame-pointer)
-    set(_n2_targets node2 node2d)
-    foreach(_t ${NODE2_TESTS})
+# Apply NODE_SANITIZE to node's own targets only (the consensus subdir scopes
+# its own; blst/bls stay clean). One place for the whole node surface.
+if (NODE_SANITIZE)
+    set(_n2_san -fsanitize=${NODE_SANITIZE} -fno-omit-frame-pointer)
+    set(_n2_targets node noded)
+    foreach(_t ${NODE_TESTS})
         list(APPEND _n2_targets ${_t}_test)
     endforeach()
     foreach(_t ${_n2_targets})

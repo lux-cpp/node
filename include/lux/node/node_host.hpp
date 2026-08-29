@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// node2_host.hpp — a running consensus node. Node2Host binds a TCP listener,
+// node_host.hpp — a running consensus node. Node2Host binds a TCP listener,
 // forms a mesh with its configured peers (one connection per pair), and drives
 // one local consensus::Node over that mesh.
 //
@@ -26,7 +26,7 @@
 #pragma once
 
 #include "lux/consensus/node.hpp"
-#include "lux/node2/mesh_vote_transport.hpp"
+#include "lux/node/mesh_vote_transport.hpp"
 
 #include <array>
 #include <chrono>
@@ -37,7 +37,7 @@
 #include <string>
 #include <vector>
 
-namespace lux::node2 {
+namespace lux::node {
 
 struct PeerAddr {
     std::string   host;
@@ -49,7 +49,7 @@ struct PeerAddr {
 // peer that stops reading makes broadcast fail (and be evicted) rather than hang.
 inline constexpr int kPeerIoTimeoutMs = 2000;
 
-// Fixed identity + consensus parameters for one node2 instance. Peer discovery is
+// Fixed identity + consensus parameters for one node instance. Peer discovery is
 // out of scope: the peer set is supplied to connect_mesh, fixed for the run.
 struct HostConfig {
     std::uint32_t                              index;       // this node's validator index
@@ -86,7 +86,7 @@ public:
     void submit(const lux::consensus::VotePosition& pos) { node_->submit(pos); }
 
     // One liveness round for `block`, driven by the committee this node can reach
-    // RIGHT NOW — itself plus its live peers. Say plainly what this is: node2 has
+    // RIGHT NOW — itself plus its live peers. Say plainly what this is: node has
     // no sampling layer, so this is a connectivity measure, not a poll of anyone's
     // opinion. A node keeps confirming only while it can still see a supermajority
     // of the set, and stops the moment it cannot; it never votes on a set it
@@ -106,7 +106,7 @@ public:
     }
     bool verifyCert(const lux::consensus::QuorumCert& c) const { return node_->verifyCert(c); }
 
-    // The finalization observer's step, and the reason node2 embeds the Node: a
+    // The finalization observer's step, and the reason node embeds the Node: a
     // height that carries a VERIFYING quorum cert is decided, so advance the
     // decided-height frontier. From then on the Node refuses to sign at that
     // height at all, which is what stops a late sibling from ever collecting this
@@ -140,4 +140,4 @@ private:
     std::unique_ptr<lux::consensus::Node> node_;
 };
 
-}  // namespace lux::node2
+}  // namespace lux::node
