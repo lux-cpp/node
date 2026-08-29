@@ -84,9 +84,16 @@ int main(int argc, char** argv) {
     cfg.validators = set;
     cfg.alpha      = std::uint32_t(alpha);
     // The committee IS the validator set: node samples nobody, so a round is
-    // "can I still reach int(0.8·n) of the set". Deriving k from n keeps a
-    // 3-node or a 33-node cluster on the same rule instead of a literal 5.
-    cfg.wave       = WaveConfig{std::uint32_t(n), 0.8, 4};
+    // "can I still reach a supermajority of the set". Deriving it from n keeps a
+    // 3-node and a 33-node cluster on the same rule instead of a literal 5.
+    //
+    // That supermajority is the SAME count the stake floor uses, and it has to
+    // be: 0.8·n is not the strict-⅔ rule, and at n=4 it asks for 4 of 4 while
+    // the floor it just cleared asks for 3. Every live node then reports the
+    // mesh up on reachable stake and no round ever decides — a daemon whose
+    // stated fault tolerance is defeated by its own threshold.
+    cfg.wave       = WaveConfig{std::uint32_t(n),
+                                equal_stake_supermajority(std::uint32_t(n)), 4};
 
     // consensus throws at its boundary on a set/α/wave combination that cannot
     // reach a decision. A daemon says so and exits; it does not abort.

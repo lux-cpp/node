@@ -164,7 +164,7 @@ int main() {
         cfg.pk         = pk;
         cfg.validators = {{pk, 20}};
         cfg.alpha      = 1;
-        cfg.wave       = WaveConfig{1, 1.0, 1};
+        cfg.wave       = WaveConfig{1, 1, 1};
         Node2Host host(std::move(cfg));
         host.listen_bind();
 

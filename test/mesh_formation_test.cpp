@@ -79,7 +79,7 @@ std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
     cfg.pk         = g_keys[index].pk;
     cfg.validators = g_set;
     cfg.alpha      = kAlpha;
-    cfg.wave       = WaveConfig{kN, 0.8, 4};
+    cfg.wave       = WaveConfig{kN, 3, 4};
     return std::make_unique<Node2Host>(std::move(cfg));
 }
 

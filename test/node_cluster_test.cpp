@@ -92,7 +92,7 @@ int main() {
         cfg.pk         = keys[i].pk;
         cfg.validators = set;
         cfg.alpha      = kAlpha;
-        cfg.wave       = WaveConfig{kN, 0.8, 4};  // threshold int(5*0.8)=4: a 5-reachable round votes
+        cfg.wave       = WaveConfig{kN, 4, 4};  // threshold int(5*0.8)=4: a 5-reachable round votes
         hosts.push_back(std::make_unique<Node2Host>(std::move(cfg)));
         ports[i] = hosts[i]->listen_bind();
         std::printf("  node %u  listening on 127.0.0.1:%u\n", i, ports[i]);
