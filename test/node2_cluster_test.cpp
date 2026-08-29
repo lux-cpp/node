@@ -92,7 +92,7 @@ int main() {
         cfg.pk         = keys[i].pk;
         cfg.validators = set;
         cfg.alpha      = kAlpha;
-        cfg.wave       = WaveConfig{5, 0.8, 4};  // threshold int(5*0.8)=4: poll(5,5) triggers a vote
+        cfg.wave       = WaveConfig{kN, 0.8, 4};  // threshold int(5*0.8)=4: a 5-reachable round votes
         cfg.epoch      = 1;
         hosts.push_back(std::make_unique<Node2Host>(std::move(cfg)));
         ports[i] = hosts[i]->listen_bind();
@@ -108,7 +108,7 @@ int main() {
                 std::map<std::uint32_t, PeerAddr> peers;
                 for (std::uint32_t j = 0; j < kN; ++j)
                     if (j != i) peers[j] = PeerAddr{"127.0.0.1", ports[j]};
-                ok[i] = hosts[i]->connect_mesh(peers, /*deadline_ms=*/10000) ? 1 : 0;
+                ok[i] = hosts[i]->connect_mesh(peers, /*deadline_ms=*/10000) == kN - 1 ? 1 : 0;
             });
         }
         for (auto& t : setup) t.join();
@@ -124,7 +124,7 @@ int main() {
     // ── propose one block; every node signs + broadcasts its ACCEPT vote ───────
     const VotePosition pos = make_pos(0x42, 1);
     for (auto& h : hosts) h->submit(pos);
-    for (int r = 0; r < 4; ++r) for (auto& h : hosts) h->poll(pos, 5, 5);  // beta confirmation rounds
+    for (int r = 0; r < 4; ++r) for (auto& h : hosts) h->round(pos);  // beta confirmation rounds
 
     // Decisive: each node now holds ONLY its own vote (self-echo) → NOT final.
     for (std::uint32_t i = 0; i < kN; ++i)

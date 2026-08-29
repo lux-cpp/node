@@ -7,9 +7,13 @@
 // without waiting for the faulty node". Two faults, each over real loopback sockets
 // with real BLS keys (the in-process companion is consensus2's liveness_test):
 //
-//   [A] DOWN validator — validator 4 of 5 never runs. The four live hosts form a
-//       4-node mesh and finalize the block (80 stake > 66) over the wire, with a
-//       verifying cert — the absent validator is routed around, never waited on.
+//   [A] DOWN validator — validator 4 of 5 is in every host's CONFIGURED set and
+//       never runs. The four live hosts dial it, get nothing, form the 4-node
+//       mesh anyway and finalize the block (80 stake > 66) over the wire with a
+//       verifying cert. Asking each host only for the peers that happened to be
+//       up would have proved nothing: nobody would ever have waited on the absent
+//       validator, which is exactly how a mesh that refused to form without it
+//       passed this test while five real processes deadlocked.
 //
 //   [B] WEDGED-but-PRESENT validator — validator 4 joins the full 5-node mesh and
 //       gossips, but its only vote is for a CONFLICTING forged block (it never
@@ -34,6 +38,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 using namespace lux::node2;
 using namespace lux::consensus2;
@@ -75,30 +84,45 @@ std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
     cfg.pk         = g_keys[index].pk;
     cfg.validators = g_set;
     cfg.alpha      = kAlpha;
-    cfg.wave       = WaveConfig{5, 0.8, 4};
+    cfg.wave       = WaveConfig{kN, 0.8, 4};
     cfg.epoch      = 1;
     return std::make_unique<Node2Host>(std::move(cfg));
 }
 
-// Form the mesh among the given host indices (each dials/accepts only its present
-// peers). Returns false if any host failed to connect. Concurrent setup phase.
-bool form_mesh(std::vector<std::unique_ptr<Node2Host>>& hosts,
-               const std::vector<std::uint32_t>& indices,
-               const std::map<std::uint32_t, std::uint16_t>& ports) {
-    std::vector<char> ok(hosts.size(), 0);
-    std::vector<std::thread> setup;
-    for (std::size_t s = 0; s < hosts.size(); ++s) {
-        setup.emplace_back([&, s] {
-            std::map<std::uint32_t, PeerAddr> peers;
-            for (std::uint32_t j : indices)
-                if (j != hosts[s]->index()) peers[j] = PeerAddr{"127.0.0.1", ports.at(j)};
-            ok[s] = hosts[s]->connect_mesh(peers, /*deadline_ms=*/10000) ? 1 : 0;
-        });
+// A loopback port that is BOUND but never listening: a validator that is in the
+// configured set and is not running. Connects to it are refused immediately, and
+// no other process can take the port while this object lives.
+struct DownPeer {
+    int fd = -1;
+    std::uint16_t port = 0;
+    DownPeer() {
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = 0;
+        if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) { std::puts("bind"); std::exit(2); }
+        socklen_t len = sizeof a;
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+        port = ntohs(a.sin_port);
     }
+    ~DownPeer() { if (fd >= 0) ::close(fd); }
+};
+
+// Form the mesh. Every host is asked to reach the WHOLE configured set — the set
+// a real daemon gets from genesis, including validators that are not running —
+// so a down validator is actually dialled and actually has to be routed around.
+// Asking each host only for the peers that happen to be up would prove nothing:
+// nobody would ever wait on the absent one. Returns each host's reached count.
+std::vector<std::size_t> form_mesh(std::vector<std::unique_ptr<Node2Host>>& hosts,
+                                   const std::map<std::uint32_t, PeerAddr>& configured,
+                                   int deadline_ms = 3000) {
+    std::vector<std::size_t> reached(hosts.size(), 0);
+    std::vector<std::thread> setup;
+    for (std::size_t s = 0; s < hosts.size(); ++s)
+        setup.emplace_back([&, s] { reached[s] = hosts[s]->connect_mesh(configured, deadline_ms); });
     for (auto& t : setup) t.join();
-    bool all = true;
-    for (char c : ok) all &= (c == 1);
-    return all;
+    return reached;
 }
 
 // Drive poll(real)+pump on `drivers` until all `expectFinal` hosts finalize `pos`,
@@ -108,7 +132,7 @@ bool drive_until_final(std::vector<Node2Host*>& drivers,
                        const VotePosition& pos, int seconds) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     for (;;) {
-        for (auto* h : drivers) { h->poll(pos, 5, 5); h->pump(); }
+        for (auto* h : drivers) { h->round(pos); h->pump(); }
         std::size_t still = 0;
         for (auto* h : expectFinal) if (!h->isFinal(pos.block_id)) ++still;
         if (still == 0) return true;
@@ -130,9 +154,19 @@ int main() {
     {
         const std::vector<std::uint32_t> live = {0, 1, 2, 3};  // validator 4 is DOWN
         std::vector<std::unique_ptr<Node2Host>> hosts;
-        std::map<std::uint32_t, std::uint16_t> ports;
-        for (std::uint32_t i : live) { hosts.push_back(make_host(i)); ports[i] = hosts.back()->listen_bind(); }
-        check(form_mesh(hosts, live, ports), "A: four live hosts formed the 4-node mesh (validator 4 down)");
+        std::map<std::uint32_t, PeerAddr> configured;
+        for (std::uint32_t i : live) {
+            hosts.push_back(make_host(i));
+            configured[i] = PeerAddr{"127.0.0.1", hosts.back()->listen_bind()};
+        }
+        // Validator 4 IS in the configured set and IS dialled — it just is not there.
+        DownPeer down;
+        configured[4] = PeerAddr{"127.0.0.1", down.port};
+
+        const std::vector<std::size_t> reached = form_mesh(hosts, configured);
+        bool reached_ok = true;
+        for (std::size_t r : reached) reached_ok &= (r == live.size() - 1);
+        check(reached_ok, "A: each live host reached the 3 running peers and routed around validator 4");
         for (auto& h : hosts) check(h->peer_count() == live.size() - 1, "A: each live host has 3 peers");
 
         const VotePosition pos = make_pos(0x42, 1);
@@ -157,9 +191,15 @@ int main() {
         const int b = g_fail;
         const std::vector<std::uint32_t> all = {0, 1, 2, 3, 4};  // validator 4 present but wedged
         std::vector<std::unique_ptr<Node2Host>> hosts;
-        std::map<std::uint32_t, std::uint16_t> ports;
-        for (std::uint32_t i : all) { hosts.push_back(make_host(i)); ports[i] = hosts.back()->listen_bind(); }
-        check(form_mesh(hosts, all, ports), "B: full 5-node mesh up (wedged validator present)");
+        std::map<std::uint32_t, PeerAddr> configured;
+        for (std::uint32_t i : all) {
+            hosts.push_back(make_host(i));
+            configured[i] = PeerAddr{"127.0.0.1", hosts.back()->listen_bind()};
+        }
+        const std::vector<std::size_t> reached = form_mesh(hosts, configured);
+        bool full = true;
+        for (std::size_t r : reached) full &= (r == all.size() - 1);
+        check(full, "B: full 5-node mesh up (wedged validator present)");
 
         const VotePosition real   = make_pos(0x42, 2);
         const VotePosition forged = make_pos(0x99, 2);  // conflicting sibling: same height
@@ -168,7 +208,7 @@ int main() {
         for (auto& h : hosts) { h->submit(real); h->submit(forged); }
 
         // Wedged host 4 commits + broadcasts its forged vote over the wire first.
-        for (int r = 0; r < 4; ++r) { hosts[4]->poll(forged, 5, 5); hosts[4]->pump(); }
+        for (int r = 0; r < 4; ++r) { hosts[4]->round(forged); hosts[4]->pump(); }
 
         std::vector<Node2Host*> honest;        // drivers + expected-final for `real`
         for (std::uint32_t i = 0; i < 4; ++i) honest.push_back(hosts[i].get());

@@ -17,6 +17,17 @@
 //     decode each complete vote frame, deliver via the sink. Returns the number
 //     of votes delivered (progress signal for the driver / observability).
 //
+// A PEER IS A MEMBER, NOT A WALL — one eviction rule, stated once in `dead`:
+// a peer whose stream closed, whose framing was violated, or whose socket will
+// not take a write is DROPPED. The quorum rule already decides finality from
+// whoever is left, so dropping a peer costs liveness nothing and removes every
+// way one socket can hold the node: an unbounded buffer (the reader is capped
+// and stops feeding once it rejects a stream), a corpse that is polled forever,
+// or a stalled reader that blocks broadcast (the host sets a send timeout, so a
+// write fails instead of hanging). Frames already reassembled are delivered
+// BEFORE the peer is dropped, so a validator that votes and then disconnects
+// still counts.
+//
 // Threading: in node2 each MeshVoteTransport is owned and driven by exactly one
 // thread (its host), so there is no shared-mutable consensus state. The per-peer
 // write mutex exists only to satisfy lux::zap::write_frame_locked's signature; it
@@ -29,7 +40,9 @@
 #include "lux/node2/frame_reader.hpp"
 #include "lux/zap/wire.hpp"                    // write_frame_locked, strip_flags
 
+#include <csignal>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -40,13 +53,30 @@
 
 namespace lux::node2 {
 
+// The vote codec writes three length-framed fixed-width fields — 32 + 48 + 96
+// bytes, each behind a 4-byte length — so a vote frame is exactly 188 bytes. A
+// frame on this link is a vote or it is a lie, and the reader is told so: one
+// page of headroom leaves room for the codec to grow without a negotiation while
+// still bounding a hostile peer to 4 KiB of our memory instead of 16 MiB.
+inline constexpr std::uint32_t kMaxVoteFrame = 4096;
+
+// A peer that hangs up must not kill this validator. Writing to a closed TCP peer
+// raises SIGPIPE, whose default disposition is process death — so any peer could
+// end a node by disconnecting at the moment it was broadcast to. The write already
+// reports EPIPE, and that return value is the whole signal the eviction rule needs.
+// Disarmed once per process, from the one place in node2 that writes to a socket.
+inline void ignore_sigpipe() {
+    static const bool once = [] { return ::signal(SIGPIPE, SIG_IGN) != SIG_ERR; }();
+    (void)once;
+}
+
 // Where decoded inbound (and self-echoed) votes go. Wiring this to Node::onVote
 // instead of holding a Node* is what keeps the transport free of consensus.
 using VoteSink = std::function<void(const lux::consensus2::SignedVote&)>;
 
 class MeshVoteTransport : public lux::consensus2::VoteTransport {
 public:
-    explicit MeshVoteTransport(VoteSink sink) : sink_(std::move(sink)) {}
+    explicit MeshVoteTransport(VoteSink sink) : sink_(std::move(sink)) { ignore_sigpipe(); }
 
     // The transport owns its peer fds: close them when it dies.
     ~MeshVoteTransport() override {
@@ -62,24 +92,33 @@ public:
     void add_peer(int fd) { peers_.push_back(std::make_unique<Peer>(fd)); }
 
     std::size_t peer_count() const noexcept { return peers_.size(); }
+    // Peers dropped so far by the eviction rule (observability / tests).
+    std::size_t evicted() const noexcept { return evicted_; }
 
     // VoteTransport: disseminate this node's own ACCEPT vote.
     void broadcast(const lux::consensus2::SignedVote& v) override {
         sink_(v);  // self-echo: the originator's own vote must reach its own gate
         const std::vector<std::uint8_t> payload = lux::consensus2::zap::encode_vote(v);
-        for (auto& p : peers_)
-            lux::zap::write_frame_locked(p->fd, p->wmu,
-                                         lux::consensus2::zap::kVoteMsgType,
-                                         payload.data(), payload.size());
+        for (std::size_t i = 0; i < peers_.size();) {
+            Peer& p = *peers_[i];
+            const bool sent = lux::zap::write_frame_locked(p.fd, p.wmu,
+                                                           lux::consensus2::zap::kVoteMsgType,
+                                                           payload.data(), payload.size());
+            if (sent) { ++i; continue; }
+            drop(i);  // the socket will not take our vote — that peer is gone
+        }
     }
 
     // Drain every peer; deliver each complete, structurally-valid vote frame.
     // Returns the number of votes delivered this call. Never blocks.
     std::size_t pump() {
         std::size_t delivered = 0;
-        for (auto& p : peers_) {
-            p->rx.drain_fd(p->fd);  // non-blocking; WouldBlock/Closed need no action here
-            while (auto f = p->rx.next()) {
+        for (std::size_t i = 0; i < peers_.size();) {
+            Peer& p = *peers_[i];
+            const Drain d = p.rx.drain_fd(p.fd);
+            // Deliver what completed BEFORE judging the peer: a validator that
+            // voted and then hung up still counts toward the quorum.
+            while (auto f = p.rx.next()) {
                 if (lux::zap::strip_flags(f->msg_type) != lux::consensus2::zap::kVoteMsgType)
                     continue;  // not a vote frame — ignore
                 if (auto vote = lux::consensus2::zap::decode_vote(f->payload)) {
@@ -89,20 +128,34 @@ public:
                 // a structurally-invalid payload is silently dropped: a peer cannot
                 // inject a malformed vote (decode_vote enforces exact field widths).
             }
+            if (dead(d, p)) { drop(i); continue; }
+            ++i;
         }
         return delivered;
     }
 
 private:
     struct Peer {
-        explicit Peer(int f) : fd(f) {}
+        explicit Peer(int f) : fd(f), rx(kMaxVoteFrame) {}
         int fd;
         std::mutex wmu;  // serializes write_frame_locked on this fd (uncontended here)
-        FrameReader rx;  // this peer's reassembly buffer
+        FrameReader rx;  // this peer's reassembly buffer, capped at one vote frame
     };
+
+    // THE eviction rule: the stream ended, or it broke the framing contract.
+    static bool dead(Drain d, const Peer& p) noexcept {
+        return d == Drain::Closed || p.rx.error();
+    }
+
+    void drop(std::size_t i) {
+        if (peers_[i]->fd >= 0) ::close(peers_[i]->fd);
+        peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(i));
+        ++evicted_;
+    }
 
     VoteSink sink_;
     std::vector<std::unique_ptr<Peer>> peers_;  // unique_ptr: Peer holds a non-movable mutex
+    std::size_t evicted_ = 0;
 };
 
 }  // namespace lux::node2
