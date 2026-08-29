@@ -81,9 +81,9 @@ Node2Host::Node2Host(HostConfig cfg) : cfg_(std::move(cfg)) {
     // the sink is only invoked during poll/pump (after node_ exists), so capturing
     // a member that is set just below is safe.
     mesh_ = std::make_unique<MeshVoteTransport>(
-        [this](const lux::consensus2::SignedVote& v) { node_->onVote(v); });
+        [this](const lux::consensus::SignedVote& v) { node_->onVote(v); });
 
-    node_ = std::make_unique<lux::consensus2::Node>(
+    node_ = std::make_unique<lux::consensus::Node>(
         cfg_.index, cfg_.sk, cfg_.pk, cfg_.validators,
         cfg_.alpha, cfg_.wave, *mesh_);
 }
@@ -207,7 +207,7 @@ std::size_t Node2Host::connect_mesh(const std::map<std::uint32_t, PeerAddr>& pee
     return mesh_->peer_count();
 }
 
-std::optional<lux::consensus2::QuorumCert> Node2Host::accept(const lux::consensus2::VotePosition& pos) {
+std::optional<lux::consensus::QuorumCert> Node2Host::accept(const lux::consensus::VotePosition& pos) {
     auto c = node_->cert(pos.block_id);
     if (!c || !node_->verifyCert(*c)) return std::nullopt;
     node_->mark_finalized_through(pos.height);

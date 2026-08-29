@@ -1,6 +1,6 @@
-# node2 — a running consensus2 node (ZAP votes over real TCP)
+# node2 — a running consensus node (ZAP votes over real TCP)
 
-`node2` hosts the **consensus2** engine and disseminates its votes over a **mesh
+`node2` hosts the **consensus** engine and disseminates its votes over a **mesh
 of real TCP sockets**, framed by the canonical **ZAP** wire codec. N validators,
 each on a real listener, dial each other and independently reach BLS quorum-cert
 finality over the wire — as threads in one binary and as separate OS processes.
@@ -18,12 +18,12 @@ finality over the wire — as threads in one binary and as separate OS processes
                                        the ONE place that knows non-blocking framing:
                                        reassembles ZAP frames from recv(MSG_DONTWAIT),
                                        bounded by the frame size its link carries.
-  codec/wire   encode/decode_vote REUSE consensus2/.../zap/vote_codec.hpp
+  codec/wire   encode/decode_vote REUSE consensus/.../zap/vote_codec.hpp
                Writer/Reader/           zap-cpp-core/.../zap/wire.hpp
                write_frame_locked
-  consensus    Node / Wave /      REUSE consensus2 (the gate, unmodified)
+  consensus    Node / Wave /      REUSE consensus (the gate, unmodified)
                QuorumCertEngine
-  crypto       consensus2::bls    REUSE consensus2 (consensus DST) + blst
+  crypto       consensus::bls    REUSE consensus (consensus DST) + blst
 ```
 
 Why a new `FrameReader` instead of `lux::zap::read_frame`: `read_frame` blocks
@@ -80,13 +80,18 @@ required by `write_frame_locked` (uncontended here).
 
 ## Build & test (links the reused checkouts, no vendoring)
 
-`consensus2` (sibling) and the `luxcpp` root (blst, `crypto/bls`, `zap-cpp-core`)
-are found automatically; `-DCONSENSUS2_DIR` / `-DLUXCPP_ROOT` override.
+`luxcpp/consensus` and the `luxcpp` root (blst, `crypto/bls`, `zap-cpp-core`) are
+found automatically; `-DCONSENSUS_DIR` / `-DLUXCPP_ROOT` override.
+
+The search matches on `include/lux/consensus/node.hpp`, not on the directory
+name, because the name alone is ambiguous: `luxfi/consensus` is the **Go**
+implementation and sits beside node2 in the lux checkout, while the C++ one lives
+under `luxcpp`. The header is what distinguishes them.
 
 ```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure       # node2's six + the reused consensus2 suite
+ctest --test-dir build --output-on-failure       # node2's six + the reused consensus suite
 ./scripts/cluster.sh build/node2d 19310 5        # 5 real PROCESSES over loopback TCP
 ./scripts/cluster.sh build/node2d 19310 5 4      # ...with validator 4 held down
 ```
@@ -108,7 +113,7 @@ ctest --test-dir build --output-on-failure       # node2's six + the reused cons
   dialled) and a WEDGED-but-present one are both routed around on the wire.
 
 Verified clean under ThreadSanitizer and ASan+UBSan+Leak (run TSan under
-`setarch -R`; instrumentation covers node2 + consensus2, never blst/bls).
+`setarch -R`; instrumentation covers node2 + consensus, never blst/bls).
 
 ## Conformance to Go
 
@@ -119,7 +124,7 @@ asserted in a comment.
   `MaxMessageSize=16 MiB` — byte-identical to `github.com/luxfi/api/zap`. A frame
   captured off a live `node2d` socket parses with Go's `zap.ReadMessage` with no
   error and three fields of exactly 32/48/96 bytes, zero trailing.
-- **The signed message and the floors** are consensus2's, checked against the
+- **The signed message and the floors** are consensus's, checked against the
   Go-generated corpus by `conformance_test`, which runs in this suite.
 
 ## Scope (honest)

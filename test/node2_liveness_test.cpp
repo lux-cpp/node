@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
 // node2_liveness_test.cpp — the PRODUCTION liveness proof OVER REAL TCP: a faulty
-// validator does not stall finality on the wire. consensus2 is leaderless, so the
+// validator does not stall finality on the wire. consensus is leaderless, so the
 // "proposer-fallback" property is realized as "any >2/3-stake quorum finalizes
 // without waiting for the faulty node". Two faults, each over real loopback sockets
-// with real BLS keys (the in-process companion is consensus2's liveness_test):
+// with real BLS keys (the in-process companion is consensus's liveness_test):
 //
 //   [A] DOWN validator — validator 4 of 5 is in every host's CONFIGURED set and
 //       never runs. The four live hosts dial it, get nothing, form the 4-node
@@ -45,7 +45,7 @@
 #include <unistd.h>
 
 using namespace lux::node2;
-using namespace lux::consensus2;
+using namespace lux::consensus;
 
 namespace {
 

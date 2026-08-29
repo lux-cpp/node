@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// mesh_vote_transport.hpp — consensus2's VoteTransport realized over a FULL MESH
+// mesh_vote_transport.hpp — consensus's VoteTransport realized over a FULL MESH
 // of real TCP sockets, framed by the canonical ZAP wire codec (zap-cpp-core).
 //
 // The existing zap::ZapVoteTransport is single-peer (one fd) and holds Node*
@@ -35,8 +35,8 @@
 
 #pragma once
 
-#include "lux/consensus2/node.hpp"            // VoteTransport, SignedVote
-#include "lux/consensus2/zap/vote_codec.hpp"  // encode_vote/decode_vote, kVoteMsgType
+#include "lux/consensus/node.hpp"            // VoteTransport, SignedVote
+#include "lux/consensus/zap/vote_codec.hpp"  // encode_vote/decode_vote, kVoteMsgType
 #include "lux/node2/frame_reader.hpp"
 #include "lux/zap/wire.hpp"                    // write_frame_locked, strip_flags
 
@@ -72,9 +72,9 @@ inline void ignore_sigpipe() {
 
 // Where decoded inbound (and self-echoed) votes go. Wiring this to Node::onVote
 // instead of holding a Node* is what keeps the transport free of consensus.
-using VoteSink = std::function<void(const lux::consensus2::SignedVote&)>;
+using VoteSink = std::function<void(const lux::consensus::SignedVote&)>;
 
-class MeshVoteTransport : public lux::consensus2::VoteTransport {
+class MeshVoteTransport : public lux::consensus::VoteTransport {
 public:
     explicit MeshVoteTransport(VoteSink sink) : sink_(std::move(sink)) { ignore_sigpipe(); }
 
@@ -96,13 +96,13 @@ public:
     std::size_t evicted() const noexcept { return evicted_; }
 
     // VoteTransport: disseminate this node's own ACCEPT vote.
-    void broadcast(const lux::consensus2::SignedVote& v) override {
+    void broadcast(const lux::consensus::SignedVote& v) override {
         sink_(v);  // self-echo: the originator's own vote must reach its own gate
-        const std::vector<std::uint8_t> payload = lux::consensus2::zap::encode_vote(v);
+        const std::vector<std::uint8_t> payload = lux::consensus::zap::encode_vote(v);
         for (std::size_t i = 0; i < peers_.size();) {
             Peer& p = *peers_[i];
             const bool sent = lux::zap::write_frame_locked(p.fd, p.wmu,
-                                                           lux::consensus2::zap::kVoteMsgType,
+                                                           lux::consensus::zap::kVoteMsgType,
                                                            payload.data(), payload.size());
             if (sent) { ++i; continue; }
             drop(i);  // the socket will not take our vote — that peer is gone
@@ -119,9 +119,9 @@ public:
             // Deliver what completed BEFORE judging the peer: a validator that
             // voted and then hung up still counts toward the quorum.
             while (auto f = p.rx.next()) {
-                if (lux::zap::strip_flags(f->msg_type) != lux::consensus2::zap::kVoteMsgType)
+                if (lux::zap::strip_flags(f->msg_type) != lux::consensus::zap::kVoteMsgType)
                     continue;  // not a vote frame — ignore
-                if (auto vote = lux::consensus2::zap::decode_vote(f->payload)) {
+                if (auto vote = lux::consensus::zap::decode_vote(f->payload)) {
                     sink_(*vote);  // structurally valid → hand to the gate (which verifies + dedups)
                     ++delivered;
                 }

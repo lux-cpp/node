@@ -41,7 +41,7 @@
 #include <unistd.h>
 
 using namespace lux::node2;
-using namespace lux::consensus2;
+using namespace lux::consensus;
 
 namespace {
 
@@ -95,7 +95,7 @@ int main() {
         check(lux::zap::MaxMessageSize == 16u * 1024u * 1024u, "ZAP ceiling is 16 MiB");
         check(lux::zap::MsgResponseFlag == 0x80 && lux::zap::MsgErrorFlag == 0x40 &&
               lux::zap::MsgTypeMask == 0x3F, "the flag bits and the type mask are Go's");
-        check(lux::consensus2::zap::kVoteMsgType < 0x40,
+        check(lux::consensus::zap::kVoteMsgType < 0x40,
               "the vote type fits the low six bits, so the flags OR in cleanly");
         check(kMaxVoteFrame <= lux::zap::MaxMessageSize,
               "the vote link's cap sits under the ZAP ceiling");

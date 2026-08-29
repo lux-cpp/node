@@ -4,7 +4,7 @@
 // node2_cluster_test.cpp — the live-mesh proof. Five Node2Host instances bind
 // real loopback TCP listeners on distinct (ephemeral) ports, dial each other into
 // a full mesh (listen/accept/connect — no socketpair), and each runs a real
-// consensus2::Node with its own BLS key. We propose one block, let every node
+// consensus::Node with its own BLS key. We propose one block, let every node
 // sign + broadcast its ACCEPT vote over the wire, then drive the pump loop and
 // assert ALL FIVE independently reach finality with a verifying >2/3-stake quorum
 // certificate.
@@ -33,7 +33,7 @@
 #include <vector>
 
 using namespace lux::node2;
-using namespace lux::consensus2;
+using namespace lux::consensus;
 
 namespace {
 

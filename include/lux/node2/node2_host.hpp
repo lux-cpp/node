@@ -1,9 +1,9 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// node2_host.hpp — a running consensus2 node. Node2Host binds a TCP listener,
+// node2_host.hpp — a running consensus node. Node2Host binds a TCP listener,
 // forms a mesh with its configured peers (one connection per pair), and drives
-// one local consensus2::Node over that mesh.
+// one local consensus::Node over that mesh.
 //
 // Identity (index + BLS key + validator set) is fixed at construction; the peer
 // ADDRESSES are supplied later to connect_mesh(), because in a real cluster the
@@ -25,7 +25,7 @@
 
 #pragma once
 
-#include "lux/consensus2/node.hpp"
+#include "lux/consensus/node.hpp"
 #include "lux/node2/mesh_vote_transport.hpp"
 
 #include <array>
@@ -55,10 +55,10 @@ struct HostConfig {
     std::uint32_t                              index;       // this node's validator index
     std::uint16_t                              port;        // requested listen port (0 = OS-assigned)
     std::array<std::uint8_t, 32>               sk;          // this node's BLS secret key
-    lux::consensus2::PubKey                    pk;          // this node's BLS public key
-    std::vector<lux::consensus2::Validator>    validators;  // the full, agreed validator set
+    lux::consensus::PubKey                    pk;          // this node's BLS public key
+    std::vector<lux::consensus::Validator>    validators;  // the full, agreed validator set
     std::uint32_t                              alpha;       // distinct-voter floor (gate)
-    lux::consensus2::WaveConfig                wave;        // liveness/voting committee config
+    lux::consensus::WaveConfig                wave;        // liveness/voting committee config
 };
 
 class Node2Host {
@@ -83,7 +83,7 @@ public:
     std::size_t connect_mesh(const std::map<std::uint32_t, PeerAddr>& peers, int deadline_ms = 10000);
 
     // ── consensus driving (single-threaded) ─────────────────────────────────
-    void submit(const lux::consensus2::VotePosition& pos) { node_->submit(pos); }
+    void submit(const lux::consensus::VotePosition& pos) { node_->submit(pos); }
 
     // One liveness round for `block`, driven by the committee this node can reach
     // RIGHT NOW — itself plus its live peers. Say plainly what this is: node2 has
@@ -92,7 +92,7 @@ public:
     // of the set, and stops the moment it cannot; it never votes on a set it
     // cannot reach. When photon sampling lands it replaces exactly this one
     // expression, and nothing above it changes.
-    lux::consensus2::Decision round(const lux::consensus2::BlockId& block) {
+    lux::consensus::Decision round(const lux::consensus::BlockId& block) {
         const auto reachable = static_cast<std::uint32_t>(mesh_->peer_count() + 1);
         return node_->poll(block, reachable, reachable);
     }
@@ -100,20 +100,20 @@ public:
     // Drain inbound votes from every peer into the gate. Returns votes delivered.
     std::size_t pump() { return mesh_->pump(); }
 
-    bool isFinal(const lux::consensus2::BlockId& b) const { return node_->isFinal(b); }
-    std::optional<lux::consensus2::QuorumCert> cert(const lux::consensus2::BlockId& b) const {
+    bool isFinal(const lux::consensus::BlockId& b) const { return node_->isFinal(b); }
+    std::optional<lux::consensus::QuorumCert> cert(const lux::consensus::BlockId& b) const {
         return node_->cert(b);
     }
-    bool verifyCert(const lux::consensus2::QuorumCert& c) const { return node_->verifyCert(c); }
+    bool verifyCert(const lux::consensus::QuorumCert& c) const { return node_->verifyCert(c); }
 
     // The finalization observer's step, and the reason node2 embeds the Node: a
     // height that carries a VERIFYING quorum cert is decided, so advance the
     // decided-height frontier. From then on the Node refuses to sign at that
     // height at all, which is what stops a late sibling from ever collecting this
-    // validator's second signature (consensus2 node.hpp mark_finalized_through
+    // validator's second signature (consensus node.hpp mark_finalized_through
     // names the embedder as the caller — this is that call). Returns the cert, or
     // nullopt if the block is not final or its cert does not verify.
-    std::optional<lux::consensus2::QuorumCert> accept(const lux::consensus2::VotePosition& pos);
+    std::optional<lux::consensus::QuorumCert> accept(const lux::consensus::VotePosition& pos);
 
     std::uint32_t index()      const noexcept { return cfg_.index; }
     std::uint16_t port()       const noexcept { return bound_port_; }
@@ -137,7 +137,7 @@ private:
     int                                 listen_fd_  = -1;
     std::uint16_t                       bound_port_ = 0;
     std::unique_ptr<MeshVoteTransport>  mesh_;
-    std::unique_ptr<lux::consensus2::Node> node_;
+    std::unique_ptr<lux::consensus::Node> node_;
 };
 
 }  // namespace lux::node2
