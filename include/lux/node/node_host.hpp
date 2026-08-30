@@ -5,6 +5,12 @@
 // forms a mesh with its configured peers (one connection per pair), and drives
 // one local consensus::Node over that mesh.
 //
+// It is a COMPOSITION, and the three parts it composes are each usable without
+// it: Mesh forms the links (lux/node/mesh.hpp), MeshVoteTransport frames votes
+// over them, and consensus::Node decides. A chain that wants its own driver —
+// lux-cpp/sdk builds one that also owns blocks and execution — takes the first
+// two and supplies the third, rather than reimplementing the socket dance.
+//
 // Identity (index + BLS key + validator set) is fixed at construction; the peer
 // ADDRESSES are supplied later to connect_mesh(), because in a real cluster the
 // listen port may be ephemeral and is only known after bind. That split keeps
@@ -26,28 +32,17 @@
 #pragma once
 
 #include "lux/consensus/node.hpp"
+#include "lux/node/mesh.hpp"
 #include "lux/node/mesh_vote_transport.hpp"
 
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
-#include <string>
 #include <vector>
 
 namespace lux::node {
-
-struct PeerAddr {
-    std::string   host;
-    std::uint16_t port;
-};
-
-// Every blocking operation on a peer socket is bounded by this window, so no
-// single peer can hold the node: a handshake that never arrives times out, and a
-// peer that stops reading makes broadcast fail (and be evicted) rather than hang.
-inline constexpr int kPeerIoTimeoutMs = 2000;
 
 // Fixed identity + consensus parameters for one node instance. Peer discovery is
 // out of scope: the peer set is supplied to connect_mesh, fixed for the run.
@@ -59,6 +54,19 @@ struct HostConfig {
     std::vector<lux::consensus::Validator>    validators;  // the full, agreed validator set
     std::uint32_t                              alpha;       // distinct-voter floor (gate)
     lux::consensus::WaveConfig                wave;        // liveness/voting committee config
+
+    // The height this node has already DECIDED, read from its own durable store
+    // before it starts. consensus::Node::mark_finalized_through names the embedder
+    // as the only party that can supply this, because the Node keeps the frontier
+    // in memory and has no persistence layer: leave it at 0 after a restart and a
+    // height whose slot was pruned becomes re-signable, which is the cross-restart
+    // prune-then-resign fork (proofs/no_double_finalize.tex §Durability across a
+    // restart). 0 is correct for a node that has decided nothing — the frontier is
+    // engaged at 0 and only height 0, which is never voted on, is closed.
+    //
+    // Go seeds the same floor from vm.LastAccepted at Start, so a chain reads it
+    // from its last accepted block's height.
+    std::uint64_t                              accepted = 0;
 };
 
 class Node2Host {
@@ -72,15 +80,13 @@ public:
     // Bind 127.0.0.1:cfg.port and listen. Returns the port actually bound (which
     // resolves a requested 0). Throws std::runtime_error at the boundary on
     // failure. The config keeps the request; port() reports the result.
-    std::uint16_t listen_bind();
+    std::uint16_t listen_bind() { return mesh_.listen_bind(cfg_.port); }
 
-    // Reach as many of `peers` as possible within ONE deadline that covers the
-    // whole phase — accepting, dialing, and the index handshake alike. The lower-
-    // indexed end of each pair dials and the higher-indexed end accepts, so a pair
-    // has exactly one connection; accepts and dials are swept together, so an
-    // absent low-indexed peer cannot starve the dials. Returns the number of peers
-    // connected (== peer_count()). Must be preceded by listen_bind.
-    std::size_t connect_mesh(const std::map<std::uint32_t, PeerAddr>& peers, int deadline_ms = 10000);
+    // Reach as many of `peers` as possible within ONE deadline. Returns the number
+    // of peers connected (== peer_count()). Must be preceded by listen_bind.
+    std::size_t connect_mesh(const std::map<std::uint32_t, PeerAddr>& peers, int deadline_ms = 10000) {
+        return mesh_.connect(peers, deadline_ms);
+    }
 
     // ── consensus driving (single-threaded) ─────────────────────────────────
     void submit(const lux::consensus::VotePosition& pos) { node_->submit(pos); }
@@ -93,12 +99,12 @@ public:
     // cannot reach. When photon sampling lands it replaces exactly this one
     // expression, and nothing above it changes.
     lux::consensus::Decision round(const lux::consensus::BlockId& block) {
-        const auto reachable = static_cast<std::uint32_t>(mesh_->peer_count() + 1);
+        const auto reachable = static_cast<std::uint32_t>(tx_->peer_count() + 1);
         return node_->poll(block, reachable, reachable);
     }
 
     // Drain inbound votes from every peer into the gate. Returns votes delivered.
-    std::size_t pump() { return mesh_->pump(); }
+    std::size_t pump() { return tx_->pump(); }
 
     bool isFinal(const lux::consensus::BlockId& b) const { return node_->isFinal(b); }
     std::optional<lux::consensus::QuorumCert> cert(const lux::consensus::BlockId& b) const {
@@ -113,30 +119,22 @@ public:
     // validator's second signature (consensus node.hpp mark_finalized_through
     // names the embedder as the caller — this is that call). Returns the cert, or
     // nullopt if the block is not final or its cert does not verify.
+    //
+    // The caller must make the height durable, so that the next boot can supply it
+    // as HostConfig::accepted. This call moves the IN-MEMORY frontier only.
     std::optional<lux::consensus::QuorumCert> accept(const lux::consensus::VotePosition& pos);
 
     std::uint32_t index()      const noexcept { return cfg_.index; }
-    std::uint16_t port()       const noexcept { return bound_port_; }
-    std::size_t   peer_count() const noexcept { return mesh_->peer_count(); }
+    std::uint16_t port()       const noexcept { return mesh_.port(); }
+    std::size_t   peer_count() const noexcept { return tx_->peer_count(); }
 
 private:
-    using Clock    = std::chrono::steady_clock;
-    using Deadline = Clock::time_point;
-
-    // Take one inbound peer off the listen backlog: accept() + its 4-byte BE index
-    // handshake, both bounded. Sets `peer_index` to the index the dialer claimed —
-    // a claim, not a proof, which connect_mesh checks against the slots it is
-    // waiting on. Returns the connected fd, or -1.
-    int accept_one(std::uint32_t& peer_index);
-    // One dial attempt (no retry — the sweep in connect_mesh owns the retry policy):
-    // non-blocking connect bounded by `wait_ms`, then our 4-byte BE index handshake.
-    // Returns the connected fd, or -1.
-    int dial_once(const PeerAddr& a, int wait_ms);
-
-    HostConfig                          cfg_;
-    int                                 listen_fd_  = -1;
-    std::uint16_t                       bound_port_ = 0;
-    std::unique_ptr<MeshVoteTransport>  mesh_;
+    HostConfig                            cfg_;
+    // Declaration order is the construction order, and it is load-bearing: the
+    // transport must outlive the Mesh that hands it sockets, and both must outlive
+    // the Node that votes over them.
+    std::unique_ptr<MeshVoteTransport>    tx_;
+    Mesh                                  mesh_;
     std::unique_ptr<lux::consensus::Node> node_;
 };
 

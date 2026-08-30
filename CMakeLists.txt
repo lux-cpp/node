@@ -91,7 +91,7 @@ find_package(Threads REQUIRED)
 add_subdirectory("${CONSENSUS_DIR}" consensus-build)
 
 # ── node — the NEW host library (the only compiled unit; the rest is header-only)
-add_library(node STATIC src/node_host.cpp)
+add_library(node STATIC src/mesh.cpp src/node_host.cpp)
 target_include_directories(node PUBLIC include "${ZAP_DIR}")
 target_link_libraries(node PUBLIC consensus Threads::Threads)
 target_compile_options(node PRIVATE -Wall -Wextra -Wpedantic)
@@ -108,9 +108,10 @@ target_compile_options(noded PRIVATE -Wall -Wextra)
 #   mesh_formation  mesh setup is bounded, and a missing validator is not a dead cluster
 #   node_cluster   five hosts finalize over a real loopback mesh
 #   node_liveness  down + wedged-but-present validators routed around, on the wire
+#   boot_floor      a restarted validator does not re-sign a height it decided
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
