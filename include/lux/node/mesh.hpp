@@ -11,7 +11,7 @@
 // once more between connecting and framing.
 //
 // Drawing it here is what lets one mesh serve two drivers: Node2Host, which
-// runs a bare consensus::Node, and a chain built on lux-cpp/sdk, which runs its
+// runs a bare consensus::Party, and a chain built on lux-cpp/sdk, which runs its
 // own validator over the same wire. Neither has to reimplement the dance, and
 // neither can drift from the other about who dials whom.
 //
