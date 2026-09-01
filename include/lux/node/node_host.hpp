@@ -3,11 +3,11 @@
 //
 // node_host.hpp — a running consensus node. Node2Host binds a TCP listener,
 // forms a mesh with its configured peers (one connection per pair), and drives
-// one local consensus::Node over that mesh.
+// one local consensus::Party over that mesh.
 //
 // It is a COMPOSITION, and the three parts it composes are each usable without
 // it: Mesh forms the links (lux/node/mesh.hpp), MeshVoteTransport frames votes
-// over them, and consensus::Node decides. A chain that wants its own driver —
+// over them, and consensus::Party decides. A chain that wants its own driver —
 // lux-cpp/sdk builds one that also owns blocks and execution — takes the first
 // two and supplies the third, rather than reimplementing the socket dance.
 //
@@ -56,8 +56,8 @@ struct HostConfig {
     lux::consensus::WaveConfig                wave;        // liveness/voting committee config
 
     // The height this node has already DECIDED, read from its own durable store
-    // before it starts. consensus::Node::mark_finalized_through names the embedder
-    // as the only party that can supply this, because the Node keeps the frontier
+    // before it starts. consensus::Party::mark_finalized_through names the embedder
+    // as the only one that can supply this, because the Party keeps the frontier
     // in memory and has no persistence layer: leave it at 0 after a restart and a
     // height whose slot was pruned becomes re-signable, which is the cross-restart
     // prune-then-resign fork (proofs/no_double_finalize.tex §Durability across a
@@ -112,9 +112,9 @@ public:
     }
     bool verifyCert(const lux::consensus::QuorumCert& c) const { return node_->verifyCert(c); }
 
-    // The finalization observer's step, and the reason node embeds the Node: a
+    // The finalization observer's step, and the reason node embeds the Party: a
     // height that carries a VERIFYING quorum cert is decided, so advance the
-    // decided-height frontier. From then on the Node refuses to sign at that
+    // decided-height frontier. From then on the Party refuses to sign at that
     // height at all, which is what stops a late sibling from ever collecting this
     // validator's second signature (consensus node.hpp mark_finalized_through
     // names the embedder as the caller — this is that call). Returns the cert, or
@@ -129,13 +129,13 @@ public:
     std::size_t   peer_count() const noexcept { return tx_->peer_count(); }
 
 private:
-    HostConfig                            cfg_;
+    HostConfig                             cfg_;
     // Declaration order is the construction order, and it is load-bearing: the
     // transport must outlive the Mesh that hands it sockets, and both must outlive
-    // the Node that votes over them.
-    std::unique_ptr<MeshVoteTransport>    tx_;
-    Mesh                                  mesh_;
-    std::unique_ptr<lux::consensus::Node> node_;
+    // the Party that votes over them.
+    std::unique_ptr<MeshVoteTransport>     tx_;
+    Mesh                                   mesh_;
+    std::unique_ptr<lux::consensus::Party> node_;
 };
 
 }  // namespace lux::node

@@ -4,7 +4,7 @@
 // boot_floor_test.cpp — a validator that restarts must not sign a height it has
 // already decided, and HostConfig::accepted is how it is told which one that is.
 //
-// consensus::Node keeps the decided-height frontier IN MEMORY and says so: it
+// consensus::Party keeps the decided-height frontier IN MEMORY and says so: it
 // names the embedder as the only party that can restore it, because only the
 // embedder has a durable store. Node2Host is that embedder. Before this, it had
 // no way to be told — the frontier could only be advanced by accept(), which
