@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
     // mesh up on reachable stake and no round ever decides — a daemon whose
     // stated fault tolerance is defeated by its own threshold.
     cfg.wave       = WaveConfig{std::uint32_t(n),
-                                two_thirds_count(std::uint32_t(n)), 4};
+                                lux::consensus::equal_stake_supermajority(std::uint32_t(n)), 4};
 
     // consensus throws at its boundary on a set/wave combination that cannot
     // reach a decision. A daemon says so and exits; it does not abort.
