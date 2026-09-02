@@ -51,7 +51,6 @@ namespace {
 
 constexpr std::uint32_t kN     = 5;
 constexpr std::uint64_t kStake = 20;   // total 100, floor 66
-constexpr std::uint32_t kAlpha = 4;    // 4 voters = 80 > 66; 1 fault tolerated
 
 int g_fail = 0;
 void check(bool ok, const std::string& what) {
@@ -83,7 +82,6 @@ std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
     cfg.sk         = g_keys[index].sk;
     cfg.pk         = g_keys[index].pk;
     cfg.validators = g_set;
-    cfg.alpha      = kAlpha;
     cfg.wave       = WaveConfig{kN, 4, 4};
     return std::make_unique<Node2Host>(std::move(cfg));
 }
