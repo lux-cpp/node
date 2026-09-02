@@ -44,6 +44,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -54,11 +55,38 @@
 namespace lux::node {
 
 // The vote codec writes three length-framed fixed-width fields — 32 + 48 + 96
-// bytes, each behind a 4-byte length — so a vote frame is exactly 188 bytes. A
-// frame on this link is a vote or it is a lie, and the reader is told so: one
-// page of headroom leaves room for the codec to grow without a negotiation while
-// still bounding a hostile peer to 4 KiB of our memory instead of 16 MiB.
+// bytes, each behind a 4-byte length — so a vote frame is exactly 188 bytes. One
+// page of headroom leaves room for the codec to grow without a negotiation.
 inline constexpr std::uint32_t kMaxVoteFrame = 4096;
+
+// ZAP msg type for a gossiped chain transaction. The link now carries two kinds
+// of thing, because a chain needs both: a vote is what a validator concluded, a
+// transaction is what a user asked for. Without the second, a transaction handed
+// to ONE node is in ONE node's block, every other validator builds a different
+// block, and the height never certifies — the correct failure, but a useless
+// one.
+inline constexpr std::uint8_t kTxMsgType = 0x12;
+
+// ZAP msg type for a proposed block — Go's block-ingestion `Put`. ONE validator
+// proposes each height and the rest execute what they receive, which is what
+// makes a height deterministic without every node first having to hold an
+// identical mempool. It is also the honest division of labour: a follower that
+// re-derives the block from its own pending set is guessing at the proposer's,
+// whereas a follower handed the bytes runs exactly what was proposed and
+// disagrees loudly (a different root, hence a different signed message) if its
+// execution differs.
+inline constexpr std::uint8_t kBlockMsgType = 0x13;
+
+// What one frame on this link may carry. A vote is 188 bytes; a transaction is
+// the large one, and this is the bound a hostile peer is held to. It is stated
+// as the LINK's cap rather than any one message's, because the reader that
+// enforces it sees frames, not meanings.
+//
+// 128 KiB is chosen against what actually rides here: it is past any signed
+// transaction (Ethereum's own relay limit is 128 KiB) and far under ZAP's 16 MiB
+// ceiling, so a peer that opens a socket and announces an enormous frame is
+// refused at the header instead of being allocated for.
+inline constexpr std::uint32_t kMaxMeshFrame = 128u * 1024u;
 
 // A peer that hangs up must not kill this validator. Writing to a closed TCP peer
 // raises SIGPIPE, whose default disposition is process death — so any peer could
@@ -73,6 +101,11 @@ inline void ignore_sigpipe() {
 // Where decoded inbound (and self-echoed) votes go. Wiring this to Node::onVote
 // instead of holding a Node* is what keeps the transport free of consensus.
 using VoteSink = std::function<void(const lux::consensus::SignedVote&)>;
+
+// Where a non-vote frame goes. One handler per msg type, registered by the host;
+// an unregistered type is dropped, so a peer cannot make this node do work by
+// naming a message it does not serve.
+using Sink = std::function<void(const std::vector<std::uint8_t>& payload)>;
 
 class MeshVoteTransport : public lux::consensus::VoteTransport {
 public:
@@ -90,6 +123,25 @@ public:
     // Register one connected peer stream socket. Called once per peer during mesh
     // setup, by the single setup thread — no locking needed.
     void add_peer(int fd) { peers_.push_back(std::make_unique<Peer>(fd)); }
+
+    // Register a handler for a non-vote msg type. Votes keep their own sink
+    // because consensus owns them; everything else the chain carries arrives
+    // here.
+    void on(std::uint8_t type, Sink h) { sinks_[lux::zap::strip_flags(type)] = std::move(h); }
+
+    // Send one framed payload to every peer. No self-echo — a vote is echoed
+    // because the gate must count the originator's own, whereas a transaction
+    // this node already holds does not need to be handed back to itself.
+    void gossip(std::uint8_t type, const std::vector<std::uint8_t>& payload) {
+        for (std::size_t i = 0; i < peers_.size();) {
+            Peer& p = *peers_[i];
+            if (lux::zap::write_frame_locked(p.fd, p.wmu, type, payload.data(), payload.size())) {
+                ++i;
+                continue;
+            }
+            drop(i);
+        }
+    }
 
     std::size_t peer_count() const noexcept { return peers_.size(); }
     // Peers dropped so far by the eviction rule (observability / tests).
@@ -119,8 +171,14 @@ public:
             // Deliver what completed BEFORE judging the peer: a validator that
             // voted and then hung up still counts toward the quorum.
             while (auto f = p.rx.next()) {
-                if (lux::zap::strip_flags(f->msg_type) != lux::consensus::zap::kVoteMsgType)
-                    continue;  // not a vote frame — ignore
+                const std::uint8_t type = lux::zap::strip_flags(f->msg_type);
+                if (type != lux::consensus::zap::kVoteMsgType) {
+                    // Some other kind of message the chain carries. Dispatch it
+                    // if this node serves that type; drop it if not.
+                    const auto h = sinks_.find(type);
+                    if (h != sinks_.end()) h->second(f->payload);
+                    continue;
+                }
                 if (auto vote = lux::consensus::zap::decode_vote(f->payload)) {
                     sink_(*vote);  // structurally valid → hand to the gate (which verifies + dedups)
                     ++delivered;
@@ -136,7 +194,7 @@ public:
 
 private:
     struct Peer {
-        explicit Peer(int f) : fd(f), rx(kMaxVoteFrame) {}
+        explicit Peer(int f) : fd(f), rx(kMaxMeshFrame) {}
         int fd;
         std::mutex wmu;  // serializes write_frame_locked on this fd (uncontended here)
         FrameReader rx;  // this peer's reassembly buffer, capped at one vote frame
@@ -154,6 +212,7 @@ private:
     }
 
     VoteSink sink_;
+    std::map<std::uint8_t, Sink> sinks_;        // msg type → handler, for everything else
     std::vector<std::unique_ptr<Peer>> peers_;  // unique_ptr: Peer holds a non-movable mutex
     std::size_t evicted_ = 0;
 };

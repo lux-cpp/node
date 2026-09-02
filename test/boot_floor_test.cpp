@@ -15,16 +15,27 @@
 //
 // THE OBSERVABLE IS THE SIGNATURE, AND IT IS READ OFF THE WIRE. round() reports
 // the wave's decision either way — the gate simply declines to sign (node.cpp
-// poll, guard 2) — so a Decision proves nothing here. Instead two hosts are
-// meshed over real loopback TCP with α = 2, so a certificate exists only if BOTH
-// signed. The witness host is identical in both runs; the ONE thing that changes
-// is the floor the other host booted with.
+// poll, guard 2) — so a Decision proves nothing here. Instead FOUR hosts are
+// meshed over real loopback TCP and the witness assembles a certificate; what is
+// read out of it is WHO SIGNED. The witness host is identical in both runs; the
+// ONE thing that changes is the floor host 0 booted with.
 //
-//   floor below the height  →  it signs   →  2 votes cross the wire  →  cert
-//   floor at the height     →  it is mute →  1 vote                  →  no cert
+//   floor below the height  →  it signs   →  its key is among the voters
+//   floor at the height     →  it is mute →  its key is absent, the rest still sign
+//
+// FOUR, not two, and the reason is a rule in the gate rather than a preference
+// here: Quasar's committee floor is kMinBFTCommittee. Below four signers a
+// two-thirds supermajority tolerates f = (n-1)/3 = 0 faults, so a unanimous
+// certificate over such a set is forged by any single compromised key among its
+// signers — the gate refuses to assemble one at all. A two-host version of this
+// test asserted its property through the ABSENCE of a certificate the gate now
+// declines to build for an unrelated reason, which is a control that passes for
+// the wrong cause. Asking which keys are in the cert says the same thing
+// directly, and says it at a set size the tier actually serves.
 //
 // A control that did not distinguish these would be a test of nothing, so the
-// run that must produce a cert is asserted just as hard as the run that must not.
+// run in which host 0 must sign is asserted just as hard as the run in which it
+// must not.
 
 #include "lux/node/node_host.hpp"
 #include "bls_signature.hpp"
@@ -43,8 +54,8 @@ using namespace lux::consensus;
 
 namespace {
 
-constexpr std::uint32_t kN      = 2;    // validators
-constexpr std::uint64_t kStake  = 50;   // each → 100 total
+constexpr std::uint32_t kN      = 4;    // validators — Quasar's committee floor
+constexpr std::uint64_t kStake  = 25;   // each → 100 total
 constexpr std::uint64_t kHeight = 7;    // the height under test
 constexpr int           kBeta   = 2;
 
@@ -77,11 +88,11 @@ VotePosition make_pos(std::uint8_t tag, std::uint64_t h) {
 std::vector<Key>       g_keys;
 std::vector<Validator> g_set;
 
-// Run one height on a real two-host mesh. `booted_at` is the durable decided
-// height host 0 comes up with; host 1 is always fresh. Returns how many voters
-// the witness (host 1) could assemble into a certificate — 2 if both signed,
-// 0 if it could not reach α at all.
-std::size_t voters_at_height(std::uint64_t booted_at) {
+// Run one height on a real kN-host mesh. `booted_at` is the durable decided
+// height host 0 comes up with; every other host is fresh. Returns the witness's
+// certificate voter list, so the caller can ask both how many signed and whether
+// host 0 is among them. Empty means no certificate formed at all.
+std::vector<PubKey> voters_at_height(std::uint64_t booted_at) {
     std::vector<std::unique_ptr<Node2Host>> hosts;
     std::vector<std::uint16_t> ports(kN);
     for (std::uint32_t i = 0; i < kN; ++i) {
@@ -91,7 +102,7 @@ std::size_t voters_at_height(std::uint64_t booted_at) {
         cfg.sk         = g_keys[i].sk;
         cfg.pk         = g_keys[i].pk;
         cfg.validators = g_set;
-        cfg.wave       = WaveConfig{kN, kN, kBeta};  // both reachable → the round counts
+        cfg.wave       = WaveConfig{kN, kN, kBeta};  // all reachable → the round counts
         cfg.accepted   = (i == 0) ? booted_at : 0;   // THE ONE VARIABLE
         hosts.push_back(std::make_unique<Node2Host>(std::move(cfg)));
         ports[i] = hosts[i]->listen_bind();
@@ -123,9 +134,15 @@ std::size_t voters_at_height(std::uint64_t booted_at) {
         for (auto& h : hosts) h->pump();
 
     const auto c = hosts[1]->cert(pos.block_id);
-    if (!c) return 0;
+    if (!c) return {};
     if (!hosts[1]->verifyCert(*c)) { std::puts("    a cert that does not verify"); std::exit(2); }
-    return c->voters.size();
+    return c->voters;
+}
+
+bool signed_by(const std::vector<PubKey>& voters, const PubKey& who) {
+    for (const auto& v : voters)
+        if (v == who) return true;
+    return false;
 }
 
 }  // namespace
@@ -143,17 +160,20 @@ int main() {
     // cross the wire, and the witness assembles a full certificate. Without this
     // run passing, the run below would prove only that something was broken.
     const auto open = voters_at_height(kHeight - 1);
-    check(open == kN, "a validator booted below the height signs there (the control)");
+    check(open.size() == kN, "every validator signs an open height (the control)");
+    check(signed_by(open, g_keys[0].pk), "the one under test signs there too (the control)");
 
     // The property. Same keys, same set, same block, same wire — host 0 booted
     // having ALREADY decided this height. It must stay mute, so the witness is
     // left holding its own vote alone and no certificate can form.
     const auto closed = voters_at_height(kHeight);
-    check(closed == 0, "a validator booted at the height signs nothing there");
+    check(!signed_by(closed, g_keys[0].pk),
+          "a validator booted at the height signs nothing there");
+    check(closed.size() == kN - 1, "and every other validator still signs");
 
-    check(open != closed, "the floor is what changed the outcome, and nothing else");
+    check(open.size() != closed.size(), "the floor is what changed the outcome, and nothing else");
 
-    std::printf("\n  voters assembled: booted below = %zu, booted at = %zu\n", open, closed);
+    std::printf("\n  voters assembled: booted below = %zu, booted at = %zu\n", open.size(), closed.size());
     std::printf("\n%s\n", g_fail ? "FAIL" : "PASS — HostConfig::accepted closes the height across a restart");
     return g_fail ? 1 : 0;
 }
