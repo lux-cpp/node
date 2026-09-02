@@ -160,9 +160,10 @@ target_compile_options(noded PRIVATE -Wall -Wextra)
 #   node_cluster   five hosts finalize over a real loopback mesh
 #   node_liveness  down + wedged-but-present validators routed around, on the wire
 #   boot_floor      a restarted validator does not re-sign a height it decided
+#   hostile_decode  what a stranger can send the two decoders that take his bytes
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)

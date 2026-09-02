@@ -41,20 +41,29 @@ inline std::optional<Item> item(std::span<const std::uint8_t> in) noexcept {
     if (in.empty()) return std::nullopt;
     const std::uint8_t b = in[0];
 
-    auto span_of = [&](std::size_t head, std::size_t len) -> std::optional<Item> {
-        if (in.size() < head + len) return std::nullopt;
+    // The bound is checked WITHOUT adding, and that is the whole point: `len` is
+    // read from the input and reaches 2^64-1 in the 8-byte long form, so
+    // `head + len` wraps and a colossal length passes a check written that way —
+    // after which subspan is handed a size the buffer does not have. Subtracting
+    // from a size that is known to be at least `head` cannot overflow.
+    auto span_of = [&](std::size_t head, std::uint64_t len) -> std::optional<Item> {
+        if (in.size() < head) return std::nullopt;
+        if (len > in.size() - head) return std::nullopt;
         Item it;
-        it.payload = in.subspan(head, len);
-        it.raw     = in.subspan(0, head + len);
+        it.payload = in.subspan(head, static_cast<std::size_t>(len));
+        it.raw     = in.subspan(0, head + static_cast<std::size_t>(len));
         it.list    = b >= 0xc0;
         return it;
     };
     // Long-form length: `n` bytes of big-endian length, which must be minimal
     // (no leading zero) and must fit.
-    auto long_len = [&](std::size_t n) -> std::optional<std::size_t> {
+    // Accumulated as uint64, never as size_t: on a 32-bit target a size_t would
+    // TRUNCATE an 8-byte length and a huge declared length would read back as a
+    // small, plausible one. The caller compares it against what remains.
+    auto long_len = [&](std::size_t n) -> std::optional<std::uint64_t> {
         if (n == 0 || n > 8 || in.size() < 1 + n) return std::nullopt;
         if (in[1] == 0) return std::nullopt;  // non-minimal
-        std::size_t len = 0;
+        std::uint64_t len = 0;
         for (std::size_t i = 0; i < n; ++i) len = (len << 8) | in[1 + i];
         if (len < 56) return std::nullopt;  // would have used the short form
         return len;

@@ -372,8 +372,13 @@ std::shared_ptr<node::Block> Chain::parse(std::span<const std::uint8_t> b) {
         return nullptr;
     if (parent.size() != 32 || root.size() != 32) return nullptr;
 
+    // NOT reserved from `ntx`. It is a peer-supplied uint32 and reserving it
+    // asks for up to 4 billion Transactions in one call — length_error or
+    // bad_alloc, thrown out of a decode that no one catches, which ends the
+    // process. The loop is already bounded by the bytes actually present: the
+    // first tx whose length does not fit fails the read and the block is
+    // refused. Growing the vector geometrically costs nothing against that.
     std::vector<Tx> txs;
-    txs.reserve(ntx);
     for (std::uint32_t i = 0; i < ntx; ++i) {
         std::vector<std::uint8_t> raw;
         if (!r.read_bytes(raw)) return nullptr;
