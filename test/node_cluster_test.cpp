@@ -39,7 +39,6 @@ namespace {
 
 constexpr std::uint32_t kN     = 5;    // validators
 constexpr std::uint64_t kStake = 20;   // per validator → total 100
-constexpr std::uint32_t kAlpha = 4;    // distinct-voter floor; 2/3 stake floor of 100 is 66
 
 int g_fail = 0;
 void check(bool ok, const std::string& what) {
@@ -91,7 +90,6 @@ int main() {
         cfg.sk         = keys[i].sk;
         cfg.pk         = keys[i].pk;
         cfg.validators = set;
-        cfg.alpha      = kAlpha;
         cfg.wave       = WaveConfig{kN, 4, 4};  // threshold int(5*0.8)=4: a 5-reachable round votes
         hosts.push_back(std::make_unique<Node2Host>(std::move(cfg)));
         ports[i] = hosts[i]->listen_bind();

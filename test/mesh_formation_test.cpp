@@ -44,7 +44,6 @@ namespace {
 
 constexpr std::uint32_t kN     = 3;
 constexpr std::uint64_t kStake = 20;
-constexpr std::uint32_t kAlpha = 2;
 constexpr int kDeadlineMs = 1500;
 // What is being proven is BOUNDED, not fast: before the fix these calls did not
 // return at all. The bound allows the deadline plus a peer-I/O window per
@@ -78,7 +77,6 @@ std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
     cfg.sk         = g_keys[index].sk;
     cfg.pk         = g_keys[index].pk;
     cfg.validators = g_set;
-    cfg.alpha      = kAlpha;
     cfg.wave       = WaveConfig{kN, 3, 4};
     return std::make_unique<Node2Host>(std::move(cfg));
 }

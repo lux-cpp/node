@@ -45,7 +45,6 @@ namespace {
 
 constexpr std::uint32_t kN      = 2;    // validators
 constexpr std::uint64_t kStake  = 50;   // each → 100 total
-constexpr std::uint32_t kAlpha  = 2;    // both must vote: a cert IS proof both signed
 constexpr std::uint64_t kHeight = 7;    // the height under test
 constexpr int           kBeta   = 2;
 
@@ -92,7 +91,6 @@ std::size_t voters_at_height(std::uint64_t booted_at) {
         cfg.sk         = g_keys[i].sk;
         cfg.pk         = g_keys[i].pk;
         cfg.validators = g_set;
-        cfg.alpha      = kAlpha;
         cfg.wave       = WaveConfig{kN, kN, kBeta};  // both reachable → the round counts
         cfg.accepted   = (i == 0) ? booted_at : 0;   // THE ONE VARIABLE
         hosts.push_back(std::make_unique<Node2Host>(std::move(cfg)));

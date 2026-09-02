@@ -52,7 +52,6 @@ struct HostConfig {
     std::array<std::uint8_t, 32>               sk;          // this node's BLS secret key
     lux::consensus::PubKey                    pk;          // this node's BLS public key
     std::vector<lux::consensus::Validator>    validators;  // the full, agreed validator set
-    std::uint32_t                              alpha;       // distinct-voter floor (gate)
     lux::consensus::WaveConfig                wave;        // liveness/voting committee config
 
     // The height this node has already DECIDED, read from its own durable store

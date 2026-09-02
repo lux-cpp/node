@@ -8,7 +8,7 @@
 // launches a cluster — optionally with a validator held down — and checks that
 // every process that should finalize does.
 //
-//   noded --index I --n N --base-port P [--alpha A] [--stake S] [--deadline-ms D]
+//   noded --index I --n N --base-port P [--stake S] [--deadline-ms D]
 //
 // Node j listens on 127.0.0.1:(P+j). The validator set is derived deterministically
 // from the index scheme below, so every process agrees on the same set; in
@@ -63,11 +63,10 @@ int main(int argc, char** argv) {
     const long base_port = arg(argc, argv, "--base-port", -1);
     if (index < 0 || n <= 0 || base_port <= 0 || index >= n) {
         std::fprintf(stderr, "usage: noded --index I --n N --base-port P "
-                             "[--alpha A] [--stake S] [--deadline-ms D]\n");
+                             "[--stake S] [--deadline-ms D]\n");
         return 2;
     }
     const long stake       = arg(argc, argv, "--stake", 20);
-    const long alpha       = arg(argc, argv, "--alpha", (2 * n) / 3 + 1);  // >2/3 count default
     const long deadline_ms = arg(argc, argv, "--deadline-ms", 15000);
 
     // Deterministic validator set shared by every process; this node's own key.
@@ -82,7 +81,6 @@ int main(int argc, char** argv) {
     cfg.sk         = keys[index].sk;
     cfg.pk         = keys[index].pk;
     cfg.validators = set;
-    cfg.alpha      = std::uint32_t(alpha);
     // The committee IS the validator set: node samples nobody, so a round is
     // "can I still reach a supermajority of the set". Deriving it from n keeps a
     // 3-node and a 33-node cluster on the same rule instead of a literal 5.
@@ -93,9 +91,9 @@ int main(int argc, char** argv) {
     // mesh up on reachable stake and no round ever decides — a daemon whose
     // stated fault tolerance is defeated by its own threshold.
     cfg.wave       = WaveConfig{std::uint32_t(n),
-                                equal_stake_supermajority(std::uint32_t(n)), 4};
+                                two_thirds_count(std::uint32_t(n)), 4};
 
-    // consensus throws at its boundary on a set/α/wave combination that cannot
+    // consensus throws at its boundary on a set/wave combination that cannot
     // reach a decision. A daemon says so and exits; it does not abort.
     std::unique_ptr<Node2Host> hostp;
     try {

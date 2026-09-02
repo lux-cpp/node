@@ -15,7 +15,7 @@ Node2Host::Node2Host(HostConfig cfg)
       mesh_(cfg_.index, *tx_),
       node_(std::make_unique<lux::consensus::Party>(
           cfg_.index, cfg_.sk, cfg_.pk, cfg_.validators,
-          cfg_.alpha, cfg_.wave, *tx_)) {
+          cfg_.wave, *tx_)) {
     // Seed the decided-height frontier from this node's OWN durable record before
     // it can sign anything. consensus::Party keeps the frontier in memory, so a
     // restart that skipped this could sign a second, conflicting block at a height
