@@ -134,7 +134,7 @@ private:
     // the Party that votes over them.
     std::unique_ptr<MeshVoteTransport>     tx_;
     Mesh                                   mesh_;
-    std::unique_ptr<lux::consensus::Party> node_;
+    std::unique_ptr<lux::consensus::Node>  node_;
 };
 
 }  // namespace lux::node
