@@ -88,7 +88,19 @@ public:
     }
 
     // ── consensus driving (single-threaded) ─────────────────────────────────
-    void submit(const lux::consensus::VotePosition& pos) { node_->submit(pos); }
+    //
+    // Registering a block also REPLAYS the votes that arrived for it before it
+    // was registered. A validator broadcasts its ACCEPT vote exactly once, so a
+    // vote the gate turned away as RejectedNoSuchBlock is a vote lost for good —
+    // and there is always a window in which that happens: a proposer publishes a
+    // block and its peers vote on it while the proposer is still finishing its
+    // own round, and a follower that parses quickly votes while its neighbours
+    // are still reading. Both were losing real votes, which showed up as a
+    // proposer that could not certify the block it had just made.
+    void submit(const lux::consensus::VotePosition& pos) {
+        node_->submit(pos);
+        replay();
+    }
 
     // One liveness round for `block`, driven by the committee this node can reach
     // RIGHT NOW — itself plus its live peers. Say plainly what this is: node has
@@ -102,8 +114,18 @@ public:
         return node_->poll(block, reachable, reachable);
     }
 
-    // Drain inbound votes from every peer into the gate. Returns votes delivered.
+    // Drain inbound frames from every peer: votes into the gate, everything else
+    // to whatever handler was registered for its type. Returns votes delivered.
     std::size_t pump() { return tx_->pump(); }
+
+    // Register a handler for a non-vote message the chain carries (transactions
+    // today). One place decides what this node listens for.
+    void on(std::uint8_t type, Sink h) { tx_->on(type, std::move(h)); }
+
+    // Send one framed payload to every peer.
+    void gossip(std::uint8_t type, const std::vector<std::uint8_t>& payload) {
+        tx_->gossip(type, payload);
+    }
 
     bool isFinal(const lux::consensus::BlockId& b) const { return node_->isFinal(b); }
     std::optional<lux::consensus::QuorumCert> cert(const lux::consensus::BlockId& b) const {
@@ -128,13 +150,29 @@ public:
     std::size_t   peer_count() const noexcept { return tx_->peer_count(); }
 
 private:
+    // Deliver one inbound vote, holding on to it if it names a block this node
+    // has not registered yet. Bounded — an unbounded early-vote buffer is a
+    // peer-controlled allocation.
+    void deliver(const lux::consensus::SignedVote& v);
+    void replay();
+
     HostConfig                             cfg_;
     // Declaration order is the construction order, and it is load-bearing: the
     // transport must outlive the Mesh that hands it sockets, and both must outlive
     // the Party that votes over them.
     std::unique_ptr<MeshVoteTransport>     tx_;
     Mesh                                   mesh_;
-    std::unique_ptr<lux::consensus::Node>  node_;
+    std::unique_ptr<lux::consensus::Party> node_;
+
+    // Votes that arrived before their block was registered here. Held only until
+    // the next submit(); a vote that is still unknown after a replay is dropped,
+    // so this never grows across heights.
+    std::vector<lux::consensus::SignedVote> early_;
 };
+
+// How many early votes are held. A vote is 176 bytes and the set is a few tens
+// of validators, so a few hundred covers every honest case with room to spare
+// while bounding what a peer can make this node hold.
+inline constexpr std::size_t kMaxEarlyVotes = 512;
 
 }  // namespace lux::node

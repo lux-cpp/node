@@ -60,6 +60,15 @@ find_checkout(_consensus "include/lux/consensus/node.hpp"
   "${CMAKE_SOURCE_DIR}/../luxcpp/consensus"
   "${CMAKE_SOURCE_DIR}/../consensus")
 
+# cevm — the C++ EVM that executes the C-Chain's blocks. Found the same way the
+# other reused trees are, and matched on a source file rather than the directory
+# name for the same reason: `cevm` is also the name of a Go binding and of a
+# Conan package. lib/evm/state/processor.hpp is what identifies the checkout.
+find_checkout(_cevm "lib/evm/state/processor.hpp"
+  "${CMAKE_SOURCE_DIR}/../../luxcpp/cevm"
+  "${CMAKE_SOURCE_DIR}/../luxcpp/cevm"
+  "${CMAKE_SOURCE_DIR}/../cevm")
+
 # luxcpp — blst + cevm::crypto::bls + zap-cpp-core all live under one root.
 find_checkout(_luxcpp "blst/bindings/blst.h"
   "${CMAKE_SOURCE_DIR}/../../luxcpp"
@@ -67,10 +76,12 @@ find_checkout(_luxcpp "blst/bindings/blst.h"
   "${CMAKE_SOURCE_DIR}/..")
 
 set(CONSENSUS_DIR "${_consensus}"                    CACHE PATH "consensus checkout")
+set(CEVM_DIR       "${_cevm}"                          CACHE PATH "cevm checkout")
 set(LUXCPP_ROOT    "${_luxcpp}"                        CACHE PATH "luxcpp checkout root")
 set(ZAP_DIR        "${LUXCPP_ROOT}/zap-cpp-core/include" CACHE PATH "zap-cpp-core include root")
 
 foreach(_p "${CONSENSUS_DIR}/CMakeLists.txt"
+           "${CEVM_DIR}/lib/evm/state/processor.hpp"
            "${ZAP_DIR}/lux/zap/wire.hpp"
            "${LUXCPP_ROOT}/blst/bindings/blst.h"
            "${LUXCPP_ROOT}/crypto/bls/cpp/bls_signature.cpp")
@@ -82,6 +93,21 @@ foreach(_p "${CONSENSUS_DIR}/CMakeLists.txt"
 endforeach()
 message(STATUS "node: consensus = ${CONSENSUS_DIR}")
 message(STATUS "node: luxcpp     = ${LUXCPP_ROOT}")
+message(STATUS "node: cevm       = ${CEVM_DIR}")
+
+# cevm's dependencies (intx, nlohmann_json, lux-crypto, bls, lux-zap-core) come
+# from Conan, so node is configured with the toolchain Conan generated for it.
+# Saying so here — rather than failing 200 lines later inside cevm's
+# find_package(intx) — is the difference between a build you can fix and one you
+# have to bisect.
+if(NOT TARGET intx::intx AND NOT CMAKE_TOOLCHAIN_FILE)
+  message(FATAL_ERROR
+    "node: cevm's dependencies come from Conan and no toolchain was given.\n"
+    "  conan install ${CEVM_DIR} -pr ${CEVM_DIR}/.github/conan/manylinux-relax.profile \\\n"
+    "    -s build_type=Release -s compiler.cppstd=gnu20 \\\n"
+    "    --output-folder=${CEVM_DIR}/build-node --build=missing\n"
+    "  cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=${CEVM_DIR}/build-node/build/Release/generators/conan_toolchain.cmake")
+endif()
 
 find_package(Threads REQUIRED)
 
@@ -90,10 +116,35 @@ find_package(Threads REQUIRED)
 #    layers — no duplication here.
 add_subdirectory("${CONSENSUS_DIR}" consensus-build)
 
+# ── Reuse cevm's build the same way. EXCLUDE_FROM_ALL because node links four of
+#    its libraries and does not want its 40-odd test and benchmark binaries; they
+#    stay buildable by name. Static, because noded is one process: cevm defaults
+#    to a shared library so it can be loaded as an EVMC plugin, which is not how
+#    it is used here.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(CEVM_TESTING      OFF CACHE BOOL "" FORCE)
+add_subdirectory("${CEVM_DIR}" cevm-build EXCLUDE_FROM_ALL)
+
 # ── node — the NEW host library (the only compiled unit; the rest is header-only)
-add_library(node STATIC src/mesh.cpp src/node_host.cpp)
+add_library(node STATIC
+    src/mesh.cpp          # the socket dance
+    src/node_host.cpp     # one Party driven over that mesh
+    src/engine.cpp        # execute → decide → accept, for any VM
+    src/evm.cpp           # the C-Chain, executed by cevm
+    src/rpc.cpp           # HTTP JSON-RPC
+    src/eth.cpp)          # the eth methods, mounted on an Rpc
 target_include_directories(node PUBLIC include "${ZAP_DIR}")
 target_link_libraries(node PUBLIC consensus Threads::Threads)
+# evm-state carries the StateDB, process_block and the Merkle-Patricia-Trie; evm
+# is the interpreter behind evmc_create_cevm. lux::crypto-secp256k1 is what
+# recovers a transaction's sender, and nlohmann_json is the RPC's codec.
+# find_package again at THIS level, not because cevm forgot to: an imported
+# target a subdirectory creates is scoped to that subdirectory, so node has to
+# ask for the two it links by name itself. Same packages, same Conan-generated
+# configs, resolved a second time — not a second source of truth.
+find_package(crypto CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+target_link_libraries(node PUBLIC evm-state evm lux::crypto-secp256k1 nlohmann_json::nlohmann_json)
 target_compile_options(node PRIVATE -Wall -Wextra -Wpedantic)
 
 # ── noded — the standalone daemon process

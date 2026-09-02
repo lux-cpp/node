@@ -115,17 +115,53 @@ int main() {
                     sent / 1024, tx.peer_count(), tx.evicted());
     }
 
-    // [2] a length the ZAP ceiling would allow but this link never carries.
+    // [2] a length the ZAP ceiling would allow but this link never carries. The
+    // link's cap is kMaxMeshFrame, not a vote's 188 bytes: the same socket now
+    // carries transactions as well, and the reader that enforces the bound sees
+    // frames rather than meanings. What matters is that the bound is far below
+    // ZAP's 16 MiB and that crossing it costs the peer its place.
     {
         delivered = 0;
         MeshVoteTransport tx(counting_sink);
         Link l;
         tx.add_peer(l.ours);
-        const std::uint32_t over = kMaxVoteFrame + 1;
+        const std::uint32_t over = kMaxMeshFrame + 1;
         check(over < lux::zap::MaxMessageSize, "[2] the test length is legal ZAP, illegal here");
         send_raw(l.theirs, header(over, lux::consensus::zap::kVoteMsgType));
         tx.pump();
-        check(tx.peer_count() == 0, "[2] a frame too large for a vote link drops the peer");
+        check(tx.peer_count() == 0, "[2] a frame too large for this link drops the peer");
+    }
+
+    // [2b] a message type this node does not serve is DROPPED, and the peer that
+    // sent it keeps its place. Dispatch is by registration, so an unregistered
+    // type costs nothing — a peer cannot make this node work by naming one.
+    {
+        delivered = 0;
+        MeshVoteTransport tx(counting_sink);
+        Link l;
+        tx.add_peer(l.ours);
+        std::vector<std::uint8_t> f = header(4, 0x2A);   // a type nothing registered
+        for (int i = 0; i < 4; ++i) f.push_back(0xEE);
+        send_raw(l.theirs, f);
+        tx.pump();
+        check(tx.peer_count() == 1, "[2b] an unserved message type does not drop the peer");
+        check(delivered == 0, "[2b] and delivers nothing");
+    }
+
+    // [2c] a registered type IS delivered, on the same socket votes ride.
+    {
+        delivered = 0;
+        std::size_t got = 0;
+        MeshVoteTransport tx(counting_sink);
+        tx.on(kTxMsgType, [&](const std::vector<std::uint8_t>& p) { got += p.size(); });
+        Link l;
+        tx.add_peer(l.ours);
+        std::vector<std::uint8_t> f = header(3, kTxMsgType);
+        for (int i = 0; i < 3; ++i) f.push_back(0x11);
+        send_raw(l.theirs, f);
+        tx.pump();
+        check(got == 3, "[2c] a registered message type reaches its handler");
+        check(tx.peer_count() == 1, "[2c] and the peer keeps its place");
     }
 
     // [3] a validator that votes and then hangs up still counts.
