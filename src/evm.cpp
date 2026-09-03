@@ -284,11 +284,28 @@ struct Chain::State {
             batch.push_back(std::move(e));
         }
 
+        // BLOCKHASH's window: the 256 blocks before this one, most recent
+        // first. Built from the accepted chain, so what a contract reads is the
+        // id this node actually decided — the host answers zero for anything
+        // outside the window, which is what geth answers too.
+        std::vector<evmc::bytes32> recent;
+        recent.reserve(256);
+        for (std::uint64_t h = height; h-- > 0 && recent.size() < 256;) {
+            const auto it = by_height.find(h);
+            if (it == by_height.end()) break;
+            evmc::bytes32 id{};
+            const auto bid = it->second->id();
+            std::memcpy(id.bytes, bid.data(), 32);
+            recent.push_back(id);
+        }
+
         ::evm::state::TxContext ctx{};
         ctx.block_number    = static_cast<std::int64_t>(height);
         ctx.block_timestamp = static_cast<std::int64_t>(timestamp);
         ctx.block_gas_limit = static_cast<std::int64_t>(genesis.gas_limit);
         ctx.chain_id = intx::be::store<evmc::uint256be>(intx::uint256{genesis.chain_id});
+        ctx.recent_hashes   = recent.empty() ? nullptr : recent.data();
+        ctx.n_recent_hashes = recent.size();
 
         const auto r = ::evm::state::process_block(db, batch, vm, ctx, kRevision);
         return to_id(r.state_root);
