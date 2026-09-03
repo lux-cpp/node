@@ -77,6 +77,103 @@ std::size_t content_length(const std::string& head) {
     return static_cast<std::size_t>(std::strtoull(head.c_str() + at + 15, nullptr, 10));
 }
 
+std::string proxy_to_archive(const std::string& archive_url, const std::string& path, const std::string& body) {
+    if (archive_url.empty()) return "";
+    std::string url = archive_url;
+    if (url.rfind("http://", 0) == 0) url = url.substr(7);
+    while (!url.empty() && url.back() == '/') url.pop_back();
+
+    std::string host = url;
+    int port = 80;
+    auto colon = url.find(':');
+    if (colon != std::string::npos) {
+        host = url.substr(0, colon);
+        try { port = std::stoi(url.substr(colon + 1)); } catch (...) { port = 80; }
+    }
+    if (host == "localhost") host = "127.0.0.1";
+
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return "";
+    timeval tv{4, 0};
+    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = ::htons(port);
+    if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) <= 0) {
+        ::close(sock);
+        return "";
+    }
+    if (::connect(sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+        ::close(sock);
+        return "";
+    }
+
+    std::string target_path = path;
+    if (target_path == "/v1/chain/C/rpc" || target_path == "/v1/bc/C/rpc" || target_path == "/" || target_path.empty()) {
+        target_path = "/v1/bc/C/rpc";
+    } else if (target_path == "/v1/chain/P" || target_path == "/v1/bc/P" || target_path == "/v1/chain/P/rpc") {
+        target_path = "/v1/bc/P";
+    } else if (target_path == "/v1/chain/X" || target_path == "/v1/bc/X" || target_path == "/v1/chain/X/rpc") {
+        target_path = "/v1/bc/X";
+    }
+
+    std::string req = "POST " + target_path + " HTTP/1.1\r\n";
+    req += "Host: " + host + ":" + std::to_string(port) + "\r\n";
+    req += "Content-Type: application/json\r\n";
+    req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    req += "Connection: close\r\n\r\n" + body;
+
+    write_all(sock, req);
+
+    std::string resp;
+    char buf[4096];
+    while (true) {
+        ssize_t n = ::recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        resp.append(buf, n);
+    }
+    ::close(sock);
+
+    auto dbl = resp.find("\r\n\r\n");
+    if (dbl == std::string::npos) return resp;
+    std::string head = resp.substr(0, dbl);
+    std::string b    = resp.substr(dbl + 4);
+
+    bool chunked = false;
+    std::string lower_head = head;
+    for (char& c : lower_head) c = std::tolower(static_cast<unsigned char>(c));
+    if (lower_head.find("transfer-encoding: chunked") != std::string::npos ||
+        lower_head.find("transfer-encoding:chunked") != std::string::npos) {
+        chunked = true;
+    }
+
+    if (chunked) {
+        std::string unchunked;
+        std::size_t pos = 0;
+        while (pos < b.size()) {
+            auto eol = b.find("\r\n", pos);
+            if (eol == std::string::npos) break;
+            std::string hex_str = b.substr(pos, eol - pos);
+            auto semi = hex_str.find(';');
+            if (semi != std::string::npos) hex_str = hex_str.substr(0, semi);
+            std::size_t size = 0;
+            try { size = std::stoul(hex_str, nullptr, 16); } catch (...) { break; }
+            if (size == 0) break;
+            pos = eol + 2;
+            if (pos + size > b.size()) break;
+            unchunked.append(b, pos, size);
+            pos += size;
+            if (pos + 2 <= b.size() && b[pos] == '\r' && b[pos+1] == '\n') {
+                pos += 2;
+            }
+        }
+        return unchunked.empty() ? b : unchunked;
+    }
+    return b;
+}
+
 }  // namespace
 
 Rpc::Rpc(std::uint16_t port) {
@@ -127,7 +224,9 @@ void Rpc::stop() {
 
 void Rpc::serve() {
     while (running_) {
-        const int c = ::accept(fd_, nullptr, nullptr);
+        sockaddr_in a{};
+        socklen_t   len = sizeof(a);
+        const int   c   = ::accept(fd_, reinterpret_cast<sockaddr*>(&a), &len);
         if (c < 0) {
             if (!running_) return;
             if (errno == EINTR) continue;
@@ -146,34 +245,34 @@ void Rpc::serve() {
 void Rpc::answer(int fd) {
     set_timeouts(fd);
 
-    // Read the head, then exactly Content-Length more. Bounded at every step.
-    std::string buf;
-    char        tmp[8192];
-    std::size_t head_end = std::string::npos;
-    while (head_end == std::string::npos) {
-        const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+    std::string head;
+    char        buf[1024];
+    while (head.size() < kMaxRequest) {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) return;
-        buf.append(tmp, static_cast<std::size_t>(n));
-        if (buf.size() > kMaxRequest) {
-            write_all(fd, response(413, "Payload Too Large", "{}"));
-            return;
-        }
-        head_end = buf.find("\r\n\r\n");
+        head.append(buf, static_cast<std::size_t>(n));
+        const auto end = head.find("\r\n\r\n");
+        if (end != std::string::npos) break;
     }
-    const std::string head = buf.substr(0, head_end);
-    std::string       body = buf.substr(head_end + 4);
 
-    const std::size_t want = content_length(head);
-    if (want > kMaxRequest) {
+    const auto header_end = head.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        write_all(fd, response(400, "Bad Request", "{}"));
+        return;
+    }
+
+    const std::size_t clen = content_length(head.substr(0, header_end));
+    if (clen > kMaxRequest) {
         write_all(fd, response(413, "Payload Too Large", "{}"));
         return;
     }
-    while (body.size() < want) {
-        const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+
+    std::string body = head.substr(header_end + 4);
+    while (body.size() < clen) {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) return;
-        body.append(tmp, static_cast<std::size_t>(n));
+        body.append(buf, static_cast<std::size_t>(n));
     }
-    body.resize(want);
 
     // Request line: METHOD SP PATH SP VERSION
     const auto sp1 = head.find(' ');
@@ -191,7 +290,24 @@ void Rpc::answer(int fd) {
 
     if (verb == "GET") {
         if (path == "" || path == "/") {
-            write_all(fd, response(200, "OK", about_.dump()));
+            Json about = about_;
+            about["mode"] = "light";
+            if (!archive_rpc_.empty()) {
+                about["archiveRpc"] = archive_rpc_;
+            }
+            if (!about.contains("chains")) {
+                about["chains"] = Json::object();
+            }
+            about["chains"]["c"] = "/v1/chain/C/rpc";
+            about["chains"]["p"] = "/v1/bc/P";
+            about["chains"]["x"] = "/v1/bc/X";
+            if (!about.contains("endpoints")) {
+                about["endpoints"] = Json::object();
+            }
+            about["endpoints"]["rpc"] = "/v1/chain/C/rpc";
+            about["endpoints"]["p"] = "/v1/bc/P";
+            about["endpoints"]["x"] = "/v1/bc/X";
+            write_all(fd, response(200, "OK", about.dump()));
         } else if (path == "/healthz" || path == "/v1/health" || path == "/health") {
             Json h = {
                 {"healthy", true},
@@ -218,6 +334,22 @@ void Rpc::answer(int fd) {
 
     // Go forwards a bare POST / to the C-Chain; so does this.
     if ((path == "" || path == "/") && !root_path_.empty()) path = root_path_;
+
+    bool is_p_or_x = (path == "/v1/chain/P" || path == "/v1/bc/P" || path == "/v1/chain/P/rpc" ||
+                      path == "/v1/chain/X" || path == "/v1/bc/X" || path == "/v1/chain/X/rpc");
+    if (is_p_or_x) {
+        if (!archive_rpc_.empty()) {
+            std::string proxied = proxy_to_archive(archive_rpc_, path, body);
+            if (!proxied.empty()) {
+                write_all(fd, response(200, "OK", proxied));
+                return;
+            }
+        }
+        write_all(fd, response(200, "OK",
+                               R"({"jsonrpc":"2.0","id":null,)"
+                               R"("error":{"code":-32000,"message":"light node: P/X chain queries require --archive-rpc to proxy from full archive node"}})"));
+        return;
+    }
 
     if (methods_.find(path) == methods_.end()) {
         write_all(fd, response(404, "Not Found",
@@ -265,8 +397,17 @@ Rpc::Json Rpc::dispatch(const std::string& path, const Json& req) {
 
     const auto& table = methods_.at(path);
     const auto  it    = table.find(req["method"].get<std::string>());
-    if (it == table.end())
+    if (it == table.end()) {
+        if (!archive_rpc_.empty()) {
+            std::string proxied = proxy_to_archive(archive_rpc_, path, req.dump());
+            if (!proxied.empty()) {
+                try {
+                    return Json::parse(proxied);
+                } catch (...) {}
+            }
+        }
         return fail(-32601, "the method " + req["method"].get<std::string>() + " does not exist");
+    }
 
     const Json params = req.contains("params") ? req["params"] : Json::array();
     try {
@@ -275,6 +416,14 @@ Rpc::Json Rpc::dispatch(const std::string& path, const Json& req) {
         const std::lock_guard<std::mutex> lock(mu_);
         return Json{{"jsonrpc", "2.0"}, {"id", id}, {"result", it->second(params)}};
     } catch (const Error& e) {
+        if (e.code == -32000 && !archive_rpc_.empty()) {
+            std::string proxied = proxy_to_archive(archive_rpc_, path, req.dump());
+            if (!proxied.empty()) {
+                try {
+                    return Json::parse(proxied);
+                } catch (...) {}
+            }
+        }
         return fail(e.code, e.what());
     } catch (const std::exception& e) {
         // A method that threw something unplanned is a bug in this node, not a

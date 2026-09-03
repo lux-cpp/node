@@ -72,6 +72,9 @@ public:
     void          stop();
     std::uint16_t port() const noexcept { return port_; }
 
+    void               set_archive_rpc(std::string url) { archive_rpc_ = std::move(url); }
+    const std::string& archive_rpc() const noexcept { return archive_rpc_; }
+
     // THE lock. The driver holds it while it mutates the chain; the Rpc holds it
     // for the duration of every method call.
     std::mutex& guard() noexcept { return mu_; }
@@ -85,6 +88,7 @@ private:
     std::uint16_t                                   port_ = 0;
     std::map<std::string, std::map<std::string, Method>> methods_;
     std::string                                     root_path_;
+    std::string                                     archive_rpc_;
     Json                                            about_;
     std::mutex                                      mu_;
     std::thread                                     accepting_;

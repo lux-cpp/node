@@ -87,6 +87,12 @@ long arg(int argc, char** argv, const char* flag, long dflt) {
     return dflt;
 }
 
+std::string arg_str(int argc, char** argv, const char* flag, std::string dflt) {
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::strcmp(argv[i], flag) == 0) return argv[i + 1];
+    return dflt;
+}
+
 std::string hex(std::span<const std::uint8_t> b) {
     std::string s = "0x";
     char        t[3];
@@ -137,7 +143,7 @@ int main(int argc, char** argv) {
     if (index < 0 || n <= 0 || base_port <= 0 || index >= n) {
         std::fprintf(stderr,
                      "usage: %s --index I --n N --base-port P [--rpc-port R] [--stake S]\n"
-                     "             [--deadline-ms D] [--blocks B] [--chain-id C]\n", prog);
+                     "             [--deadline-ms D] [--blocks B] [--chain-id C] [--archive-rpc URL] [--light]\n", prog);
         return 2;
     }
     const long stake       = arg(argc, argv, "--stake", 20);
@@ -145,6 +151,12 @@ int main(int argc, char** argv) {
     const long rpc_port    = arg(argc, argv, "--rpc-port", 0);
     const long blocks      = arg(argc, argv, "--blocks", 0);  // 0 = until stopped
     const auto chain_id    = std::uint64_t(arg(argc, argv, "--chain-id", long(kLocalChainId)));
+
+    std::string archive_rpc = arg_str(argc, argv, "--archive-rpc", "");
+    if (archive_rpc.empty()) {
+        if (const char* env = std::getenv("LUX_ARCHIVE_RPC")) archive_rpc = env;
+        else if (const char* env2 = std::getenv("ZOO_ARCHIVE_RPC")) archive_rpc = env2;
+    }
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
@@ -225,6 +237,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     Rpc& rpc = *rpcp;
+    if (!archive_rpc.empty()) {
+        rpc.set_archive_rpc(archive_rpc);
+    }
     serve_eth(rpc, chain, client_version);
     const std::string_view prog_view(prog ? prog : "");
     const std::string public_api = (prog_view == "zood" || prog_view.find("zoo") != std::string_view::npos)
@@ -232,17 +247,24 @@ int main(int argc, char** argv) {
                                        : "https://api.lux.network";
     rpc.about(Rpc::Json{
         {"client", client_version},
+        {"mode", "light"},
         {"index", index},
         {"validators", n},
         {"endpoint", public_api},
-        {"chains", Rpc::Json::object({{"c", "/v1/chain/C/rpc"}})},
+        {"chains", Rpc::Json::object({{"c", "/v1/chain/C/rpc"}, {"p", "/v1/bc/P"}, {"x", "/v1/bc/X"}})},
         {"endpoints", Rpc::Json::object({
             {"rpc", "/v1/chain/C/rpc"},
+            {"p", "/v1/bc/P"},
+            {"x", "/v1/bc/X"},
             {"health", "/v1/health"},
             {"public", public_api}
         })}
     });
     rpc.start();
+    std::printf("node %ld: mode light node (frontier resident)\n", index);
+    if (!archive_rpc.empty()) {
+        std::printf("node %ld: archive RPC %s (proxying historical & P/X state)\n", index, archive_rpc.c_str());
+    }
     std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/C/rpc\n", index, rpc.port());
     std::fflush(stdout);
 
