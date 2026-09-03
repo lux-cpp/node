@@ -55,10 +55,20 @@ Id keccak(std::span<const std::uint8_t> in) noexcept {
     return to_id(cevm::keccak256({in.data(), in.size()}));
 }
 
-// The EVM revision this chain runs. Shanghai is what cevm's block-root parity
-// against luxfi/geth is held at, so it is what a block is executed under: a
-// revision the parity gate does not cover would be a root nothing checks.
-constexpr evmc_revision kRevision = EVMC_SHANGHAI;
+// The EVM revision this chain runs. CANCUN, because the live C-Chain genesis
+// sets cancunTime: 0 — a node pinned to Shanghai executes a different EVM from
+// the network it claims to be on, and forks the moment a block uses anything
+// the two revisions disagree about (TSTORE/TLOAD, and SELFDESTRUCT, which
+// EIP-6780 confines to the transaction that created the account).
+//
+// Flipping this alone would not have been enough: EIP-6780 has to be
+// implemented, or a Cancun-labelled node still destroys accounts Cancun keeps.
+// It is, because execution now runs through cevm::state::transition, whose
+// Cancun behaviour is checked against go-ethereum t8n — a SELFDESTRUCT
+// scenario produces byte-identical roots on both, and differs from the same
+// scenario at Shanghai, which is what proves the fork is real rather than a
+// label.
+constexpr evmc_revision kRevision = EVMC_CANCUN;
 
 // ── the block, and its bytes ────────────────────────────────────────────────
 //
