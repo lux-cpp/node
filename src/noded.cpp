@@ -226,10 +226,22 @@ int main(int argc, char** argv) {
     }
     Rpc& rpc = *rpcp;
     serve_eth(rpc, chain, client_version);
-    rpc.about(Rpc::Json{{"client", client_version},
-                        {"index", index},
-                        {"validators", n},
-                        {"chains", Rpc::Json::array({"C"})}});
+    const std::string_view prog_view(prog ? prog : "");
+    const std::string public_api = (prog_view == "zood" || prog_view.find("zoo") != std::string_view::npos)
+                                       ? "https://api.zoo.network"
+                                       : "https://api.lux.network";
+    rpc.about(Rpc::Json{
+        {"client", client_version},
+        {"index", index},
+        {"validators", n},
+        {"endpoint", public_api},
+        {"chains", Rpc::Json::object({{"c", "/v1/chain/C/rpc"}})},
+        {"endpoints", Rpc::Json::object({
+            {"rpc", "/v1/chain/C/rpc"},
+            {"health", "/v1/health"},
+            {"public", public_api}
+        })}
+    });
     rpc.start();
     std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/C/rpc\n", index, rpc.port());
     std::fflush(stdout);
