@@ -142,14 +142,22 @@ std::uint64_t height_param(const evm::Chain& c, const Json& params, std::size_t 
     const std::uint64_t tip = c.last_accepted_height();
     if (!params.is_array() || params.size() <= i) return tip;
     const Json& v = params[i];
+    std::uint64_t h = tip;
     if (v.is_string()) {
         const auto s = v.get<std::string>();
         if (s == "latest" || s == "pending" || s == "safe" || s == "finalized") return tip;
-        if (s == "earliest") return 0;
-        return number(s);
+        if (s == "earliest") {
+            if (tip == 0) return 0;
+            throw Rpc::Error(-32000, "this light node keeps only the frontier; configure --archive-rpc to proxy historical quantum-finalized state");
+        }
+        h = number(s);
+    } else if (v.is_number_unsigned()) {
+        h = v.get<std::uint64_t>();
     }
-    if (v.is_number_unsigned()) return v.get<std::uint64_t>();
-    return tip;
+    if (h != tip) {
+        throw Rpc::Error(-32000, "this light node keeps only the frontier; configure --archive-rpc to proxy historical quantum-finalized state");
+    }
+    return h;
 }
 
 Json block_json(const evm::Chain& c, const node::Block& b, bool full) {
@@ -227,7 +235,12 @@ void serve_eth(Rpc& rpc, evm::Chain& chain, const std::string& client) {
     on("eth_getBlockByNumber", [&chain](const Json& p) -> Json {
         const auto h = height_param(chain, p, 0);
         const auto b = chain.at_height(h);
-        if (!b) return nullptr;
+        if (!b) {
+            if (h != chain.last_accepted_height()) {
+                throw Rpc::Error(-32000, "this light node keeps only the frontier; configure --archive-rpc to proxy historical quantum-finalized state");
+            }
+            return nullptr;
+        }
         const bool full = p.is_array() && p.size() > 1 && p[1].is_boolean() &&
                           p[1].get<bool>();
         return block_json(chain, *b, full);
@@ -238,7 +251,9 @@ void serve_eth(Rpc& rpc, evm::Chain& chain, const std::string& client) {
         Id id{};
         std::copy(raw.begin(), raw.end(), id.begin());
         const auto b = chain.get(id);
-        if (!b) return nullptr;
+        if (!b) {
+            throw Rpc::Error(-32000, "this light node keeps only the frontier; configure --archive-rpc to proxy historical quantum-finalized state");
+        }
         const bool full = p.is_array() && p.size() > 1 && p[1].is_boolean() &&
                           p[1].get<bool>();
         return block_json(chain, *b, full);
