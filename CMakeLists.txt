@@ -148,7 +148,17 @@ find_package(nlohmann_json CONFIG REQUIRED)
 target_link_libraries(node PUBLIC evm-state evm lux::crypto-secp256k1 lux::crypto-sha256 nlohmann_json::nlohmann_json)
 target_compile_options(node PRIVATE -Wall -Wextra -Wpedantic)
 
-# ── noded — the standalone daemon process
+# ── luxd — the standalone daemon process (C++ version)
+add_executable(luxd src/noded.cpp)
+target_link_libraries(luxd PRIVATE node)
+target_compile_options(luxd PRIVATE -Wall -Wextra)
+
+# ── zood — Zoo L2 flavor (C++ version)
+add_executable(zood src/noded.cpp)
+target_link_libraries(zood PRIVATE node)
+target_compile_options(zood PRIVATE -Wall -Wextra)
+
+# ── noded — backwards-compatible alias
 add_executable(noded src/noded.cpp)
 target_link_libraries(noded PRIVATE node)
 target_compile_options(noded PRIVATE -Wall -Wextra)
