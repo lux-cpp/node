@@ -159,10 +159,10 @@ private:
     HostConfig                             cfg_;
     // Declaration order is the construction order, and it is load-bearing: the
     // transport must outlive the Mesh that hands it sockets, and both must outlive
-    // the Party that votes over them.
+    // the Node that votes over them.
     std::unique_ptr<MeshVoteTransport>     tx_;
     Mesh                                   mesh_;
-    std::unique_ptr<lux::consensus::Party> node_;
+    std::unique_ptr<lux::consensus::Node>  node_;
 
     // Votes that arrived before their block was registered here. Held only until
     // the next submit(); a vote that is still unknown after a replay is dropped,
