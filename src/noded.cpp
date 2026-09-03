@@ -60,8 +60,11 @@ constexpr std::uint64_t kLocalChainId = 31337;
 
 // What web3_clientVersion reports. luxfi/evm answers a bare version string
 // (plugin/evm/version.go), so this does too — with a name, because a client
-// asking what it is talking to should not be told something else's name.
-const char* const kClientVersion = "lux-cpp/noded/v0.1.0";
+std::string get_client_version(const char* prog) {
+    if (std::strstr(prog, "zood")) return "zoo-cpp/zood/v0.1.0";
+    if (std::strstr(prog, "luxd")) return "lux-cpp/luxd/v0.1.0";
+    return "lux-cpp/noded/v0.1.0";
+}
 
 struct Key {
     std::array<std::uint8_t, 32> sk{};
@@ -124,13 +127,17 @@ void on_signal(int) { g_stop.store(true); }
 }  // namespace
 
 int main(int argc, char** argv) {
+    const char* prog = (argc > 0 && argv[0]) ? argv[0] : "luxd";
+    if (const char* slash = std::strrchr(prog, '/')) prog = slash + 1;
+    const std::string client_version = get_client_version(prog);
+
     const long index     = arg(argc, argv, "--index", -1);
     const long n         = arg(argc, argv, "--n", -1);
     const long base_port = arg(argc, argv, "--base-port", -1);
     if (index < 0 || n <= 0 || base_port <= 0 || index >= n) {
         std::fprintf(stderr,
-                     "usage: noded --index I --n N --base-port P [--rpc-port R] [--stake S]\n"
-                     "             [--deadline-ms D] [--blocks B] [--chain-id C]\n");
+                     "usage: %s --index I --n N --base-port P [--rpc-port R] [--stake S]\n"
+                     "             [--deadline-ms D] [--blocks B] [--chain-id C]\n", prog);
         return 2;
     }
     const long stake       = arg(argc, argv, "--stake", 20);
@@ -218,8 +225,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     Rpc& rpc = *rpcp;
-    serve_eth(rpc, chain, kClientVersion);
-    rpc.about(Rpc::Json{{"client", kClientVersion},
+    serve_eth(rpc, chain, client_version);
+    rpc.about(Rpc::Json{{"client", client_version},
                         {"index", index},
                         {"validators", n},
                         {"chains", Rpc::Json::array({"C"})}});
