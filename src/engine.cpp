@@ -9,8 +9,10 @@
 
 namespace lux::node {
 
-Engine::Engine(std::unique_ptr<VM> vm, Node2Host& host, std::mutex& guard)
-    : vm_(std::move(vm)), host_(host), guard_(guard) {}
+Engine::Engine(std::unique_ptr<VM> vm, Node2Host& host, std::mutex& guard,
+               Binding binding, Id set_root)
+    : vm_(std::move(vm)), host_(host), guard_(guard),
+      binding_(binding), set_root_(set_root) {}
 
 lux::consensus::VotePosition Engine::position(const Block& b) const {
     lux::consensus::VotePosition pos{};
@@ -29,14 +31,23 @@ lux::consensus::VotePosition Engine::position(const Block& b) const {
     pos.canonical_id        = b.id();
     pos.parent_canonical_id = b.parent();
 
-    // The axis this whole exercise is about: the root THIS node's execution
-    // produced, put into the message this node signs.
-    pos.execution_state_root = b.root();
+    // The axis this whole exercise is about. Under Executed it carries the root
+    // THIS node's execution produced, so a divergent EVM cannot hide. Under
+    // Transport it stays empty, because that is the message luxd signs — a Go
+    // voter does not execute the block it votes on, and a C++ node that binds
+    // the root there produces a message Go drops rather than disputes.
+    if (binding_ == Binding::Executed)
+        pos.execution_state_root = b.root();
 
-    // payload_root stays empty, and deliberately so. It would have to be a
-    // transactions root every implementation computes identically, and inventing
-    // one here that only this node computes would be a second identity for a
-    // block rather than a shared one. Empty is signed consistently as empty.
+    // payload_root stays empty either way, and deliberately so. It would have to
+    // be a transactions root every implementation computes identically, and
+    // inventing one here that only this node computes would be a second identity
+    // for a block rather than a shared one. Empty is signed consistently as
+    // empty — which is also what Go signs.
+
+    // The set this vote is cast under. Binding it is what stops a certificate
+    // being re-presented under a different set after a stake change.
+    pos.validator_set_root = set_root_;
     return pos;
 }
 

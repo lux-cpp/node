@@ -132,7 +132,8 @@ add_library(node STATIC
     src/engine.cpp        # execute → decide → accept, for any VM
     src/evm.cpp           # the C-Chain, executed by cevm
     src/rpc.cpp           # HTTP JSON-RPC
-    src/eth.cpp)          # the eth methods, mounted on an Rpc
+    src/eth.cpp           # the eth methods, mounted on an Rpc
+    src/validators.cpp)   # the set-root commitment a vote binds
 target_include_directories(node PUBLIC include "${ZAP_DIR}")
 target_link_libraries(node PUBLIC consensus Threads::Threads)
 # evm-state carries the StateDB, process_block and the Merkle-Patricia-Trie; evm
@@ -144,7 +145,7 @@ target_link_libraries(node PUBLIC consensus Threads::Threads)
 # configs, resolved a second time — not a second source of truth.
 find_package(crypto CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
-target_link_libraries(node PUBLIC evm-state evm lux::crypto-secp256k1 nlohmann_json::nlohmann_json)
+target_link_libraries(node PUBLIC evm-state evm lux::crypto-secp256k1 lux::crypto-sha256 nlohmann_json::nlohmann_json)
 target_compile_options(node PRIVATE -Wall -Wextra -Wpedantic)
 
 # ── noded — the standalone daemon process
@@ -161,9 +162,10 @@ target_compile_options(noded PRIVATE -Wall -Wextra)
 #   node_liveness  down + wedged-but-present validators routed around, on the wire
 #   boot_floor      a restarted validator does not re-sign a height it decided
 #   hostile_decode  what a stranger can send the two decoders that take his bytes
+#   set_root        the validator-set commitment, against Go's encoding
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
