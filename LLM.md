@@ -152,7 +152,7 @@ conan install ../../luxcpp/cevm -pr ../../luxcpp/cevm/.github/conan/manylinux-re
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=../../luxcpp/cevm/build-node/build/Release/generators/conan_toolchain.cmake
 cmake --build build -j
-ctest --test-dir build --output-on-failure    # 42: node, consensus, and cevm's geth-parity gates
+ctest --test-dir build --output-on-failure    # 44: node, consensus, and cevm's parity gates
 ./scripts/chain.sh                            # 5 processes serving one C-Chain over JSON-RPC
 ./scripts/cluster.sh build/noded 19310 5      # 5 real PROCESSES, consensus only
 ./scripts/cluster.sh build/noded 19310 5 4    # ...with validator 4 held down
@@ -189,6 +189,17 @@ takes α). Use a worktree pinned to the commit you mean and pass
   node final before `pump()`**, then all 5 finalize with a verifying cert.
 - `node_liveness_test` — a DOWN validator (in every host's configured set, and
   dialled) and a WEDGED-but-present one are both routed around on the wire.
+- `hostile_decode_test` — the two decoders that take bytes from strangers,
+  `Tx::decode` (any `eth_sendRawTransaction` caller) and `Chain::parse` (any
+  peer), fed bytes a stranger would send. Both had a way to end the process: an
+  RLP length bound written as `size < head + len` wraps at the 8-byte long form
+  and accepts a declared 2^64-1, and a block's transaction count was reserved
+  before a single transaction was read — 893 GB at `sizeof(Tx)`. Each case was
+  confirmed to FAIL against the unfixed decoder first, which is the only way to
+  know a decoder test is testing anything: the obvious assertions pass either
+  way, because `Tx::decode` rejects the overflow for an unrelated reason and
+  `parse` frees the reservation on its way out. So the bound is asserted on
+  `rlp::item` directly, and the allocation on `VmPeak`.
 
 Verified clean under ThreadSanitizer and ASan+UBSan+Leak (run TSan under
 `setarch -R`; instrumentation covers node + consensus, never blst/bls).
@@ -221,25 +232,11 @@ REAL — observed on a running 5-process cluster, not inferred:
 | contract creation and storage work | a constructor's `SSTORE` is readable through `eth_getStorageAt` |
 | JSON-RPC is live | `eth_chainId` → `0x7a69`, `eth_blockNumber` advances off the real pipeline |
 
+| precompiles work from contract code | SHA-256, RIPEMD-160 and IDENTITY match Python's hashlib byte-for-byte, called from deployed bytecode on the live chain |
+| DELEGATECALL delegates | a proxy's storage takes the write; the implementation's own storage is untouched |
+
 NOT REAL YET — named, not hidden:
 
-- **Precompiles are unreachable from contract code, and they fail SILENTLY.**
-  This is a cevm bug, not a node one, and it is the sharpest thing on this page.
-  `EvmcStateHost::call()` (cevm `lib/evm/state/evmc_host.hpp`) executes a callee
-  only when `db_.get_code_size(recipient) > 0`. A precompile has no code in the
-  StateDB, so the branch falls through to `return evmc::Result{EVMC_SUCCESS,
-  msg.gas, 0}` — **success, empty output, no gas charged**. Measured on the
-  running chain: `STATICCALL(0x02)` returns 1 and yields 32 zero bytes where
-  SHA-256 was due; `CALL(0x04)` likewise fails to echo its input. `DELEGATECALL`
-  and `STATICCALL` are not handled by either branch at all, so they never execute
-  the callee's code even for an ordinary contract. Any contract touching
-  `ecrecover`/`sha256`/`modexp`/`bn256` computes a different result from geth and
-  therefore a different state root — a fork, arrived at without an error. The
-  geth-parity gates do not catch it because their contract case does not call a
-  precompile. The implementations exist (`cevm::state::call_precompile` in
-  `test/state/precompiles.hpp`, and `evm::gpu::precompile::Dispatcher`); the host
-  just never dispatches. Fixing it needs cevm's own parity gates re-run, which is
-  why it is written down here rather than patched in passing.
 - **No rollback of a speculative execution.** cevm's `commit()` clears the
   journal, so a block cannot be reverted once its root is computed. A height that
   fails to certify leaves the state ahead of the last accepted block, and `noded`
@@ -261,6 +258,29 @@ NOT REAL YET — named, not hidden:
   signing. `luxcpp/pqclean` and `luxcpp/lattice` are not linked by node. Quasar
   here is classical blst. Nothing here pretends otherwise.
 - **The peer handshake is 4 plaintext bytes** (see below).
+
+## The bug that was here, and why no gate saw it
+
+cevm's `EvmcStateHost::call()` decided whether there was anything to execute by
+asking StateDB for a code size, and treated "nothing to run" as success. A
+precompile has no code there, so every call to one from inside contract code
+returned `EVMC_SUCCESS` with an empty output and no gas charged — a contract
+calling SHA-256 got 32 zero bytes and no error. `DELEGATECALL` and `CALLCODE`
+matched no branch at all, so the callee's code never ran: every proxy and
+upgradeable contract, reporting success and writing nothing. And the code was
+read from `msg.recipient` rather than `msg.code_address`, which is the same
+account for a plain CALL and the wrong one for exactly those two kinds.
+
+None of it was visible to the seven geth-parity gates, because the contract case
+in `evm-block-root-parity` calls no precompile and delegates to nothing. A gate
+that passes while the engine computes a non-Ethereum state root is the failure
+mode worth remembering: the bug was not that something errored, it was that
+nothing did.
+
+Fixed in cevm (`blue/cpp-node-cevm-live`), with `evm-host-precompile-parity`
+added and registered so it cannot come back quietly. That gate was confirmed to
+FAIL against the old host — `status=0` on every case — before being committed as
+passing.
 
 ## A deliberate divergence from Go, and its cost
 
@@ -303,3 +323,15 @@ Does NOT yet, in the order it matters:
   families, the handshake). Note also that Go's p2p framing counts the type byte
   in its length and caps at 2 MiB, whereas the plugin-RPC framing this node uses
   excludes it and caps at 16 MiB — they are two different wires with one name.
+
+## This file
+
+`LLM.md` is the canonical document and is tracked here. `AGENTS.md`, `GEMINI.md`
+and `CLAUDE.md` are symlinks to it, kept on disk and NOT tracked: they hold no
+content of their own, and tracking them would only be a way for the repository
+to carry one file under four names and eventually disagree with itself. After a
+fresh clone:
+
+```
+ln -sf LLM.md AGENTS.md && ln -sf LLM.md GEMINI.md && ln -sf LLM.md CLAUDE.md
+```

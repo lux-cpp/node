@@ -2,3 +2,12 @@ build/
 build-*/
 *.o
 *.a
+
+# LLM.md is the canonical, tracked document. The three aliases are local
+# conveniences for whichever assistant is reading — symlinks to LLM.md, so they
+# carry no content of their own and tracking them would only be a way for the
+# repository to hold the same file under four names.
+#   ln -sf LLM.md AGENTS.md && ln -sf LLM.md GEMINI.md && ln -sf LLM.md CLAUDE.md
+AGENTS.md
+GEMINI.md
+CLAUDE.md

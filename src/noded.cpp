@@ -161,6 +161,7 @@ int main(int argc, char** argv) {
     // it asks for 4 of 4 while the floor it just cleared asks for 3. A daemon
     // whose stated fault tolerance is defeated by its own threshold reports the
     // mesh up and then never decides a round.
+    cfg.wave = WaveConfig::feasible(std::uint32_t(n));
 
     // consensus throws at its boundary on a set/wave combination that cannot
     // reach a decision. A daemon says so and exits; it does not abort.
