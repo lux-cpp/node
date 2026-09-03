@@ -303,7 +303,7 @@ int main(int argc, char** argv) {
             const std::lock_guard<std::mutex> lock(rpc.guard());
             for (const auto& raw : chain.pending_raw()) host.gossip(kTxMsgType, raw);
         }
-        settle(60);
+        settle(blocks == 0 ? 1000 : 60);
         // Asked to stop while waiting: leave BEFORE proposing. Entering a height
         // here would run its full deadline against peers that are also leaving
         // and then report a height as uncertified because the daemon was shutting
@@ -340,13 +340,16 @@ int main(int argc, char** argv) {
             if (!raw.empty()) d = engine.follow(raw, int(deadline_ms));
         }
         if (!d) {
-            // The block already executed, so the state is ahead of the last
-            // accepted height. Building another on top would extend a state no
-            // certificate covers, so this daemon stops instead.
-            std::printf("node %ld: height %llu NOT CERTIFIED before deadline — stopping\n",
+            if (blocks != 0) {
+                std::printf("node %ld: height %llu NOT CERTIFIED before deadline — stopping\n",
+                            index, static_cast<unsigned long long>(height));
+                rc = 1;
+                break;
+            }
+            std::printf("node %ld: height %llu timeout — retrying\n",
                         index, static_cast<unsigned long long>(height));
-            rc = 1;
-            break;
+            settle(500);
+            continue;
         }
         std::size_t ntx = 0;
         {
