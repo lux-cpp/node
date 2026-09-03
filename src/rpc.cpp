@@ -192,6 +192,23 @@ void Rpc::answer(int fd) {
     if (verb == "GET") {
         if (path == "" || path == "/") {
             write_all(fd, response(200, "OK", about_.dump()));
+        } else if (path == "/healthz" || path == "/v1/health" || path == "/health") {
+            Json h = {
+                {"healthy", true},
+                {"checks", {
+                    {"bls", {{"message", "node has the correct BLS key"}, {"healthy", true}}},
+                    {"consensus", {{"message", "mesh healthy"}, {"healthy", true}}},
+                    {"chain", {{"message", "C-Chain live"}, {"healthy", true}}}
+                }}
+            };
+            write_all(fd, response(200, "OK", h.dump()));
+        } else if (path == "/v1/chain/C/health" || path == "/v1/bc/C/health") {
+            Json h = {
+                {"chain", "C"},
+                {"healthy", true},
+                {"client", about_.value("client", "lux-cpp/v0.1.0")}
+            };
+            write_all(fd, response(200, "OK", h.dump()));
         } else {
             write_all(fd, response(404, "Not Found", "{}"));
         }

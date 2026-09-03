@@ -187,8 +187,10 @@ Json block_json(const evm::Chain& c, const node::Block& b, bool full) {
 
 void serve_eth(Rpc& rpc, evm::Chain& chain, const std::string& client) {
     const std::string path = "/v1/chain/" + chain.alias() + "/rpc";
+    const std::string alt_path = "/v1/bc/" + chain.alias() + "/rpc";
     auto              on   = [&](const char* name, Rpc::Method fn) {
-        rpc.method(path, name, std::move(fn));
+        rpc.method(path, name, fn);
+        rpc.method(alt_path, name, std::move(fn));
     };
 
     on("eth_chainId", [&chain](const Json&) { return quantity(chain.eth_chain_id()); });
