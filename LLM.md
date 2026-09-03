@@ -335,3 +335,33 @@ fresh clone:
 ```
 ln -sf LLM.md AGENTS.md && ln -sf LLM.md GEMINI.md && ln -sf LLM.md CLAUDE.md
 ```
+
+## Post-quantum: what is available, and what is not
+
+The primitives are here and they work. lux-crypto — which this node already
+links — ships ML-KEM-768 and ML-DSA-65 behind a C ABI at NIST level 3
+(`mlkem_keygen/encap/decap`, `mldsa_keygen/sign/verify`, `mode = 3`). Verified
+on Linux: the KEM round-trips to an agreeing shared secret, ML-DSA-65 signs at
+3309 bytes and verifies, and one flipped signature byte fails verification.
+Nothing needs to be vendored from `luxcpp/pqclean` or `luxcpp/lattice` for
+either.
+
+What is NOT done is every place they would be USED: the peer handshake is still
+four plaintext bytes, NodeID is still an index, and blocks are still signed with
+classical BLS. Those are the work; the crypto under them is not.
+
+## Whose message this node signs
+
+`Engine::Binding` decides, and it is a named choice because the two answers are
+mutually exclusive — validators that disagree about it do not form a quorum,
+their signatures simply fail against each other's message.
+
+- `Executed` binds `execution_state_root` to what this node's EVM produced, so a
+  divergent EVM stalls a height instead of hiding. `noded` uses this.
+- `Transport` leaves the execution axes empty, which is what luxd signs: Go's
+  proposervm returns `ids.Empty`, and a Go voter does not execute the block it
+  votes on. A C++ node that binds the root inside a live Go network produces a
+  message Go DROPS rather than disputes.
+
+Joining luxd takes `Transport` until Go binds the axis too, at which point this
+collapses back to one answer.
