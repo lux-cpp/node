@@ -17,12 +17,9 @@
 // certifies the root only indirectly, through a block hash that happens to
 // commit to it. Here the axis is bound.
 //
-// That is a DELIBERATE DIVERGENCE and it has a consequence worth stating: a
-// signed message that binds the root is not the message Go signs for the same
-// block, so a C++ validator and a Go validator cannot form one quorum until Go
-// binds the axis too. What is gained is that divergent execution can no longer
-// hide — two nodes whose EVMs disagree sign different messages and simply fail
-// to reach a quorum, instead of both signing a name they each mean differently.
+// That is a DELIBERATE DIVERGENCE, and it is not a free one — it decides who
+// this node can form a quorum WITH, so it is a named choice rather than a
+// constant. See `Binding`.
 
 #pragma once
 
@@ -35,6 +32,33 @@
 #include <optional>
 
 namespace lux::node {
+
+// WHOSE MESSAGE THIS NODE SIGNS.
+//
+// The vote's execution axes can be filled two ways, and the two are mutually
+// exclusive: a signed message either commits to the root this node computed or
+// it does not, and validators that disagree about which do not form a quorum —
+// their signatures simply fail to verify against each other's message.
+//
+//   Executed — bind execution_state_root to what THIS node's EVM produced.
+//     Stronger, and the reason is that divergent execution cannot hide: two
+//     nodes whose EVMs disagree sign different messages and stall the height
+//     instead of both signing a name they each mean differently.
+//
+//   Transport — leave the execution axes empty, which is what luxd signs.
+//     Go's proposervm returns ids.Empty for ExecutionStateRoot, and a Go voter
+//     does not execute the block it votes on. Matching that is the ONLY way a
+//     C++ node's votes verify inside a live Go network; binding the root there
+//     produces a message luxd drops rather than disputes.
+//
+// Both are correct; which one is right depends on the network. A pure C++
+// cluster takes Executed. Joining luxd takes Transport, until Go binds the axis
+// too — at which point this collapses back to one answer, which is where it
+// should end up.
+enum class Binding {
+    Executed,   // bind the root this node computed — a C++-only cluster
+    Transport,  // leave it empty, as luxd does — a mixed cluster
+};
 
 // One decided height: the block, and the certificate that decided it.
 struct Decided {
@@ -53,7 +77,11 @@ class Engine {
 public:
     // The engine drives the VM; it does not own the mesh, which outlives it.
     // `guard` is the chain's lock — the same one the RPC holds while it answers.
-    Engine(std::unique_ptr<VM> vm, Node2Host& host, std::mutex& guard);
+    // `binding` decides whose signed message this node produces; see Binding.
+    // `set_root` is the commitment to the validator set the vote is cast under,
+    // which every node in the quorum must compute identically.
+    Engine(std::unique_ptr<VM> vm, Node2Host& host, std::mutex& guard,
+           Binding binding = Binding::Executed, Id set_root = {});
 
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
@@ -110,6 +138,8 @@ private:
     std::unique_ptr<VM> vm_;
     Node2Host&          host_;
     std::mutex&         guard_;
+    Binding             binding_;
+    Id                  set_root_;
 };
 
 }  // namespace lux::node

@@ -29,6 +29,7 @@
 #include "lux/node/evm.hpp"
 #include "lux/node/node_host.hpp"
 #include "lux/node/rpc.hpp"
+#include "lux/node/validators.hpp"
 
 #include "bls_signature.hpp"
 
@@ -147,6 +148,28 @@ int main(int argc, char** argv) {
     std::vector<Validator> set;
     for (const auto& k : keys) set.push_back({k.pk, std::uint64_t(stake)});
 
+    // The commitment to that set, which every vote binds. Computed with Go's
+    // encoding (lux/node/validators.hpp), so a node in a mixed cluster signs the
+    // same message luxd does.
+    //
+    // The node id and the uncompressed key are placeholders HERE and only here:
+    // this daemon derives its validator set from an index scheme rather than
+    // from a P-chain, so it has no node ids or uncompressed keys to commit to.
+    // A node joining a live network reads the EFFECTIVE set from the P-chain
+    // (/v1/chain/P/ops/validators/at?height=0) — the weight the P-chain
+    // computed, not the one genesis declared, and the 96-byte uncompressed key,
+    // not the 48-byte compressed one the proof of possession signs. Until that
+    // read exists, this commits to the set it actually has.
+    std::vector<SetMember> members;
+    for (long i = 0; i < n; ++i) {
+        SetMember m;
+        m.node_id.fill(std::uint8_t(0x80 + i));
+        m.weight = std::uint64_t(stake);
+        m.pubkey.assign(keys[i].pk.begin(), keys[i].pk.end());
+        members.push_back(std::move(m));
+    }
+    const Id set_root = validator_set_root(members);
+
     HostConfig cfg;
     cfg.index      = std::uint32_t(index);
     cfg.port       = std::uint16_t(base_port + index);
@@ -181,6 +204,7 @@ int main(int argc, char** argv) {
     std::printf("node %ld: consensus 127.0.0.1:%u  chain C (eth chainId %llu)\n",
                 index, port, static_cast<unsigned long long>(chain.eth_chain_id()));
     std::printf("node %ld: genesis state root %s\n", index, hex(chain.state_root()).c_str());
+    std::printf("node %ld: validator set root %s\n", index, hex(set_root).c_str());
     std::fflush(stdout);
 
     // ── the RPC, up before consensus ────────────────────────────────────────
@@ -244,7 +268,10 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(two_thirds_stake_floor(total_stake)));
     std::fflush(stdout);
 
-    Engine engine(std::move(chainp), host, rpc.guard());
+    // Executed: this is a C++-only cluster, so the vote binds the root this
+    // node's EVM produced and a divergent EVM stalls the height instead of
+    // hiding. Joining luxd takes Binding::Transport — see engine.hpp.
+    Engine engine(std::move(chainp), host, rpc.guard(), Binding::Executed, set_root);
 
     // Pump the mesh for `ms`, so gossip lands and inbound blocks arrive. The one
     // place this daemon waits.
