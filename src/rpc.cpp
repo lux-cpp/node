@@ -150,9 +150,12 @@ std::string proxy_to_archive(const std::string& archive_url, const std::string& 
     ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+    // htons and friends are FUNCTIONS in glibc and MACROS on Darwin
+    // (sys/_endian.h), and a macro cannot be reached through ::, so the
+    // qualified spelling builds on Linux and fails to parse on macOS.
     sockaddr_in a{};
     a.sin_family = AF_INET;
-    a.sin_port = ::htons(port);
+    a.sin_port = htons(port);
     if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) <= 0) {
         ::close(sock);
         return "";
@@ -227,8 +230,8 @@ Rpc::Rpc(std::uint16_t port) {
 
     sockaddr_in a{};
     a.sin_family      = AF_INET;
-    a.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
-    a.sin_port        = ::htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port        = htons(port);
     if (::bind(fd_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
         ::close(fd_);
         throw std::runtime_error("rpc: bind 127.0.0.1:" + std::to_string(port) + ": " +
@@ -240,7 +243,7 @@ Rpc::Rpc(std::uint16_t port) {
     }
     socklen_t len = sizeof(a);
     if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&a), &len) == 0)
-        port_ = ::ntohs(a.sin_port);
+        port_ = ntohs(a.sin_port);
 }
 
 Rpc::~Rpc() { stop(); }
