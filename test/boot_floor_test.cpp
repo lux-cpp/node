@@ -38,6 +38,7 @@
 // must not.
 
 #include "lux/node/node_host.hpp"
+#include "lux/consensus/threshold.hpp"
 #include "bls_signature.hpp"
 
 #include <array>
@@ -102,7 +103,7 @@ std::vector<PubKey> voters_at_height(std::uint64_t booted_at) {
         cfg.sk         = g_keys[i].sk;
         cfg.pk         = g_keys[i].pk;
         cfg.validators = g_set;
-        cfg.wave       = WaveConfig{kN, equal_stake_supermajority(kN), kBeta};
+        cfg.wave       = WaveConfig{kN, two_thirds_count(kN), kBeta};
         cfg.accepted   = (i == 0) ? booted_at : 0;   // THE ONE VARIABLE
         hosts.push_back(std::make_unique<Node2Host>(std::move(cfg)));
         ports[i] = hosts[i]->listen_bind();

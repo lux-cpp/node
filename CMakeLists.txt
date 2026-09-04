@@ -111,6 +111,33 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# ── AWS-LC — the ONLY TLS stack on this machine offering luxd's mandatory
+#    X25519MLKEM768 hybrid group (`network/peer/tls_config.go`'s single-
+#    element CurvePreferences list). System OpenSSL here is 3.0.13, which
+#    predates the group entirely; AWS-LC 0.45.0 (the exact version node.rs's
+#    own `aws-lc-rs` dependency resolves to) has it at the SAME wire codepoint
+#    Go's crypto/tls assigns (`SSL_GROUP_X25519_MLKEM768 = 0x11EC`). Built
+#    standalone from its own CMakeLists (its source ships inside the
+#    `aws-lc-sys` crate; this repo depends on neither Cargo nor that crate,
+#    only on the C library it vendors) — see LLM.md for the exact command.
+#    Not a Conan package: nothing in this stack packages it.
+set(AWSLC_SRC       "" CACHE PATH "AWS-LC source tree (has include/openssl/ssl.h)")
+set(AWSLC_BUILD_DIR "" CACHE PATH "AWS-LC build dir (has crypto/libcrypto.a, ssl/libssl.a)")
+if(NOT AWSLC_SRC OR NOT EXISTS "${AWSLC_SRC}/include/openssl/ssl.h" OR
+   NOT AWSLC_BUILD_DIR OR NOT EXISTS "${AWSLC_BUILD_DIR}/ssl/libssl.a")
+  message(FATAL_ERROR
+    "node: AWS-LC not found. Build it once — see LLM.md \"Building AWS-LC\" —\n"
+    "then pass -DAWSLC_SRC=<...>/aws-lc -DAWSLC_BUILD_DIR=<build dir>.")
+endif()
+message(STATUS "node: aws-lc      = ${AWSLC_BUILD_DIR}")
+add_library(awslc_crypto STATIC IMPORTED)
+set_target_properties(awslc_crypto PROPERTIES IMPORTED_LOCATION "${AWSLC_BUILD_DIR}/crypto/libcrypto.a")
+add_library(awslc_ssl STATIC IMPORTED)
+set_target_properties(awslc_ssl PROPERTIES
+  IMPORTED_LOCATION "${AWSLC_BUILD_DIR}/ssl/libssl.a"
+  INTERFACE_LINK_LIBRARIES awslc_crypto
+  INTERFACE_INCLUDE_DIRECTORIES "${AWSLC_SRC}/include")
+
 # ── Reuse consensus's build (brings the blst / bls_signature / consensus targets
 #    with correct include + link propagation). One build definition for the reused
 #    layers — no duplication here.
@@ -133,9 +160,12 @@ add_library(node STATIC
     src/evm.cpp           # the C-Chain, executed by cevm
     src/rpc.cpp           # HTTP JSON-RPC
     src/eth.cpp           # the eth methods, mounted on an Rpc
-    src/validators.cpp)   # the set-root commitment a vote binds
+    src/validators.cpp    # the set-root commitment a vote binds
+    src/staking.cpp        # a luxd peer's identity: P-256 cert + NodeID + BLS
+    src/peer_tls.cpp       # TLS 1.3 + X25519MLKEM768, over AWS-LC
+    src/peer.cpp)          # the p2p Handshake/PushQuery/vote path to a live luxd
 target_include_directories(node PUBLIC include "${ZAP_DIR}")
-target_link_libraries(node PUBLIC consensus Threads::Threads)
+target_link_libraries(node PUBLIC consensus Threads::Threads awslc_ssl)
 # evm-state carries the StateDB, process_block and the Merkle-Patricia-Trie; evm
 # is the interpreter behind evmc_create_cevm. lux::crypto-secp256k1 is what
 # recovers a transaction's sender, and nlohmann_json is the RPC's codec.
@@ -162,6 +192,13 @@ target_compile_options(zood PRIVATE -Wall -Wextra)
 add_executable(noded src/noded.cpp)
 target_link_libraries(noded PRIVATE node)
 target_compile_options(noded PRIVATE -Wall -Wextra)
+
+# ── lux-join — a validator on a REAL, external luxd network (not this node's
+#   own self-referential mesh): PQ-gated TLS, the p2p Handshake, and a signed
+#   Quasar vote on whatever luxd proposes. See LLM.md.
+add_executable(lux-join src/lux_join_main.cpp)
+target_link_libraries(lux-join PRIVATE node)
+target_compile_options(lux-join PRIVATE -Wall -Wextra)
 
 # ── tests — one registration, one list
 #   frame_reader    the reassembler in isolation (fragmentation, batching, limits)
