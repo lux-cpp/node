@@ -98,8 +98,8 @@ std::uint16_t Mesh::listen_bind(std::uint16_t port) {
     if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0)
         throw std::runtime_error("node: bind() failed on port " + std::to_string(port));
 
-    // Backlog must hold every inbound dialer until accept() drains it.
-    if (::listen(listen_fd_, 16) != 0)
+    // Backlog must hold inbound dialers until accept() drains it.
+    if (::listen(listen_fd_, 128) != 0)
         throw std::runtime_error("node: listen() failed");
 
     socklen_t len = sizeof addr;
