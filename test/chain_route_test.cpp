@@ -46,8 +46,8 @@ Reply call(std::uint16_t port, const char* verb, const std::string& path, const 
 
     sockaddr_in a{};
     a.sin_family = AF_INET;
-    a.sin_port   = ::htons(port);
-    a.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+    a.sin_port   = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::connect(sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
         ::close(sock);
         return out;
