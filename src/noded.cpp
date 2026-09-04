@@ -121,6 +121,12 @@ evm::Genesis local_genesis(std::uint64_t chain_id) {
     balance[26] = 0xe0; balance[27] = 0xc9; balance[28] = 0xba; balance[29] = 0xb2;
     balance[30] = 0x40; balance[31] = 0x00;
     g.alloc.emplace_back(dev, balance);
+
+    // LUX_MNEMONIC treasury: 0x9011E888251AB053B7bD1cdB598Db4f9DEd94714
+    const std::array<std::uint8_t, 20> treasury{0x90, 0x11, 0xe8, 0x88, 0x25, 0x1a, 0xb0, 0x53,
+                                                0xb7, 0xbd, 0x1c, 0xdb, 0x59, 0x8d, 0xb4, 0xf9,
+                                                0xde, 0xd9, 0x47, 0x14};
+    g.alloc.emplace_back(treasury, balance);
     return g;
 }
 
