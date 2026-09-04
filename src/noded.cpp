@@ -257,11 +257,11 @@ int main(int argc, char** argv) {
         {"index", index},
         {"validators", n},
         {"endpoint", public_api},
-        {"chains", Rpc::Json::object({{"c", "/v1/chain/C/rpc"}, {"p", "/v1/bc/P"}, {"x", "/v1/bc/X"}})},
+        {"chains", Rpc::Json::object({{"c", "/v1/chain/c"}, {"p", "/v1/chain/p"}, {"x", "/v1/chain/x"}})},
         {"endpoints", Rpc::Json::object({
-            {"rpc", "/v1/chain/C/rpc"},
-            {"p", "/v1/bc/P"},
-            {"x", "/v1/bc/X"},
+            {"rpc", "/v1/chain/c"},
+            {"p", "/v1/chain/p"},
+            {"x", "/v1/chain/x"},
             {"health", "/v1/health"},
             {"public", public_api}
         })}
@@ -271,7 +271,7 @@ int main(int argc, char** argv) {
     if (!archive_rpc.empty()) {
         std::printf("node %ld: archive RPC %s (proxying historical & P/X state)\n", index, archive_rpc.c_str());
     }
-    std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/C/rpc\n", index, rpc.port());
+    std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/c\n", index, rpc.port());
     std::fflush(stdout);
 
     // ── the mesh ────────────────────────────────────────────────────────────
