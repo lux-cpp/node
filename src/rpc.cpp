@@ -11,11 +11,61 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <vector>
 
 namespace lux::node {
 namespace {
+
+// THE one place that decides which chain a path names.
+//
+// `/v1/chain/C/rpc`, `/v1/chain/c`, `/v1/bc/C` and `/v1/bc/c/rpc` are one
+// route, not four: the middle word is either spelling, the alias is matched
+// without regard to case, and the trailing `/rpc` is optional. Everything
+// downstream is handed a lowercase alias and never sees a path again, so a
+// chain becomes reachable by every spelling the moment it registers rather
+// than once someone remembers to add a branch here.
+struct ChainPath {
+    std::string alias;           // empty when the path names no chain
+    bool        health = false;  // `.../health` rather than the RPC itself
+};
+
+ChainPath chain_path(const std::string& path) {
+    std::vector<std::string> parts;
+    for (std::size_t i = 0; i < path.size();) {
+        if (path[i] == '/') { ++i; continue; }
+        const auto end = path.find('/', i);
+        parts.push_back(path.substr(i, end == std::string::npos ? end : end - i));
+        if (end == std::string::npos) break;
+        i = end + 1;
+    }
+    if (parts.size() < 3 || parts.size() > 4) return {};
+    if (parts[0] != "v1") return {};
+    if (parts[1] != "chain" && parts[1] != "bc") return {};
+
+    ChainPath out;
+    out.alias = parts[2];
+    for (char& c : out.alias)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (parts.size() == 4) {
+        if (parts[3] == "health") out.health = true;
+        else if (parts[3] != "rpc") return {};
+    }
+    return out;
+}
+
+// Where the archive publishes a chain. This is the UPSTREAM's shape, measured
+// against a running Go node rather than assumed: it answers `/v1/bc/C/rpc` and
+// `/v1/bc/P`. An alias the archive does not publish is not proxied at all — a
+// guessed path returns a 404 wearing the costume of an outage.
+std::string archive_path(const std::string& alias) {
+    if (alias == "c") return "/v1/bc/C/rpc";
+    if (alias == "p") return "/v1/bc/P";
+    if (alias == "x") return "/v1/bc/X";
+    return "";
+}
 
 // A request this server will read, and no larger. A JSON-RPC call is small; a
 // raw transaction is the biggest thing that arrives, and 1 MiB is far past any
@@ -77,8 +127,10 @@ std::size_t content_length(const std::string& head) {
     return static_cast<std::size_t>(std::strtoull(head.c_str() + at + 15, nullptr, 10));
 }
 
-std::string proxy_to_archive(const std::string& archive_url, const std::string& path, const std::string& body) {
+std::string proxy_to_archive(const std::string& archive_url, const std::string& alias, const std::string& body) {
     if (archive_url.empty()) return "";
+    const std::string target_path = archive_path(alias);
+    if (target_path.empty()) return "";
     std::string url = archive_url;
     if (url.rfind("http://", 0) == 0) url = url.substr(7);
     while (!url.empty() && url.back() == '/') url.pop_back();
@@ -108,15 +160,6 @@ std::string proxy_to_archive(const std::string& archive_url, const std::string& 
     if (::connect(sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
         ::close(sock);
         return "";
-    }
-
-    std::string target_path = path;
-    if (target_path == "/v1/chain/C/rpc" || target_path == "/v1/bc/C/rpc" || target_path == "/" || target_path.empty()) {
-        target_path = "/v1/bc/C/rpc";
-    } else if (target_path == "/v1/chain/P" || target_path == "/v1/bc/P" || target_path == "/v1/chain/P/rpc") {
-        target_path = "/v1/bc/P";
-    } else if (target_path == "/v1/chain/X" || target_path == "/v1/bc/X" || target_path == "/v1/chain/X/rpc") {
-        target_path = "/v1/bc/X";
     }
 
     std::string req = "POST " + target_path + " HTTP/1.1\r\n";
@@ -202,10 +245,17 @@ Rpc::Rpc(std::uint16_t port) {
 
 Rpc::~Rpc() { stop(); }
 
-void Rpc::method(std::string path, std::string name, Method fn) {
-    methods_[std::move(path)][std::move(name)] = std::move(fn);
+namespace {
+std::string lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
 }
-void Rpc::root(std::string path) { root_path_ = std::move(path); }
+}  // namespace
+
+void Rpc::method(std::string alias, std::string name, Method fn) {
+    methods_[lower(std::move(alias))][std::move(name)] = std::move(fn);
+}
+void Rpc::root(std::string alias) { root_alias_ = lower(std::move(alias)); }
 void Rpc::about(Json j) { about_ = std::move(j); }
 
 void Rpc::start() {
@@ -288,6 +338,9 @@ void Rpc::answer(int fd) {
 
     if (verb == "OPTIONS") { write_all(fd, response(204, "No Content", "")); return; }
 
+    // Decided once, here, for every verb below.
+    const ChainPath chain = chain_path(path);
+
     if (verb == "GET") {
         if (path == "" || path == "/") {
             Json about = about_;
@@ -298,15 +351,20 @@ void Rpc::answer(int fd) {
             if (!about.contains("chains")) {
                 about["chains"] = Json::object();
             }
-            about["chains"]["c"] = "/v1/chain/C/rpc";
-            about["chains"]["p"] = "/v1/bc/P";
-            about["chains"]["x"] = "/v1/bc/X";
+            // Advertise what is actually registered, so a chain appears here by
+            // existing. The archive-backed pair is named too, because a light
+            // node answers for them without serving them.
+            for (const auto& served : methods_)
+                about["chains"][served.first] = "/v1/chain/" + served.first;
+            for (const char* proxied : {"p", "x"})
+                if (!about["chains"].contains(proxied))
+                    about["chains"][proxied] = std::string("/v1/chain/") + proxied;
             if (!about.contains("endpoints")) {
                 about["endpoints"] = Json::object();
             }
-            about["endpoints"]["rpc"] = "/v1/chain/C/rpc";
-            about["endpoints"]["p"] = "/v1/bc/P";
-            about["endpoints"]["x"] = "/v1/bc/X";
+            about["endpoints"]["rpc"] = "/v1/chain/" + (root_alias_.empty() ? std::string("c") : root_alias_);
+            about["endpoints"]["p"] = "/v1/chain/p";
+            about["endpoints"]["x"] = "/v1/chain/x";
             write_all(fd, response(200, "OK", about.dump()));
         } else if (path == "/healthz" || path == "/v1/health" || path == "/health") {
             Json h = {
@@ -318,9 +376,9 @@ void Rpc::answer(int fd) {
                 }}
             };
             write_all(fd, response(200, "OK", h.dump()));
-        } else if (path == "/v1/chain/C/health" || path == "/v1/bc/C/health") {
+        } else if (chain.health && methods_.count(chain.alias) != 0) {
             Json h = {
-                {"chain", "C"},
+                {"chain", chain.alias},
                 {"healthy", true},
                 {"client", about_.value("client", "lux-cpp/v0.1.0")}
             };
@@ -333,25 +391,32 @@ void Rpc::answer(int fd) {
     if (verb != "POST") { write_all(fd, response(405, "Method Not Allowed", "{}")); return; }
 
     // Go forwards a bare POST / to the C-Chain; so does this.
-    if ((path == "" || path == "/") && !root_path_.empty()) path = root_path_;
+    const std::string alias =
+        (path == "" || path == "/") && !root_alias_.empty() ? root_alias_ : chain.alias;
 
-    bool is_p_or_x = (path == "/v1/chain/P" || path == "/v1/bc/P" || path == "/v1/chain/P/rpc" ||
-                      path == "/v1/chain/X" || path == "/v1/bc/X" || path == "/v1/chain/X/rpc");
-    if (is_p_or_x) {
+    if (alias.empty() || chain.health) {
+        write_all(fd, response(404, "Not Found",
+                               R"({"jsonrpc":"2.0","id":null,)"
+                               R"("error":{"code":-32601,"message":"no such chain"}})"));
+        return;
+    }
+
+    if (methods_.find(alias) == methods_.end()) {
+        // A chain this node does not keep. With an archive configured it is
+        // still answerable, which is how a frontier-only node serves P and X.
         if (!archive_rpc_.empty()) {
-            std::string proxied = proxy_to_archive(archive_rpc_, path, body);
+            const std::string proxied = proxy_to_archive(archive_rpc_, alias, body);
             if (!proxied.empty()) {
                 write_all(fd, response(200, "OK", proxied));
                 return;
             }
         }
-        write_all(fd, response(200, "OK",
-                               R"({"jsonrpc":"2.0","id":null,)"
-                               R"("error":{"code":-32000,"message":"light node: P/X chain queries require --archive-rpc to proxy from full archive node"}})"));
-        return;
-    }
-
-    if (methods_.find(path) == methods_.end()) {
+        if (!archive_path(alias).empty()) {
+            write_all(fd, response(200, "OK",
+                                   R"({"jsonrpc":"2.0","id":null,)"
+                                   R"("error":{"code":-32000,"message":"light node: P/X chain queries require --archive-rpc to proxy from full archive node"}})"));
+            return;
+        }
         write_all(fd, response(404, "Not Found",
                                R"({"jsonrpc":"2.0","id":null,)"
                                R"("error":{"code":-32601,"message":"no such chain"}})"));
@@ -373,14 +438,14 @@ void Rpc::answer(int fd) {
     Json out;
     if (request.is_array()) {
         out = Json::array();
-        for (const auto& one : request) out.push_back(dispatch(path, one));
+        for (const auto& one : request) out.push_back(dispatch(alias, one));
     } else {
-        out = dispatch(path, request);
+        out = dispatch(alias, request);
     }
     write_all(fd, response(200, "OK", out.dump()));
 }
 
-Rpc::Json Rpc::dispatch(const std::string& path, const Json& req) {
+Rpc::Json Rpc::dispatch(const std::string& alias, const Json& req) {
     // The id is echoed even when the request is malformed, which is what lets a
     // client match an error to the call that caused it.
     Json id = nullptr;
@@ -395,11 +460,11 @@ Rpc::Json Rpc::dispatch(const std::string& path, const Json& req) {
     if (!req.is_object() || !req.contains("method") || !req["method"].is_string())
         return fail(-32600, "invalid request");
 
-    const auto& table = methods_.at(path);
+    const auto& table = methods_.at(alias);
     const auto  it    = table.find(req["method"].get<std::string>());
     if (it == table.end()) {
         if (!archive_rpc_.empty()) {
-            std::string proxied = proxy_to_archive(archive_rpc_, path, req.dump());
+            std::string proxied = proxy_to_archive(archive_rpc_, alias, req.dump());
             if (!proxied.empty()) {
                 try {
                     return Json::parse(proxied);
@@ -417,7 +482,7 @@ Rpc::Json Rpc::dispatch(const std::string& path, const Json& req) {
         return Json{{"jsonrpc", "2.0"}, {"id", id}, {"result", it->second(params)}};
     } catch (const Error& e) {
         if (e.code == -32000 && !archive_rpc_.empty()) {
-            std::string proxied = proxy_to_archive(archive_rpc_, path, req.dump());
+            std::string proxied = proxy_to_archive(archive_rpc_, alias, req.dump());
             if (!proxied.empty()) {
                 try {
                     return Json::parse(proxied);
