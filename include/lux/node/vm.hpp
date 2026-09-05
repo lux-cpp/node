@@ -112,6 +112,26 @@ struct VM {
     // anything, and the height that seeds the decided-height frontier.
     virtual Id last_accepted() const = 0;                                     // Go LastAccepted
     virtual std::uint64_t last_accepted_height() const = 0;
+
+    // THE HIGHEST HEIGHT THIS NODE ITSELF DECIDED — the top of the run of
+    // blocks that reached the tip through a quorum certificate this node
+    // verified, rather than arriving from outside it.
+    //
+    // On a chain that only ever advanced through accept() this is
+    // last_accepted_height() and the question is uninteresting. It stops being
+    // uninteresting the moment a chain can be handed history: reading an export
+    // moves the tip WITHOUT producing a single certificate under it, so the
+    // chain reports a healthy tip while every consensus frontier below it is
+    // missing. Go names the same state in vms/proposervm/vm.go — an inner chain
+    // restored without its outer index — and says what follows from it: such a
+    // chain "will NOT build blocks and MUST NOT be treated as a caught-up
+    // validator until the outer index is rebuilt from certified peer state".
+    //
+    // A VALUE, NOT A FLAG. The chain reports where its decisions stop; whether
+    // that is far enough to vote is the engine's rule, stated once there. A
+    // boolean here would put the policy in the chain and then have to be kept in
+    // step with it — two places, one rule.
+    virtual std::uint64_t frontier() const = 0;
 };
 
 }  // namespace lux::node

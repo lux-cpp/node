@@ -28,6 +28,10 @@ $ curl -s -X POST -H 'content-type: application/json' \
   chain        evm::Chain        NEW  src/evm.cpp — the C-Chain: genesis, mempool,
                                        execution through cevm, the real MPT root.
                                        The ONLY unit that knows evmc/intx/StateDB.
+  export       import_chain_data NEW  src/import.cpp — the C-chain's EXTERNAL
+                                       format (RLP) read back: ids recomputed,
+                                       links walked, tx tries rebuilt. Knows the
+                                       Ethereum block, not consensus.
   vm seam      VM / Block        NEW  include/lux/node/vm.hpp — what a chain is,
                                        asked once. P, X, Q and Z plug in here.
   engine       Engine            NEW  src/engine.cpp — execute → decide → accept,
@@ -231,6 +235,8 @@ REAL — observed on a running 5-process cluster, not inferred:
 | a transaction is real end to end | signed by `eth-account` (an independent implementation), sender RECOVERED here via secp256k1, balance moved exactly 1 ether, nonce 0→1, root changed `0x29e1beb5…` → `0xd117904d…` |
 | contract creation and storage work | a constructor's `SSTORE` is readable through `eth_getStorageAt` |
 | JSON-RPC is live | `eth_chainId` → `0x7a69`, `eth_blockNumber` advances off the real pipeline |
+| an RLP export imports and matches Go | the canonical `lux-testnet-96368.rlp`: 218 blocks, 219 senders recovered, every link walked, tip `0x722e2b39ae8973ab5d94b51451623352650b728e411ce0261c5efcd23aa381a5` and state root `0x4e19366fcc65d7ddd0b803bfbd7537f0c0ddc5d190c3ded40712408fcb137f35` — the same two values Go's import of the same bytes produced. `zoo-testnet` (84), `zoo-mainnet` (799) and `spc-mainnet` import the same way |
+| an imported node refuses to validate | `import_test`: the engine proposes nothing, follows nothing, and never asks the chain to build; `luxd` prints NOT A CAUGHT-UP VALIDATOR and parks |
 
 | precompiles work from contract code | SHA-256, RIPEMD-160 and IDENTITY match Python's hashlib byte-for-byte, called from deployed bytecode on the live chain |
 | DELEGATECALL delegates | a proxy's storage takes the write; the implementation's own storage is untouched |
@@ -241,6 +247,13 @@ NOT REAL YET — named, not hidden:
   journal, so a block cannot be reverted once its root is computed. A height that
   fails to certify leaves the state ahead of the last accepted block, and `noded`
   STOPS rather than build on it. Fail-secure, and the next thing to close.
+- **An import does not derive state.** The blocks and the tip are real and
+  checked; the EVM state behind them is not, because an export carries no genesis
+  allocation to execute from. `eth_getBalance` after an import answers from the
+  configured genesis, not from the imported chain — which is the second reason
+  such a node must not validate, and why it parks instead.
+- **No recovery from an import.** Go rebuilds the missing outer index from
+  certified peer state (`enterOuterBackfill`); this node refuses and stops there.
 - **No persistence.** State and blocks are in memory; a restart is a new chain.
   `HostConfig::accepted` exists to be seeded from a durable store, and there is
   no durable store.
@@ -292,6 +305,68 @@ costs is interop: a signed message that binds the root is not the message Go
 signs for the same block, so a C++ and a Go validator cannot form one quorum
 until Go binds it too. Stated here because it is a protocol difference, not an
 implementation detail.
+
+## Reading a chain back (`--import-chain-data`)
+
+The C-chain speaks two encodings. **ZAP** is the serialization everything in this
+stack uses — votes, blocks on the wire, the frame. **RLP** is what the C-chain
+hands to Ethereum, and a chain's history leaves it as an *export*: a bare
+concatenation of RLP-encoded blocks with no envelope, no index and no length
+prefix. `luxd --import-chain-data PATH` reads one. The flag is spelled Go's way
+because it is the same flag: Go passes it into the C-Chain's config and the VM
+reads the export at startup, before the chain serves anything, and a second run
+of an unchanged flag is a no-op rather than a failure. One runbook, three
+implementations.
+
+**What is proven, and what is only carried.** Every hash compared here is one
+this node computed: a block's id is `keccak(rlp(header))` over the header's own
+bytes; block N's parentHash must equal the id computed for block N−1, walked over
+every block rather than sampled; the body's transactions rebuild the header's
+`transactionsRoot` as a Merkle-Patricia trie; the uncle list hashes to
+`ommersHash`; and every transaction is decoded and its sender RECOVERED with
+secp256k1 — which also refuses another chain's export, since a transaction binds
+its chain id.
+
+The `stateRoot` is the one thing NOT proven, and naming it is the point. An
+export carries blocks, not state: deriving these roots means executing every
+transaction from the genesis ALLOCATION, which an export does not contain (the
+canonical lux-testnet export's genesis alloc is not in `lux/state`). So the roots
+are read from the headers as claims, and this node ends up knowing a tip whose
+state it did not compute.
+
+### And therefore it is not a validator
+
+Reading an export moves the tip and produces **no certificate under it**. Go
+names the same state in `vms/proposervm/vm.go` — an inner chain restored without
+its outer index — and says what has to follow: such a chain "will NOT build
+blocks and MUST NOT be treated as a caught-up validator until the outer index is
+rebuilt from certified peer state." A node that imports and then proposes signs
+an ancestry it never verified, which is worse than one that cannot import at all.
+
+The rule is one predicate in one place. `VM::frontier()` is a VALUE — the highest
+height this node itself decided — and `Engine::may_sign()` compares it to the
+tip. It is asked at the top of `settle()`, the single door every signed message
+passes through, and again in front of `build()`/`parse()`, because building is
+executing and a refusal behind the execution would already have run a block
+against state this node never derived. `evm::Chain::ingest` moves the tip and
+deliberately does not touch the frontier; `BlockImpl::accept` — reached only on a
+verifying quorum certificate — is the only thing that does.
+
+`import_test` drives the engine over an imported chain and asserts that the chain
+was never even **asked** to build, with the un-imported chain as the control.
+`noded` says the same thing out loud and parks: RPC keeps answering, so the
+imported history is readable and the state is visible rather than silent.
+
+```
+node 0: import tip 0x722e2b39ae…81a5 height 218 time 1746815479
+node 0: import state root 0x4e19366f…7f35 (carried from the header — an export holds blocks, not state)
+node 0: import 218 blocks ingested, 0 already held, 219 transactions recovered
+node 0: NOT A CAUGHT-UP VALIDATOR — tip is height 218, this node's own decisions stop at height 0
+```
+
+Recovery — rebuilding those heights from certified peer state — is **not here**.
+Go has `enterOuterBackfill`; this node has the refusal and no way out of it but a
+fresh start. Said plainly rather than hidden behind a tip that looks healthy.
 
 ## Scope (honest)
 

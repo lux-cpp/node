@@ -175,6 +175,7 @@ add_library(node STATIC
     src/node_host.cpp     # one Party driven over that mesh
     src/engine.cpp        # execute → decide → accept, for any VM
     src/evm.cpp           # the C-Chain, executed by cevm
+    src/import.cpp        # the C-chain's external format, read back
     src/rpc.cpp           # HTTP JSON-RPC
     src/eth.cpp           # the eth methods, mounted on an Rpc
     src/validators.cpp    # the set-root commitment a vote binds
@@ -230,9 +231,11 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #   chain_route     every spelling of a chain's path reaches that one chain
 #   archive_proxy   what a relayed answer's status is, when this node is a proxy
 #   block_reject    a block that is not accepted gives its transactions back
+#   import          the canonical RLP export, walked block by block, and the
+#                   refusal that follows a tip nobody here decided
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root chain_route archive_proxy block_reject)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root chain_route archive_proxy block_reject import)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)

@@ -78,6 +78,33 @@ struct Tx {
     static std::optional<Tx> decode(std::span<const std::uint8_t> raw, std::uint64_t chain_id);
 };
 
+// A BLOCK OUT OF THE CHAIN'S PAST, read back from an export.
+//
+// The C-Chain has two encodings and this is the other one. A block this node
+// builds is a ZAP frame whose id is the keccak of exactly those bytes; a block
+// the chain EXPORTS is an Ethereum block, and its id is the keccak of its
+// header's RLP. Both are the same five facts — parent, height, timestamp, root,
+// transactions — carried in the format that names the block for whoever is
+// reading it, so `id` and `bytes` come from the reader rather than from a
+// re-encoding here. Re-deriving them would mean re-choosing an encoding the
+// exporter already chose, and one disagreement about it would name a different
+// block.
+//
+// `root` IS A CLAIM, and the whole of this type turns on that. A built or
+// followed block's root is what this node's own cevm produced; a past block's
+// root is what its header says, because reading an export executes nothing. A
+// chain holding these therefore knows a tip whose state it has not derived —
+// which is exactly why `Chain::frontier()` stops below them.
+struct Past {
+    Id                        id{};         // keccak(rlp(header)) — recomputed by the reader
+    Id                        parent{};     // its header's parentHash
+    Id                        root{};       // its header's stateRoot — a claim, not a result
+    std::uint64_t             height    = 0;
+    std::uint64_t             timestamp = 0;
+    std::vector<Tx>           txs;          // senders RECOVERED, never asserted
+    std::vector<std::uint8_t> bytes;        // the block's own RLP, verbatim
+};
+
 // The C-Chain. Owns the EVM state, the mempool, and every block it has built or
 // accepted.
 //
@@ -112,6 +139,18 @@ public:
     void          prefer(const Id&) override;
     Id            last_accepted() const override;
     std::uint64_t last_accepted_height() const override;
+    std::uint64_t frontier() const override;
+
+    // Take one block of history read from an export. It must extend the tip by
+    // exactly one height, and that is the only thing this checks — whether the
+    // block belongs to THIS chain's past is the reader's question, because only
+    // the reader has the file's own genesis to close the ancestry against.
+    //
+    // Ingesting moves the tip and produces NO certificate, so it leaves
+    // frontier() behind — deliberately, and permanently until consensus catches
+    // up. Throws on a block that does not extend the tip; a chain that quietly
+    // accepted a gap would report a height it cannot walk down from.
+    void ingest(Past);
 
     // ── the EVM's own questions, which only its RPC asks ────────────────────
     std::uint64_t eth_chain_id() const noexcept;
