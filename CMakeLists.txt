@@ -121,8 +121,25 @@ find_package(Threads REQUIRED)
 #    `aws-lc-sys` crate; this repo depends on neither Cargo nor that crate,
 #    only on the C library it vendors) — see LLM.md for the exact command.
 #    Not a Conan package: nothing in this stack packages it.
+#    Found the way the other two reused trees are found, rather than named on
+#    the command line: it is a checkout beside them and it was the one
+#    dependency that made configuring this repo a two-step job. -DAWSLC_SRC
+#    and -DAWSLC_BUILD_DIR still override.
 set(AWSLC_SRC       "" CACHE PATH "AWS-LC source tree (has include/openssl/ssl.h)")
 set(AWSLC_BUILD_DIR "" CACHE PATH "AWS-LC build dir (has crypto/libcrypto.a, ssl/libssl.a)")
+if(NOT AWSLC_SRC)
+  find_checkout(AWSLC_SRC "include/openssl/ssl.h"
+    "${CMAKE_SOURCE_DIR}/../aws-lc"
+    "${CMAKE_SOURCE_DIR}/../../luxcpp/aws-lc"
+    "${CMAKE_SOURCE_DIR}/../luxcpp/aws-lc")
+endif()
+if(NOT AWSLC_BUILD_DIR AND AWSLC_SRC)
+  # The build is a directory under the source, and it counts only if the
+  # library is actually in it: a configured-but-unbuilt tree is not an answer.
+  find_checkout(AWSLC_BUILD_DIR "ssl/libssl.a"
+    "${AWSLC_SRC}/build"
+    "${AWSLC_SRC}/build/Release")
+endif()
 if(NOT AWSLC_SRC OR NOT EXISTS "${AWSLC_SRC}/include/openssl/ssl.h" OR
    NOT AWSLC_BUILD_DIR OR NOT EXISTS "${AWSLC_BUILD_DIR}/ssl/libssl.a")
   message(FATAL_ERROR
