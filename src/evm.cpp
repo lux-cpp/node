@@ -81,7 +81,7 @@ class BlockImpl final : public node::Block {
 public:
     BlockImpl(Chain::State* st, Id parent, std::uint64_t height, std::uint64_t timestamp,
               Id root, std::vector<Tx> txs, bool verified)
-        : st_(st), parent_(parent), height_(height), timestamp_(timestamp), root_(root),
+        : st_(st), parent_(parent), root_(root), height_(height), timestamp_(timestamp),
           txs_(std::move(txs)), verified_(verified) {
         lux::zap::Writer w;
         w.write_bytes(parent_.data(), parent_.size());
@@ -93,6 +93,16 @@ public:
         bytes_ = w.take();
         id_    = keccak(bytes_);
     }
+
+    // The same block, in the OTHER encoding: read back from an export, so its
+    // id and its bytes are the external Ethereum format's and arrive already
+    // computed. `verified_` is false and cannot be anything else — this node ran
+    // nothing, so its root is the header's claim and an honest node does not
+    // vote for a block it did not execute.
+    BlockImpl(Chain::State* st, Id id, std::vector<std::uint8_t> bytes, Id parent,
+              std::uint64_t height, std::uint64_t timestamp, Id root, std::vector<Tx> txs)
+        : st_(st), parent_(parent), root_(root), id_(id), height_(height), timestamp_(timestamp),
+          txs_(std::move(txs)), bytes_(std::move(bytes)), verified_(false) {}
 
     Id                            id() const override { return id_; }
     Id                            parent() const override { return parent_; }
@@ -276,6 +286,13 @@ struct Chain::State {
     std::uint64_t                                       accepted_height = 0;
     Id                                                  preferred{};
 
+    // Where this node's OWN decisions stop. Genesis is decided by construction
+    // — every validator computes it from the same genesis — so a chain that has
+    // only ever advanced through accept() has frontier == accepted_height and
+    // nothing to say. `ingest` moves accepted_height and leaves this behind,
+    // which is the whole record of "the tip arrived without a certificate".
+    std::uint64_t                                       frontier = 0;
+
     std::vector<Tx>                          mempool;
     std::map<Id, char>                       seen;   // tx hash → in mempool or mined
 
@@ -444,6 +461,25 @@ std::shared_ptr<node::Block> Chain::get(const Id& id) const {
 void Chain::prefer(const Id& id) { st_->preferred = id; }
 Id   Chain::last_accepted() const { return st_->accepted_id; }
 std::uint64_t Chain::last_accepted_height() const { return st_->accepted_height; }
+std::uint64_t Chain::frontier() const { return st_->frontier; }
+
+void Chain::ingest(Past p) {
+    if (p.height != st_->accepted_height + 1)
+        throw std::runtime_error("evm: ingest at height " + std::to_string(p.height) +
+                                 " does not extend the tip at height " +
+                                 std::to_string(st_->accepted_height));
+
+    auto blk = std::make_shared<BlockImpl>(st_.get(), p.id, std::move(p.bytes), p.parent,
+                                           p.height, p.timestamp, p.root, std::move(p.txs));
+    st_->blocks[p.id]      = blk;
+    st_->by_height[p.height] = blk;
+    st_->accepted_id       = p.id;
+    st_->accepted_height   = p.height;
+    st_->preferred         = p.id;
+    // st_->frontier is NOT touched. Nothing certified this block, and the gap
+    // that leaves is the only thing standing between an imported node and one
+    // that signs history it never verified.
+}
 
 Id Chain::state_root() const { return st_->by_height.at(st_->accepted_height)->root(); }
 
@@ -505,6 +541,10 @@ void BlockImpl::accept() {
     st_->accepted_id         = id_;
     st_->accepted_height     = height_;
     st_->preferred           = id_;
+    // A certificate verified over this height, so this node's own decisions now
+    // reach it. THE ONLY place the frontier moves — which is what makes it a
+    // record of consensus rather than of progress.
+    st_->frontier            = height_;
 
     // A mined transaction leaves the pool. This is the only place it can happen
     // and be right: until the block is ACCEPTED the transaction is still

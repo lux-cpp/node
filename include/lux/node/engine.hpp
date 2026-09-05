@@ -124,6 +124,24 @@ public:
 
     std::uint64_t height() const { return vm_->last_accepted_height(); }
 
+    // MAY THIS NODE PUT ITS SIGNATURE ON A HEIGHT AT ALL.
+    //
+    // False when the chain's tip sits above the highest height this node
+    // decided — the state a chain is left in by reading an export, which moves
+    // the tip and produces no certificate under it. Everything below such a tip
+    // is history this node took on someone else's word, so a vote cast from it
+    // would put this validator's name on an ancestry it never verified, and a
+    // block built on it would extend one. Refusing is the whole point: an
+    // implementation that imports and then proposes is worse than one that
+    // cannot import at all.
+    //
+    // Go reaches the same refusal from the other end — proposervm sees a
+    // missing outer anchor, enters backfill, and gates BuildBlock off until the
+    // outer index is rebuilt from certified peer state (vms/proposervm/vm.go).
+    // Same rule, said where this node produces a signature rather than where it
+    // wraps a block.
+    bool may_sign() const { return vm_->frontier() >= vm_->last_accepted_height(); }
+
 private:
     // The signed position for a block. ONE definition, so a block proposed and
     // the same block followed produce the identical signed message — otherwise a

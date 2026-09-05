@@ -142,6 +142,9 @@ public:
     void                   prefer(const Id&) override {}
     Id                     last_accepted() const override { return kEmptyId; }
     std::uint64_t          last_accepted_height() const override { return 0; }
+    // Nothing was ever handed to this chain from outside, so its own decisions
+    // reach its tip and the engine's gate has nothing to hold.
+    std::uint64_t          frontier() const override { return 0; }
 
 private:
     Tally* t_;
