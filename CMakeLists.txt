@@ -65,9 +65,9 @@ find_checkout(_consensus "include/lux/consensus/node.hpp"
 # name for the same reason: `cevm` is also the name of a Go binding and of a
 # Conan package. lib/evm/state/processor.hpp is what identifies the checkout.
 find_checkout(_cevm "lib/evm/state/processor.hpp"
+  "${CMAKE_SOURCE_DIR}/../cevm"
   "${CMAKE_SOURCE_DIR}/../../luxcpp/cevm"
-  "${CMAKE_SOURCE_DIR}/../luxcpp/cevm"
-  "${CMAKE_SOURCE_DIR}/../cevm")
+  "${CMAKE_SOURCE_DIR}/../luxcpp/cevm")
 
 # luxcpp — blst + cevm::crypto::bls + zap-cpp-core all live under one root.
 find_checkout(_luxcpp "blst/bindings/blst.h"
