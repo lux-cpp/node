@@ -121,16 +121,21 @@ Id tx_root(const std::vector<rlp::Item>& txs) {
 
 }  // namespace
 
-Import import_chain_data(evm::Chain& chain, const std::string& path) {
+Import import_chain_data(evm::Chain& chain, const std::string& path,
+                         const Checkpoint& checkpoint) {
     const Mapped file(path);
     auto         rest = file.bytes();
 
     Import        out{};
     const auto    chain_id  = chain.eth_chain_id();
+    // RESUME. The head on entry is where a previous run of either door stopped,
+    // so a re-read walks the file from the front — every check re-run — and
+    // ingests only what is above it.
     const auto    head      = chain.last_accepted_height();
     bool          anchored  = false;  // the file's block 0 has been read
     Id            prev_id{};
     std::uint64_t prev_number = 0;
+    std::uint64_t marked      = head;  // height of the last checkpoint told
 
     while (!rest.empty()) {
         const auto block = rlp::item(rest);
@@ -248,9 +253,27 @@ Import import_chain_data(evm::Chain& chain, const std::string& path) {
         past.bytes.assign(block->raw.begin(), block->raw.end());
         chain.ingest(std::move(past));
         ++out.blocks;
+
+        // THE POINTER MOVED WITH THE BLOCK, and this is where that is checked
+        // rather than assumed. `ingest` advances the tip as part of taking the
+        // block, so the two cannot come apart — but a reader that trusted its
+        // own local variables would not notice if they ever did, and would then
+        // hand a door a height the chain does not hold.
+        if (chain.last_accepted_height() != *number || chain.last_accepted() != id)
+            throw std::runtime_error("import: the chain's tip does not name the block it just "
+                                     "ingested" + at(*number));
+
+        if (checkpoint && *number - marked >= kCheckpointInterval) {
+            checkpoint(id, *number);
+            marked = *number;
+        }
     }
 
     if (!anchored) throw std::runtime_error("import: no blocks in " + path);
+    // The last stretch, which is shorter than an interval. A file of 218 blocks
+    // gets exactly this one and no other; a re-read that ingested nothing gets
+    // none at all, because there is no new height to report.
+    if (checkpoint && out.blocks > 0 && out.height > marked) checkpoint(out.tip, out.height);
     return out;
 }
 
