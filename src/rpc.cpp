@@ -127,10 +127,58 @@ std::size_t content_length(const std::string& head) {
     return static_cast<std::size_t>(std::strtoull(head.c_str() + at + 15, nullptr, 10));
 }
 
-std::string proxy_to_archive(const std::string& archive_url, const std::string& alias, const std::string& body) {
-    if (archive_url.empty()) return "";
+// What came back from the archive: the status it answered with, and the body.
+//
+// THE STATUS IS PART OF THE ANSWER. A proxy that returns only the body has to
+// invent a status for it, and the only one it can invent is 200 — so an archive
+// that said "no such chain" arrives at the client as a success carrying an error
+// document. A client reads the status first (every HTTP library does; that is
+// what `resp.ok` is), so it sees a 200 and then tries to parse a body that is
+// not the answer to its question. `empty()` is how "there was no answer at all"
+// is said — a connection that failed, an alias with no archive path — which is a
+// different thing from an answer that was not 200 and is treated differently by
+// the callers below.
+struct Proxied {
+    int         status = 0;
+    std::string body;
+
+    bool empty() const { return status == 0; }
+    bool ok() const { return status >= 200 && status < 300; }
+};
+
+// The reason phrase for a relayed status. HTTP requires the token to be there
+// and no client reads it — the status is the answer — so the ones a proxy
+// actually relays are named and anything else is passed through with a generic
+// phrase rather than being rounded to a status this node can spell.
+const char* reason_for(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 429: return "Too Many Requests";
+        case 500: return "Internal Server Error";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        case 504: return "Gateway Timeout";
+        default: return status < 400 ? "OK" : "Error";
+    }
+}
+
+// The status line: "HTTP/1.1 404 Not Found" — the three digits after the space.
+int status_of(const std::string& head) {
+    const auto sp = head.find(' ');
+    if (sp == std::string::npos) return 0;
+    const int code = std::atoi(head.c_str() + sp + 1);
+    return (code >= 100 && code <= 599) ? code : 0;
+}
+
+Proxied proxy_to_archive(const std::string& archive_url, const std::string& alias, const std::string& body) {
+    if (archive_url.empty()) return {};
     const std::string target_path = archive_path(alias);
-    if (target_path.empty()) return "";
+    if (target_path.empty()) return {};
     std::string url = archive_url;
     if (url.rfind("http://", 0) == 0) url = url.substr(7);
     while (!url.empty() && url.back() == '/') url.pop_back();
@@ -145,7 +193,7 @@ std::string proxy_to_archive(const std::string& archive_url, const std::string& 
     if (host == "localhost") host = "127.0.0.1";
 
     int sock = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return "";
+    if (sock < 0) return {};
     timeval tv{4, 0};
     ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -158,11 +206,11 @@ std::string proxy_to_archive(const std::string& archive_url, const std::string& 
     a.sin_port = htons(port);
     if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) <= 0) {
         ::close(sock);
-        return "";
+        return {};
     }
     if (::connect(sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
         ::close(sock);
-        return "";
+        return {};
     }
 
     std::string req = "POST " + target_path + " HTTP/1.1\r\n";
@@ -183,9 +231,14 @@ std::string proxy_to_archive(const std::string& archive_url, const std::string& 
     ::close(sock);
 
     auto dbl = resp.find("\r\n\r\n");
-    if (dbl == std::string::npos) return resp;
+    // No header block at all: the archive is not speaking HTTP. There is no
+    // status to carry, so this is "no answer" rather than a bad one.
+    if (dbl == std::string::npos) return {};
     std::string head = resp.substr(0, dbl);
     std::string b    = resp.substr(dbl + 4);
+
+    const int status = status_of(head);
+    if (status == 0) return {};
 
     bool chunked = false;
     std::string lower_head = head;
@@ -215,9 +268,9 @@ std::string proxy_to_archive(const std::string& archive_url, const std::string& 
                 pos += 2;
             }
         }
-        return unchunked.empty() ? b : unchunked;
+        return Proxied{status, unchunked.empty() ? b : unchunked};
     }
-    return b;
+    return Proxied{status, b};
 }
 
 }  // namespace
@@ -408,9 +461,14 @@ void Rpc::answer(int fd) {
         // A chain this node does not keep. With an archive configured it is
         // still answerable, which is how a frontier-only node serves P and X.
         if (!archive_rpc_.empty()) {
-            const std::string proxied = proxy_to_archive(archive_rpc_, alias, body);
+            const Proxied proxied = proxy_to_archive(archive_rpc_, alias, body);
             if (!proxied.empty()) {
-                write_all(fd, response(200, "OK", proxied));
+                // The archive's OWN status, not a fresh 200 over its body. This
+                // node is a proxy on this path: it did not answer the question,
+                // it relayed one, and relaying an answer means relaying what the
+                // answer was. A 404 rewrapped as a 200 tells the client the
+                // chain is there and gives it an error document to parse.
+                write_all(fd, response(proxied.status, reason_for(proxied.status), proxied.body));
                 return;
             }
         }
@@ -467,10 +525,16 @@ Rpc::Json Rpc::dispatch(const std::string& alias, const Json& req) {
     const auto  it    = table.find(req["method"].get<std::string>());
     if (it == table.end()) {
         if (!archive_rpc_.empty()) {
-            std::string proxied = proxy_to_archive(archive_rpc_, alias, req.dump());
-            if (!proxied.empty()) {
+            const Proxied proxied = proxy_to_archive(archive_rpc_, alias, req.dump());
+            // Only a SUCCESSFUL archive answer is a JSON-RPC result worth
+            // relaying. This site is inside a dispatch whose status has already
+            // been decided — a batch is one response — so a 404 body adopted
+            // here would be laundered into a 200 with no way to say otherwise.
+            // Falling through to this node's own JSON-RPC error says the true
+            // thing: the method is not answerable here.
+            if (proxied.ok()) {
                 try {
-                    return Json::parse(proxied);
+                    return Json::parse(proxied.body);
                 } catch (...) {}
             }
         }
@@ -485,10 +549,12 @@ Rpc::Json Rpc::dispatch(const std::string& alias, const Json& req) {
         return Json{{"jsonrpc", "2.0"}, {"id", id}, {"result", it->second(params)}};
     } catch (const Error& e) {
         if (e.code == -32000 && !archive_rpc_.empty()) {
-            std::string proxied = proxy_to_archive(archive_rpc_, alias, req.dump());
-            if (!proxied.empty()) {
+            // Same rule as above: an archive that refused is not an answer this
+            // node may present as its own.
+            const Proxied proxied = proxy_to_archive(archive_rpc_, alias, req.dump());
+            if (proxied.ok()) {
                 try {
-                    return Json::parse(proxied);
+                    return Json::parse(proxied.body);
                 } catch (...) {}
             }
         }

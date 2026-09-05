@@ -211,9 +211,10 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #   hostile_decode  what a stranger can send the two decoders that take his bytes
 #   set_root        the validator-set commitment, against Go's encoding
 #   chain_route     every spelling of a chain's path reaches that one chain
+#   archive_proxy   what a relayed answer's status is, when this node is a proxy
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root chain_route)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root chain_route archive_proxy)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
