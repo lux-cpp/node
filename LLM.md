@@ -23,8 +23,12 @@ $ curl -s -X POST -H 'content-type: application/json' \
 ## Layer decomposition (decomplected — each layer is independently testable)
 
 ```
+  network      Network           NEW  src/network.cpp — which chain aliases this
+                                       node's network owns, from its chain id.
+                                       No dependencies; the table (see below).
   rpc          Rpc / serve_eth   NEW  src/rpc.cpp, src/eth.cpp — HTTP JSON-RPC at
-                                       /v1/chain/<alias>/rpc. Knows JSON, no chain.
+                                       /v1/chain/<alias>/rpc. Knows JSON and which
+                                       network it is on; no chain.
   chain        evm::Chain        NEW  src/evm.cpp — the C-Chain: genesis, mempool,
                                        execution through cevm, the real MPT root.
                                        The ONLY unit that knows evmc/intx/StateDB.
@@ -250,6 +254,17 @@ NOT REAL YET — named, not hidden:
   is no `eth_getTransactionReceipt` returning a fabricated receipt.
 - **P, X, Q and Z are not here.** The `VM` seam is what they plug into; only C is
   implemented.
+- **A node answers for its own network and no other.** The chain id names the
+  network (`src/network.cpp` — the one table), the network owns a set of
+  aliases, and every other name is a 404 decided BEFORE the archive proxy is
+  consulted. Lux (96369/96368/96370/31337) owns `c`, its chain id in decimal,
+  `p` and `x`; Hanzo (36963/36962/36964) owns `hanzo` + its id; Zoo
+  (200200/200201/200202) owns `zoo` + its id. So a Zoo node 404s `/v1/chain/c`
+  — C-Chain is the Lux primary network's EVM and no other network runs it — and
+  `POST /` reaches whichever chain is the node's own. A chain id no row claims
+  answers under its own number only; it does NOT inherit `c`. The identity comes
+  from `--chain-id`, never from argv[0]: luxd, zood and noded are one binary, so
+  the name it was invoked under is a guess that can contradict the chain it runs.
 - **The C-Chain is IN-PROCESS, not a plugin.** luxd loads its EVM as a separate
   process over ZAP (`vms/rpcchainvm/zap`, MsgBuildBlock=9 … MsgBlockReject=30).
   This node links cevm directly. The `VM` interface is the seam a ZAP client

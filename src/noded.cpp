@@ -27,6 +27,7 @@
 #include "lux/node/engine.hpp"
 #include "lux/node/eth.hpp"
 #include "lux/node/evm.hpp"
+#include "lux/node/network.hpp"
 #include "lux/node/node_host.hpp"
 #include "lux/node/rpc.hpp"
 #include "lux/node/validators.hpp"
@@ -59,11 +60,12 @@ namespace {
 constexpr std::uint64_t kLocalChainId = 31337;
 
 // What web3_clientVersion reports. luxfi/evm answers a bare version string
-// (plugin/evm/version.go), so this does too — with a name, because a client
-std::string get_client_version(const char* prog) {
-    if (std::strstr(prog, "zood")) return "zoo-cpp/zood/v0.1.0";
-    if (std::strstr(prog, "luxd")) return "lux-cpp/luxd/v0.1.0";
-    return "lux-cpp/noded/v0.1.0";
+// (plugin/evm/version.go), so this does too — named for the NETWORK the chain
+// id says this is. It used to be read off argv[0], which is a guess: luxd, zood
+// and noded are the same binary, so `luxd --chain-id 200200` called itself Lux
+// while running Zoo's chain. A node has one identity and the chain id is it.
+std::string client_version(const Network& net) {
+    return (net.name.empty() ? std::string("node") : net.name) + "-cpp/v0.1.0";
 }
 
 struct Key {
@@ -141,7 +143,6 @@ void on_signal(int) { g_stop.store(true); }
 int main(int argc, char** argv) {
     const char* prog = (argc > 0 && argv[0]) ? argv[0] : "luxd";
     if (const char* slash = std::strrchr(prog, '/')) prog = slash + 1;
-    const std::string client_version = get_client_version(prog);
 
     const long index     = arg(argc, argv, "--index", -1);
     const long n         = arg(argc, argv, "--n", -1);
@@ -157,6 +158,11 @@ int main(int argc, char** argv) {
     const long rpc_port    = arg(argc, argv, "--rpc-port", 0);
     const long blocks      = arg(argc, argv, "--blocks", 0);  // 0 = until stopped
     const auto chain_id    = std::uint64_t(arg(argc, argv, "--chain-id", long(kLocalChainId)));
+
+    // Everything this daemon says about which network it is on comes from here.
+    const Network     net     = network_of(chain_id);
+    const std::string client  = client_version(net);
+    const std::string self    = net.served.front();
 
     std::string archive_rpc = arg_str(argc, argv, "--archive-rpc", "");
     if (archive_rpc.empty()) {
@@ -226,8 +232,9 @@ int main(int argc, char** argv) {
     evm::Chain& chain = *chainp;
 
     const std::uint16_t port = host.listen_bind();
-    std::printf("node %ld: consensus 127.0.0.1:%u  chain C (eth chainId %llu)\n",
-                index, port, static_cast<unsigned long long>(chain.eth_chain_id()));
+    std::printf("node %ld: consensus 127.0.0.1:%u  chain %s (eth chainId %llu)\n",
+                index, port, self.c_str(),
+                static_cast<unsigned long long>(chain.eth_chain_id()));
     std::printf("node %ld: genesis state root %s\n", index, hex(chain.state_root()).c_str());
     std::printf("node %ld: validator set root %s\n", index, hex(set_root).c_str());
     std::fflush(stdout);
@@ -246,32 +253,32 @@ int main(int argc, char** argv) {
     if (!archive_rpc.empty()) {
         rpc.set_archive_rpc(archive_rpc);
     }
-    serve_eth(rpc, chain, client_version);
-    const std::string_view prog_view(prog ? prog : "");
-    const std::string public_api = (prog_view == "zood" || prog_view.find("zoo") != std::string_view::npos)
-                                       ? "https://api.zoo.network"
-                                       : "https://api.lux.network";
-    rpc.about(Rpc::Json{
-        {"client", client_version},
+    // This registers the chain under every alias it answers to AND tells the Rpc
+    // which network it belongs to, so the chains named below are the ones this
+    // node actually owns rather than a list written here a second time.
+    serve_eth(rpc, chain, client);
+    // api.lux.network, api.zoo.network — the network's own face. A chain id no
+    // network claims has no public API, and says so by not naming one.
+    const std::string public_api =
+        net.name.empty() ? std::string() : "https://api." + net.name + ".network";
+    Rpc::Json about{
+        {"client", client},
         {"mode", "light"},
         {"index", index},
         {"validators", n},
-        {"endpoint", public_api},
-        {"chains", Rpc::Json::object({{"c", "/v1/chain/c"}, {"p", "/v1/chain/p"}, {"x", "/v1/chain/x"}})},
-        {"endpoints", Rpc::Json::object({
-            {"rpc", "/v1/chain/c"},
-            {"p", "/v1/chain/p"},
-            {"x", "/v1/chain/x"},
-            {"health", "/v1/health"},
-            {"public", public_api}
-        })}
-    });
+        {"endpoints", Rpc::Json::object({{"health", "/v1/health"}})}
+    };
+    if (!public_api.empty()) {
+        about["endpoint"] = public_api;
+        about["endpoints"]["public"] = public_api;
+    }
+    rpc.about(std::move(about));
     rpc.start();
     std::printf("node %ld: mode light node (frontier resident)\n", index);
     if (!archive_rpc.empty()) {
         std::printf("node %ld: archive RPC %s (proxying historical & P/X state)\n", index, archive_rpc.c_str());
     }
-    std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/c\n", index, rpc.port());
+    std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/%s\n", index, rpc.port(), self.c_str());
     std::fflush(stdout);
 
     // ── the mesh ────────────────────────────────────────────────────────────

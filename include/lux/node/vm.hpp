@@ -98,8 +98,10 @@ struct Block {
 struct VM {
     virtual ~VM() = default;
 
-    // The chain's own identity and its RPC name. `alias` is the path segment a
-    // JSON-RPC caller reaches it under (Go: /ext/bc/<alias>), so "C", "P", "X".
+    // The chain's own identity and its RPC name. `alias` is the canonical path
+    // segment a JSON-RPC caller reaches it under — `/v1/chain/<alias>`. It is
+    // the chain's NETWORK that decides the word (network.hpp): "c" is the Lux
+    // primary network's EVM and belongs to no other network.
     virtual Id chain_id() const = 0;
     virtual std::string alias() const = 0;
 

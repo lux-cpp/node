@@ -194,11 +194,14 @@ Json block_json(const evm::Chain& c, const node::Block& b, bool full) {
 }  // namespace
 
 void serve_eth(Rpc& rpc, evm::Chain& chain, const std::string& client) {
-    // Registered once, under the chain's own alias. Every spelling of the path
-    // that names this chain reaches it; the Rpc decides which those are.
-    const std::string alias = chain.alias();
-    auto              on    = [&](const char* name, Rpc::Method fn) {
-        rpc.method(alias, name, std::move(fn));
+    // The chain id names the network, and the network names the aliases this
+    // chain answers to: its canonical one and its own id in decimal. Both name
+    // ONE chain, so one method table is registered under each of them — and
+    // under nothing else, because the aliases a node answers to are its
+    // network's to give, not the caller's to choose.
+    const Network net = network_of(chain.eth_chain_id());
+    auto          on  = [&](const char* name, Rpc::Method fn) {
+        for (const auto& alias : net.served) rpc.method(alias, name, fn);
     };
 
     on("eth_chainId", [&chain](const Json&) { return quantity(chain.eth_chain_id()); });
@@ -282,7 +285,7 @@ void serve_eth(Rpc& rpc, evm::Chain& chain, const std::string& client) {
         return Json{{"pending", quantity(chain.pending())}, {"queued", "0x0"}};
     });
 
-    rpc.root(alias);
+    rpc.network(net);
 }
 
 }  // namespace lux::node

@@ -4,16 +4,19 @@
 // rpc.hpp — the node's HTTP JSON-RPC surface.
 //
 // The paths are Go's, verified against the running node rather than assumed:
-// `/v1/chain/<alias>`, where the alias is the VM's own ("C", "P", "X"). The
-// alias is matched without regard to case and the trailing `/rpc` is optional,
-// so `/v1/chain/C/rpc` and `/v1/chain/c` are the same route; `/v1/bc/...` is
-// the same word in the middle and is accepted too. One function decides all of
-// that — chain_path() in rpc.cpp — and a chain is registered once, under its
-// alias. The `/ext/bc/...` prefix that every Ethereum tutorial writes is GONE
-// from luxd — server/http/server.go states baseURL = "/v1" and that there is no
-// backward compatibility — so serving it here would be inventing a route the
-// network does not have. `POST /` is proxied to the C-Chain, which luxd also
-// does, because that is what an unconfigured `eth` client hits first.
+// `/v1/chain/<alias>`. The alias is matched without regard to case and the
+// trailing `/rpc` is optional, so `/v1/chain/C/rpc` and `/v1/chain/c` are the
+// same route; `/v1/bc/...` is the same word in the middle and is accepted too.
+// One function decides all of that — chain_path() in rpc.cpp. The
+// `/ext/bc/...` prefix that every Ethereum tutorial writes is GONE from luxd —
+// server/http/server.go states baseURL = "/v1" and that there is no backward
+// compatibility — so serving it here would be inventing a route the network
+// does not have. `POST /` reaches this node's OWN chain, which luxd also does,
+// because that is what an unconfigured `eth` client hits first.
+//
+// WHICH aliases those may be is not the caller's to choose: a node's network
+// owns a set of them (network.hpp) and every other name is a 404, decided here
+// before any archive is asked. A node answers for its own network and no other.
 //
 // A method is a function from params to result. Throwing `Rpc::Error` produces
 // a JSON-RPC error object; anything else escaping a method is caught and
@@ -27,6 +30,8 @@
 // on anything but its own computation.
 
 #pragma once
+
+#include "lux/node/network.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -62,14 +67,17 @@ public:
     Rpc(const Rpc&) = delete;
     Rpc& operator=(const Rpc&) = delete;
 
-    // Register `name` on the chain `alias` (e.g. "C", "eth_chainId"). A chain
-    // is registered ONCE, under its alias, and is then reachable by every
+    // Register `name` on the chain `alias` (e.g. "c", "eth_chainId"). A chain
+    // is registered ONCE per alias it answers to, and is then reachable by every
     // spelling of the path that names it — see chain_path() in rpc.cpp.
     void method(std::string alias, std::string name, Method fn);
 
-    // Answer `POST /` from `alias` as well — Go forwards the bare root to the
-    // C-Chain's RPC, and a client pointed at the node with no path expects it.
-    void root(std::string alias);
+    // The network this node belongs to. Its aliases are the ONLY ones this
+    // server answers for, and a path naming any other chain is refused before an
+    // archive is consulted. Its canonical alias is also what `POST /` reaches,
+    // which is why root is not a second knob: the bare root is this node's own
+    // chain, and the network is what says which chain that is.
+    void network(Network n);
 
     // A plain GET / — what the node says about itself.
     void about(Json j);
@@ -92,9 +100,11 @@ private:
 
     int                                             fd_ = -1;
     std::uint16_t                                   port_ = 0;
-    // Keyed by lowercase chain alias, never by path.
+    // Keyed by lowercase chain alias, never by path. What this node SERVES; the
+    // network below is what it may ANSWER FOR, which is the wider set — a chain
+    // it owns but does not keep is reached through the archive.
     std::map<std::string, std::map<std::string, Method>> methods_;
-    std::string                                     root_alias_;
+    Network                                         net_;
     std::string                                     archive_rpc_;
     Json                                            about_;
     std::mutex                                      mu_;

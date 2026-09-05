@@ -9,6 +9,7 @@
 
 #include "lux/node/evm.hpp"
 
+#include "lux/node/network.hpp"
 #include "rlp.hpp"
 
 #include <cevm/cevm.h>              // evmc_create_cevm
@@ -368,6 +369,12 @@ Id Chain::chain_id() const {
 }
 
 std::uint64_t Chain::eth_chain_id() const noexcept { return st_->genesis.chain_id; }
+
+std::string Chain::alias() const {
+    // One derivation, shared with the RPC's ownership gate, so what this chain
+    // calls itself and what the node answers to cannot drift apart.
+    return network_of(st_->genesis.chain_id).served.front();
+}
 
 std::shared_ptr<node::Block> Chain::build() {
     const auto parent = st_->by_height.at(st_->accepted_height);
