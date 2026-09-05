@@ -243,7 +243,16 @@ int main(int argc, char** argv) {
     // ── the export, read before anything else looks at the chain ────────────
     if (!import_path.empty()) {
         try {
-            const Import in = import_chain_data(chain, import_path);
+            // The flag door's checkpoint: say where the read has got to, every
+            // 4096 blocks. A mainnet export is a million blocks and takes
+            // minutes, and an operator watching a silent process cannot tell a
+            // slow read from a wedged one.
+            const auto mark = [index](const Id& tip, std::uint64_t height) {
+                std::printf("node %ld: import at height %llu, tip %s\n", index,
+                            static_cast<unsigned long long>(height), hex(tip).c_str());
+                std::fflush(stdout);
+            };
+            const Import in = import_chain_data(chain, import_path, mark);
             std::printf("node %ld: import %s\n", index, import_path.c_str());
             std::printf("node %ld: import genesis %s\n", index, hex(in.genesis).c_str());
             std::printf("node %ld: import tip %s height %llu time %llu\n", index,
@@ -278,6 +287,10 @@ int main(int argc, char** argv) {
         rpc.set_archive_rpc(archive_rpc);
     }
     serve_eth(rpc, chain, client_version);
+    // The second door onto the reader the flag above already used. Two ways in,
+    // one implementation — a node that grew a separate reader per entry point
+    // would have two answers to what a block is, inside one binary.
+    serve_admin(rpc, chain);
     const std::string_view prog_view(prog ? prog : "");
     const std::string public_api = (prog_view == "zood" || prog_view.find("zoo") != std::string_view::npos)
                                        ? "https://api.zoo.network"

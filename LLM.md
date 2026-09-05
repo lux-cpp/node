@@ -237,7 +237,8 @@ REAL — observed on a running 5-process cluster, not inferred:
 | JSON-RPC is live | `eth_chainId` → `0x7a69`, `eth_blockNumber` advances off the real pipeline |
 | an RLP export imports and matches Go | the canonical `lux-testnet-96368.rlp`: 218 blocks, 219 senders recovered, every link walked, tip `0x722e2b39ae8973ab5d94b51451623352650b728e411ce0261c5efcd23aa381a5` and state root `0x4e19366fcc65d7ddd0b803bfbd7537f0c0ddc5d190c3ded40712408fcb137f35` — the same two values Go's import of the same bytes produced. `zoo-testnet` (84), `zoo-mainnet` (799) and `spc-mainnet` (10) import the same way |
 | …and at mainnet size | `lux-mainnet-96369.rlp`, 1.2 GB: 1,082,780 blocks and 1,229,884 senders recovered in ~4.5 min, peak RSS ~4.2 GB, tip `0x32dede1f…61f0`. The export is MAPPED, not read into a buffer — but every block it ingests is kept in memory, so an import is bounded by the same absence of persistence the rest of this node has |
-| an imported node refuses to validate | `import_test`: the engine proposes nothing, follows nothing, and never asks the chain to build; `luxd` prints NOT A CAUGHT-UP VALIDATOR and parks |
+| an imported node refuses to validate | `import_test`: the engine proposes nothing, follows nothing, and never asks the chain to build, through either door; `luxd` prints NOT A CAUGHT-UP VALIDATOR and parks |
+| both doors are one reader | on a live `luxd`, `--import-chain-data` reads the canonical export to tip `0x722e2b39…81a5`, and `admin_importChain` given the same file on the same node answers `{"blocks":0,"skipped":218}` at the same tip — resume, across the two doors, off one head |
 
 | precompiles work from contract code | SHA-256, RIPEMD-160 and IDENTITY match Python's hashlib byte-for-byte, called from deployed bytecode on the live chain |
 | DELEGATECALL delegates | a proxy's storage takes the write; the implementation's own storage is untouched |
@@ -307,7 +308,7 @@ signs for the same block, so a C++ and a Go validator cannot form one quorum
 until Go binds it too. Stated here because it is a protocol difference, not an
 implementation detail.
 
-## Reading a chain back (`--import-chain-data`)
+## Reading a chain back (two doors, one reader)
 
 The C-chain speaks two encodings. **ZAP** is the serialization everything in this
 stack uses — votes, blocks on the wire, the frame. **RLP** is what the C-chain
@@ -318,6 +319,41 @@ because it is the same flag: Go passes it into the C-Chain's config and the VM
 reads the export at startup, before the chain serves anything, and a second run
 of an unchanged flag is a no-op rather than a failure. One runbook, three
 implementations.
+
+A node is asked to read an export in **two** ways and there is **one** reader.
+`--import-chain-data PATH` at startup and the `admin_importChain` RPC while it
+runs are both calls to `import_chain_data`; `serve_admin` (`src/eth.cpp`) is nine
+lines and `noded`'s flag is shorter, and neither decodes anything. Go has that
+exact shape — `admin_api.go:84` and `vm.go:628` both call
+`importBlocksFromFile` — and it is worth keeping because the alternative is the
+usual one: the flag grows a reader, the RPC grows another, and a single binary
+ends up with two answers to what a block is.
+
+```
+$ curl -s -X POST -H 'content-type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"admin_importChain",
+             "params":["…/lux-testnet-96368.rlp"]}' \
+    http://127.0.0.1:41898/v1/chain/C/rpc
+{"blocks":218,"skipped":0,"transactions":219,"heightBefore":"0x0",
+ "heightAfter":"0xda","frontier":"0x0",
+ "tip":"0x722e2b39ae…81a5","stateRoot":"0x4e19366f…7f35"}
+```
+
+`frontier` rides along in the answer, so a caller polling the door that filled
+the chain is told in the same breath that the node has decided none of it.
+
+**The lock and the checkpoint.** `Rpc` holds THE chain lock for the whole of
+every method call, which is what Go spells `vmLock.Lock()` at the top of
+`ImportChain` — a read that arrives mid-height waits for it. Every 4096 blocks
+(Go's `defaultCommitInterval`) the reader stops and tells its door where it has
+got to. Go commits the state trie there and moves the accepted-block pointer in
+the same step "so there's no crash window where state is persisted but
+acceptedBlockDB is stale"; here the pointer is moved by `ingest`, and the reader
+READS IT BACK and refuses to go on unless it names the block just ingested — so
+a checkpoint can only ever report a height the chain already holds. Resume is
+the same fact from the other side: the head on entry is where the last run of
+*either* door stopped, the file is re-walked from the front with every check
+re-run, and only blocks above the head are ingested.
 
 **What is proven, and what is only carried.** Every hash compared here is one
 this node computed: a block's id is `keccak(rlp(header))` over the header's own
@@ -354,7 +390,9 @@ deliberately does not touch the frontier; `BlockImpl::accept` — reached only o
 verifying quorum certificate — is the only thing that does.
 
 `import_test` drives the engine over an imported chain and asserts that the chain
-was never even **asked** to build, with the un-imported chain as the control.
+was never even **asked** to build, with the un-imported chain as the control —
+and does it again over a chain filled through the RPC door, because the refusal
+is a property of the chain and not of the door that filled it.
 `noded` says the same thing out loud and parks: RPC keeps answering, so the
 imported history is readable and the state is visible rather than silent.
 

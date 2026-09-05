@@ -31,14 +31,20 @@
 
 #include "lux/consensus/threshold.hpp"
 #include "lux/node/engine.hpp"
+#include "lux/node/eth.hpp"
 #include "lux/node/evm.hpp"
 #include "lux/node/import.hpp"
 #include "lux/node/node_host.hpp"
+#include "lux/node/rpc.hpp"
 
 #include "bls_signature.hpp"
 
 #include <bin/cevm/eth_mpt.hpp>
 #include <test/state/hash_utils.hpp>
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <array>
 #include <cstdint>
@@ -48,7 +54,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 using namespace lux::node;
@@ -176,6 +181,66 @@ evm::Genesis local_genesis(std::uint64_t chain_id) {
     g.chain_id  = chain_id;
     g.gas_limit = 30'000'000;
     return g;
+}
+
+// ── the RPC door, driven the way a caller drives it ─────────────────────────
+//
+// A real socket and a real JSON-RPC request, because a door tested by calling
+// the function behind it is not a door that was tested at all.
+struct Answer {
+    int         status = 0;
+    Rpc::Json   body;
+};
+
+Answer rpc_import(std::uint16_t port, const std::string& path) {
+    Answer out;
+    const int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return out;
+    timeval tv{20, 0};
+    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    sockaddr_in a{};
+    a.sin_family      = AF_INET;
+    a.sin_port        = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+        ::close(sock);
+        return out;
+    }
+
+    const Rpc::Json call{{"jsonrpc", "2.0"},
+                         {"id", 1},
+                         {"method", "admin_importChain"},
+                         {"params", Rpc::Json::array({path})}};
+    const std::string payload = call.dump();
+    std::string req = "POST /v1/chain/C/rpc HTTP/1.1\r\nHost: 127.0.0.1\r\n";
+    req += "Content-Type: application/json\r\n";
+    req += "Content-Length: " + std::to_string(payload.size()) + "\r\n";
+    req += "Connection: close\r\n\r\n" + payload;
+    for (std::size_t off = 0; off < req.size();) {
+        const ssize_t n = ::send(sock, req.data() + off, req.size() - off, 0);
+        if (n <= 0) break;
+        off += static_cast<std::size_t>(n);
+    }
+
+    std::string raw;
+    char        buf[4096];
+    while (true) {
+        const ssize_t n = ::recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        raw.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(sock);
+
+    if (raw.rfind("HTTP/1.1 ", 0) == 0) out.status = std::atoi(raw.c_str() + 9);
+    const auto dbl = raw.find("\r\n\r\n");
+    if (dbl != std::string::npos) {
+        try {
+            out.body = Rpc::Json::parse(raw.substr(dbl + 4));
+        } catch (...) {}
+    }
+    return out;
 }
 
 bool refused(evm::Chain& chain, const std::string& path, const std::string& what) {
@@ -377,6 +442,110 @@ int main(int argc, char** argv) {
         check(seen->builds == 1, "a chain that was NOT handed its history is asked to build");
     }
 
+    // ── two doors, one reader ───────────────────────────────────────────────
+    //
+    // The node is asked to read an export in two ways, and the point of the
+    // section is that the second one is a DOOR and not a second reader. So it
+    // is driven the way a caller drives it — a real socket, a real JSON-RPC
+    // request — and its answer is compared field by field against what the
+    // startup flag's call to the same function returned for the same bytes.
+    std::printf("\nTwo doors onto one reader\n");
+    {
+        evm::Chain by_flag(local_genesis(31337));
+        const auto flagged = import_chain_data(by_flag, good.path());
+
+        evm::Chain by_rpc(local_genesis(31337));
+        Rpc        rpc(0);
+        serve_admin(rpc, by_rpc);
+        rpc.start();
+
+        const auto answer = rpc_import(rpc.port(), good.path());
+        check(answer.status == 200 && answer.body.contains("result"),
+              "admin_importChain answers the export the flag was given");
+        const auto& r = answer.body["result"];
+        check(r["blocks"] == flagged.blocks && r["skipped"] == flagged.skipped &&
+                  r["transactions"] == flagged.txs,
+              "with the same counts the flag's call returned");
+        check(r["tip"] == hex(flagged.tip) && r["stateRoot"] == hex(flagged.root) &&
+                  r["genesis"] == hex(flagged.genesis),
+              "the same tip, the same carried state root, the same anchoring genesis");
+        check(r["heightBefore"] == "0x0" && r["heightAfter"] == "0x4",
+              "and says where the chain was before it and where it is after");
+        check(by_rpc.last_accepted() == by_flag.last_accepted() &&
+                  by_rpc.last_accepted_height() == by_flag.last_accepted_height(),
+              "the two chains are at the same block, which is what one reader means");
+
+        // The frontier travels with the answer, so a caller polling this door
+        // is told in the same breath that the node is not caught up.
+        check(r["frontier"] == "0x0" && by_rpc.frontier() == 0,
+              "and the answer itself reports a frontier still at zero");
+
+        // The refusal is a property of the chain, not of the door that filled
+        // it: driven after an RPC import, the engine still never asks to build.
+        {
+            auto     host    = lone_host();
+            std::mutex guard;
+            auto     counted = std::make_unique<Counted>(by_rpc);
+            Counted* seen    = counted.get();
+            Engine   engine(std::move(counted), *host, guard);
+            (void)engine.propose([](std::span<const std::uint8_t>) {}, 150);
+            check(seen->builds == 0,
+                  "a chain filled through the RPC door is no more a validator than one "
+                  "filled through the flag");
+        }
+
+        // Idempotent through this door too — the same reader, so the same rule.
+        const auto twice = rpc_import(rpc.port(), good.path());
+        check(twice.body["result"]["blocks"] == 0 && twice.body["result"]["skipped"] == 4,
+              "a second call ingests nothing and is still a success");
+
+        // A refusal arrives as the reader's own words. A door that summarized
+        // them would cost the caller the block number it stopped at.
+        const auto absent = rpc_import(rpc.port(), "/nonexistent/export.rlp");
+        check(absent.body.contains("error") &&
+                  absent.body["error"]["message"].get<std::string>().find("cannot open") !=
+                      std::string::npos,
+              "and a file that is not there comes back as the reader's own refusal");
+        rpc.stop();
+    }
+
+    // ── the checkpoint, and what it is allowed to say ───────────────────────
+    //
+    // Go commits state every 4096 blocks and moves the accepted-block pointer
+    // in the same step. Here the pointer is moved by `ingest` and the reader
+    // reads it back before telling a door anything — so the assertion that
+    // matters is not that a checkpoint arrived but that the chain ALREADY held
+    // the height it named, checked from inside the callback itself.
+    std::printf("\nThe checkpoint says where the chain actually is\n");
+    {
+        const Export       big = synthesize(kCheckpointInterval + 4);
+        const Temp         file(big.file);
+        evm::Chain         chain(local_genesis(31337));
+        std::vector<std::uint64_t> marks;
+        bool                       behind = false;
+        const auto in = import_chain_data(chain, file.path(),
+                                          [&](const Id& tip, std::uint64_t height) {
+                                              marks.push_back(height);
+                                              if (chain.last_accepted_height() < height ||
+                                                  chain.last_accepted() != tip)
+                                                  behind = true;
+                                          });
+        check(in.blocks == kCheckpointInterval + 4, "the whole export is read");
+        check(marks.size() == 2 && marks[0] == kCheckpointInterval &&
+                  marks[1] == kCheckpointInterval + 4,
+              "one checkpoint every 4096 blocks, and one for the last short stretch");
+        check(!behind,
+              "and at each one the chain already held the block it named — the pointer "
+              "never trails what a door was told");
+
+        // A re-read ingests nothing, so there is no new height to report and no
+        // checkpoint is invented for one.
+        std::vector<std::uint64_t> none;
+        (void)import_chain_data(chain, file.path(),
+                                [&](const Id&, std::uint64_t h) { none.push_back(h); });
+        check(none.empty(), "a re-read that ingests nothing reports no checkpoint");
+    }
+
     // ── the canonical export, when there is one to read ─────────────────────
     const char* given = (argc > 1) ? argv[1] : std::getenv("LUX_RLP_EXPORT");
     if (given != nullptr && *given != '\0') {
@@ -404,6 +573,22 @@ int main(int argc, char** argv) {
         check(in.blocks == 218, "218 blocks ingested, block 0 read as the anchor");
         check(chain.last_accepted_height() == 218 && chain.frontier() == 0,
               "and this node's decisions still stop at height 0");
+
+        // The same file through the other door. Go's tip is a fact about the
+        // BYTES, so both doors must produce it or one of them is not reading
+        // the same chain.
+        evm::Chain served(local_genesis(96368));
+        Rpc        rpc(0);
+        serve_admin(rpc, served);
+        rpc.start();
+        const auto answer = rpc_import(rpc.port(), given);
+        const auto& r     = answer.body["result"];
+        check(r["tip"] == hex(in.tip) && r["stateRoot"] == hex(in.root) &&
+                  r["heightAfter"] == "0xda" && r["blocks"] == 218,
+              "admin_importChain reads the canonical export to the same tip, at height 218");
+        check(r["frontier"] == "0x0" && served.frontier() == 0,
+              "and a node handed 218 real blocks over RPC still has decided none of them");
+        rpc.stop();
     } else {
         std::printf("\n(no canonical export given — pass one as argv[1] or $LUX_RLP_EXPORT to pin "
                     "a real chain's tip against Go's import of the same bytes)\n");

@@ -39,15 +39,43 @@
 // reaches the same behaviour by returning a "nothing to import" error and
 // classifying it back into success at the call site (isNothingToImportError);
 // this returns the counts and lets the caller read them.
+//
+// ONE IMPLEMENTATION, TWO DOORS. A node is asked to read an export in two ways
+// — `--import-chain-data PATH` at startup and the `admin_importChain` RPC while
+// it runs — and both are calls to THIS function. Go has exactly that shape and
+// it is worth naming, because the alternative is what usually happens: the flag
+// grows a reader, the RPC grows another, and the two disagree about what a
+// block means. `serve_admin` (eth.hpp) is the RPC door and is nine lines long;
+// `noded.cpp` is the flag door and is shorter. Neither decodes anything.
 
 #pragma once
 
 #include "lux/node/evm.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace lux::node {
+
+// How often the reader stops to say where it has got to: every 4096 blocks,
+// which is the interval Go imports at (defaultCommitInterval, config.go:19).
+inline constexpr std::uint64_t kCheckpointInterval = 4096;
+
+// Told, every kCheckpointInterval blocks and once when the file runs out, that
+// the chain now holds `tip` at `height`.
+//
+// Go commits the state trie here and writes the accepted-block pointer in the
+// same step, "so there's no crash window where state is persisted but
+// acceptedBlockDB is stale" (admin_api.go:67). This node's chain is in memory
+// and its durable artifact is the export itself, so the ordering is what
+// carries over rather than the disk write: the pointer is moved by `ingest`,
+// the reader READS IT BACK and refuses to go on if it does not name the block
+// it just ingested, and only then is a door told. A door may therefore act on a
+// checkpoint — print it, publish it, write it down — knowing the chain holds
+// every block up to it. Throwing from here stops the read at the last
+// checkpoint that held.
+using Checkpoint = std::function<void(const Id& tip, std::uint64_t height)>;
 
 // What reading an export produced.
 struct Import {
@@ -61,13 +89,15 @@ struct Import {
     std::uint64_t timestamp = 0;
 };
 
-// Read the RLP block export at `path` into `chain`.
+// Read the RLP block export at `path` into `chain`, telling `checkpoint` — if a
+// door passed one — how far it has got as it goes.
 //
 // Throws std::runtime_error on anything that does not hold: a file that will
 // not open, a malformed or truncated encoding, a header the wrong shape, a
 // recomputed root that disagrees with the header, a parent that does not name
 // the block before it, a height that skips, or a transaction that does not
 // decode and recover on this chain. A refusal names the block it stopped at.
-Import import_chain_data(evm::Chain& chain, const std::string& path);
+Import import_chain_data(evm::Chain& chain, const std::string& path,
+                         const Checkpoint& checkpoint = {});
 
 }  // namespace lux::node

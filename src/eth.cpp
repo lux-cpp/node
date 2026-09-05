@@ -3,6 +3,8 @@
 
 #include "lux/node/eth.hpp"
 
+#include "lux/node/import.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -283,6 +285,38 @@ void serve_eth(Rpc& rpc, evm::Chain& chain, const std::string& client) {
     });
 
     rpc.root(alias);
+}
+
+void serve_admin(Rpc& rpc, evm::Chain& chain) {
+    rpc.method(chain.alias(), "admin_importChain", [&chain](const Json& p) -> Json {
+        const std::uint64_t before = chain.last_accepted_height();
+        Import              in;
+        try {
+            in = import_chain_data(chain, text(p, 0));
+        } catch (const std::exception& e) {
+            // The reader's own refusal, given to the caller verbatim: it names
+            // the block it stopped at, and inventing a summary here would lose
+            // the only thing that makes the failure actionable.
+            throw Rpc::Error(-32000, e.what());
+        }
+        return Json{
+            {"blocks", in.blocks},
+            {"skipped", in.skipped},
+            {"transactions", in.txs},
+            {"genesis", octets(in.genesis)},
+            {"tip", octets(in.tip)},
+            // Carried from the header, not derived — an export holds blocks,
+            // not state. The field is named for what it is everywhere else.
+            {"stateRoot", octets(in.root)},
+            {"heightBefore", quantity(before)},
+            {"heightAfter", quantity(in.height)},
+            // What this node has DECIDED, which after a read is below the tip
+            // and stays there. A caller polling for "am I caught up" gets the
+            // truthful answer from the same object that told it the import
+            // worked.
+            {"frontier", quantity(chain.frontier())},
+        };
+    });
 }
 
 }  // namespace lux::node
