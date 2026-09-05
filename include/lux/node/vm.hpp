@@ -86,6 +86,20 @@ struct VM {
     // anything, and the height that seeds the decided-height frontier.
     virtual Id last_accepted() const = 0;                                     // Go LastAccepted
     virtual std::uint64_t last_accepted_height() const = 0;
+
+    // Whether the chain is past replaying history — Go's SetState(Bootstrapping)
+    // then SetState(NormalOp), which is where its chains learn to check
+    // signatures. A chain replaying blocks the network already agreed on may
+    // skip work that was done when those blocks were first accepted; a chain
+    // serving peers may not.
+    //
+    // Not pure, and the default is silence, because skipping that work is an
+    // OPTIMIZATION and a chain is free to decline it. That is also why the
+    // question is asked in this direction: every chain must be safe when this is
+    // never called, so the answer a chain assumes is "checking", and this call
+    // can only relax it — never a call the absence of which turns verification
+    // off.
+    virtual void set_bootstrapped(bool) {}
 };
 
 }  // namespace lux::node
