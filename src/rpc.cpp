@@ -60,6 +60,11 @@ ChainPath chain_path(const std::string& path) {
 // against a running Go node rather than assumed: it answers `/v1/bc/C/rpc` and
 // `/v1/bc/P`. An alias the archive does not publish is not proxied at all — a
 // guessed path returns a 404 wearing the costume of an outage.
+//
+// A URL, not a permission. Whether this node may answer for the alias at all was
+// settled before anything here was called (see Network), so these three are the
+// Lux primary network's chains as the archive spells them, not a second and
+// network-agnostic list of what is servable.
 std::string archive_path(const std::string& alias) {
     if (alias == "c") return "/v1/bc/C/rpc";
     if (alias == "p") return "/v1/bc/P";
@@ -311,7 +316,13 @@ std::string lower(std::string s) {
 void Rpc::method(std::string alias, std::string name, Method fn) {
     methods_[lower(std::move(alias))][std::move(name)] = std::move(fn);
 }
-void Rpc::root(std::string alias) { root_alias_ = lower(std::move(alias)); }
+void Rpc::network(Network n) {
+    // Folded on the way in, once, so the whole server below compares lowercase
+    // against lowercase — the same rule method() applies to a registration.
+    for (auto& a : n.served) a = lower(a);
+    for (auto& a : n.owned) a = lower(a);
+    net_ = std::move(n);
+}
 void Rpc::about(Json j) { about_ = std::move(j); }
 
 void Rpc::start() {
@@ -407,28 +418,29 @@ void Rpc::answer(int fd) {
             if (!about.contains("chains")) {
                 about["chains"] = Json::object();
             }
-            // Advertise what is actually registered, so a chain appears here by
-            // existing. The archive-backed pair is named too, because a light
-            // node answers for them without serving them.
-            for (const auto& served : methods_)
-                about["chains"][served.first] = "/v1/chain/" + served.first;
-            for (const char* proxied : {"p", "x"})
-                if (!about["chains"].contains(proxied))
-                    about["chains"][proxied] = std::string("/v1/chain/") + proxied;
+            // Advertise what this node's network OWNS — the chains it keeps and
+            // the ones it reaches through an archive, which are answerable here
+            // either way. Nothing else is listed, because nothing else is this
+            // node's to offer.
+            for (const auto& alias : net_.owned)
+                about["chains"][alias] = "/v1/chain/" + alias;
             if (!about.contains("endpoints")) {
                 about["endpoints"] = Json::object();
             }
-            about["endpoints"]["rpc"] = "/v1/chain/" + (root_alias_.empty() ? std::string("c") : root_alias_);
-            about["endpoints"]["p"] = "/v1/chain/p";
-            about["endpoints"]["x"] = "/v1/chain/x";
+            if (!net_.served.empty())
+                about["endpoints"]["rpc"] = "/v1/chain/" + net_.served.front();
             write_all(fd, response(200, "OK", about.dump()));
         } else if (path == "/healthz" || path == "/v1/health" || path == "/health") {
+            // The chain check names THIS node's chain. "C-Chain live" on a Zoo
+            // node is a health report about a chain it does not run.
+            const std::string live =
+                "chain " + (net_.served.empty() ? std::string("unknown") : net_.served.front()) + " live";
             Json h = {
                 {"healthy", true},
                 {"checks", {
                     {"bls", {{"message", "node has the correct BLS key"}, {"healthy", true}}},
                     {"consensus", {{"message", "mesh healthy"}, {"healthy", true}}},
-                    {"chain", {{"message", "C-Chain live"}, {"healthy", true}}}
+                    {"chain", {{"message", live}, {"healthy", true}}}
                 }}
             };
             write_all(fd, response(200, "OK", h.dump()));
@@ -446,11 +458,17 @@ void Rpc::answer(int fd) {
     }
     if (verb != "POST") { write_all(fd, response(405, "Method Not Allowed", "{}")); return; }
 
-    // Go forwards a bare POST / to the C-Chain; so does this.
+    // Go forwards a bare POST / to its own chain; so does this — to whichever
+    // chain this node's network says is its own.
     const std::string alias =
-        (path == "" || path == "/") && !root_alias_.empty() ? root_alias_ : chain.alias;
+        (path == "" || path == "/") && !net_.served.empty() ? net_.served.front() : chain.alias;
 
-    if (alias.empty() || chain.health) {
+    // Nothing named, a health path that reached the POST branch, or a chain
+    // belonging to some OTHER network. The last is the load-bearing one, and it
+    // is settled here — before the archive — because relaying another network's
+    // chain would publish that network's answer as this node's own. Only a Lux
+    // node owns `c`; a Zoo node asked for it does not have one to give.
+    if (alias.empty() || chain.health || !net_.owns(alias)) {
         write_all(fd, response(404, "Not Found",
                                R"({"jsonrpc":"2.0","id":null,)"
                                R"("error":{"code":-32601,"message":"no such chain"}})"));
@@ -458,8 +476,9 @@ void Rpc::answer(int fd) {
     }
 
     if (methods_.find(alias) == methods_.end()) {
-        // A chain this node does not keep. With an archive configured it is
-        // still answerable, which is how a frontier-only node serves P and X.
+        // A chain this node's network owns but this node does not keep. With an
+        // archive configured it is still answerable, which is how a frontier-only
+        // node serves P and X.
         if (!archive_rpc_.empty()) {
             const Proxied proxied = proxy_to_archive(archive_rpc_, alias, body);
             if (!proxied.empty()) {
@@ -472,15 +491,12 @@ void Rpc::answer(int fd) {
                 return;
             }
         }
-        if (!archive_path(alias).empty()) {
-            write_all(fd, response(200, "OK",
-                                   R"({"jsonrpc":"2.0","id":null,)"
-                                   R"("error":{"code":-32000,"message":"light node: P/X chain queries require --archive-rpc to proxy from full archive node"}})"));
-            return;
-        }
-        write_all(fd, response(404, "Not Found",
+        // Owned, so it is not a 404: this node has the chain, it just does not
+        // keep its state. Saying which is missing — the archive, not the chain —
+        // is the difference between a node to configure and a node to abandon.
+        write_all(fd, response(200, "OK",
                                R"({"jsonrpc":"2.0","id":null,)"
-                               R"("error":{"code":-32601,"message":"no such chain"}})"));
+                               R"("error":{"code":-32000,"message":"light node: this chain is not kept here; configure --archive-rpc to proxy it from a full archive node"}})"));
         return;
     }
 

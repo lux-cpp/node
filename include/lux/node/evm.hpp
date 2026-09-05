@@ -105,7 +105,10 @@ public:
 
     // ── node::VM ────────────────────────────────────────────────────────────
     Id            chain_id() const override;
-    std::string   alias() const override { return "C"; }
+    // The canonical alias of the network this chain's id belongs to — "c" on
+    // Lux, "zoo" on Zoo, "hanzo" on Hanzo. A literal "C" here is what let a Zoo
+    // node call its own chain the C-Chain and answer to that name.
+    std::string   alias() const override;
     std::shared_ptr<node::Block> build() override;
     std::shared_ptr<node::Block> parse(std::span<const std::uint8_t>) override;
     std::shared_ptr<node::Block> get(const Id&) const override;
