@@ -147,6 +147,20 @@ int main() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+    // Final is not the same as finished. A node finalises the moment its
+    // voted stake crosses the threshold — node 0 did so at four of five — and
+    // the fifth vote was still on the wire when the loop above stopped. The
+    // assertions below are about the voter set, which is a claim about every
+    // vote having ARRIVED, so drain until a round delivers nothing.
+    for (;;) {
+        std::size_t delivered = 0;
+        for (auto& h : hosts) delivered += h->pump();
+        total_delivered += delivered;
+        ++rounds;
+        if (delivered == 0) break;
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
     std::printf("  pumped: %zu votes delivered across the mesh in %d round(s)\n\n",
                 total_delivered, rounds);
 
