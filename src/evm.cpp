@@ -111,9 +111,13 @@ public:
     // decision. Defined below, where Chain::State is complete.
     void accept() override;
 
+    // The other half of being decided: this block lost, so the transactions it
+    // took go back. Defined below, beside accept — the two are one rule read
+    // from its two ends.
+    void reject() override;
+
     std::uint64_t          timestamp() const noexcept { return timestamp_; }
     const std::vector<Tx>& txs() const noexcept { return txs_; }
-    bool                   accepted() const noexcept { return accepted_; }
 
 private:
     Chain::State*             st_;
@@ -122,7 +126,10 @@ private:
     std::vector<Tx>           txs_;
     std::vector<std::uint8_t> bytes_;
     bool                      verified_;
-    bool                      accepted_ = false;
+    // A block is decided ONCE, one way. Whichever call arrives first wins and
+    // the other is inert, so a second trigger cannot both advance the tip and
+    // hand the same transactions back.
+    bool                      decided_ = false;
 };
 
 }  // namespace
@@ -490,8 +497,8 @@ std::vector<Tx> Chain::block_txs(const Id& id) const {
 namespace {
 
 void BlockImpl::accept() {
-    if (accepted_) return;  // idempotent: a height is accepted once
-    accepted_ = true;
+    if (decided_) return;  // idempotent: a height is decided once
+    decided_ = true;
     const auto it = st_->blocks.find(id_);
     if (it == st_->blocks.end()) return;
     st_->by_height[height_]  = it->second;
@@ -508,6 +515,39 @@ void BlockImpl::accept() {
         const auto at = std::find_if(st_->mempool.begin(), st_->mempool.end(),
                                      [&](const Tx& p) { return p.hash == t.hash; });
         if (at != st_->mempool.end()) st_->mempool.erase(at);
+    }
+}
+
+void BlockImpl::reject() {
+    if (decided_) return;  // idempotent, and inert once accepted
+    decided_ = true;
+
+    // The block is unreachable now: nothing may build on it and nothing may ask
+    // for it. Go frees exactly this much on a reject — the block's pinned state
+    // and nothing else (manager.free / backend.free). The map owns a reference,
+    // so one is held here first: erasing it is otherwise the last owner
+    // releasing the object whose method is running.
+    std::shared_ptr<BlockImpl> alive;
+    if (const auto pinned = st_->blocks.find(id_); pinned != st_->blocks.end()) {
+        alive = std::move(pinned->second);
+        st_->blocks.erase(pinned);
+    }
+
+    // AND THE TRANSACTIONS COME BACK. build() swapped the whole pool into this
+    // block, so this is the only thing standing between a height that failed to
+    // certify and a node whose pool is empty while every peer still holds the
+    // transactions — the disagreement that then produces a different block at
+    // the next height. Go returns them the same way (platformvm's rejector
+    // reissues the block's decision txs; xvm's Reject re-checks and reissues).
+    //
+    // By hash, and skipping what is already waiting, because a followed block's
+    // transactions may never have left this node's pool: they arrived by gossip
+    // and were only ever removed by ACCEPT. Adding a second copy would put the
+    // same transaction in a block twice.
+    for (const auto& t : txs_) {
+        const auto at = std::find_if(st_->mempool.begin(), st_->mempool.end(),
+                                     [&](const Tx& p) { return p.hash == t.hash; });
+        if (at == st_->mempool.end()) st_->mempool.push_back(t);
     }
 }
 

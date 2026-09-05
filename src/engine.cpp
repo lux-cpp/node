@@ -56,26 +56,49 @@ std::optional<Decided> Engine::settle(const std::shared_ptr<Block>& blk, int dea
     if (!blk) return std::nullopt;
 
     // An honest node does not vote for a block its own execution rejected. This
-    // is where a peer's claimed root, having disagreed with ours, stops.
+    // is where a peer's claimed root, having disagreed with ours, stops. It is
+    // a DROP, not a rejection: the block never reached consensus, so it is
+    // holding nothing that reject() would give back, and Go drops it here too.
     if (!blk->verify()) return std::nullopt;
 
     const auto pos = position(*blk);
     host_.submit(pos);
     if (after_submit) after_submit();
 
+    // FROM HERE THE BLOCK IS REGISTERED, and every way out that is not an
+    // accept is this node giving up on it. Giving up silently is what left the
+    // chain disagreeing with its peers about what was still pending: the
+    // daemon's height loop simply retries a height it could not certify
+    // (noded.cpp: "timeout — retrying"), and the abandoned block took the
+    // transactions with it — the C-Chain's build() swaps the whole mempool into
+    // the block, so a height that timed out emptied the pool and the next one
+    // was built from nothing. So say it: the block was decided against.
+    //
+    // The shape differs from Go's and the difference is worth naming. Go's
+    // engine keeps an undecided block pending across ticks and rejects it only
+    // when a sibling wins, because it has a fork choice to lose to. settle() is
+    // the WHOLE life of a block here — there is no later tick that could still
+    // accept it — so abandonment is where "will never be accepted" becomes true,
+    // and that is Go's precondition for Reject, reached by a shorter road.
+    auto abandon = [&]() -> std::optional<Decided> {
+        const std::lock_guard<std::mutex> lock(guard_);
+        blk->reject();
+        return std::nullopt;
+    };
+
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms);
     while (!host_.isFinal(pos.block_id)) {
         host_.round(pos.block_id);  // β-confirmation rounds → sign + broadcast once decided
         host_.pump();               // drain peers' votes into the gate
-        if (std::chrono::steady_clock::now() >= deadline) return std::nullopt;
+        if (std::chrono::steady_clock::now() >= deadline) return abandon();
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
     // Certified ⇒ decided. accept() takes the witness AND advances the
     // decided-height frontier, so this validator can never sign a sibling here.
     auto cert = host_.accept(pos);
-    if (!cert) return std::nullopt;
+    if (!cert) return abandon();
 
     // Only now does the chain's tip move: the VM is told the block was decided,
     // by a certificate, after that certificate verified. This is a write to the
