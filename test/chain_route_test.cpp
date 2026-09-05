@@ -96,6 +96,11 @@ int main() {
     // tested on something longer than one character.
     rpc.method("Zoo", "eth_chainId", [](const Rpc::Json&) { return std::string("0x7a69"); });
     rpc.root("C");
+    // P and X are not kept here; they are RELAYED. A node answers for a chain it
+    // does not keep only when it has been told where the archive publishes it,
+    // so the test says so rather than relying on a name being special.
+    rpc.relay("P", "/v1/bc/P");
+    rpc.relay("X", "/v1/bc/X");
     rpc.about(Rpc::Json{{"client", "lux-cpp/test"}});
     rpc.start();
     const std::uint16_t port = rpc.port();

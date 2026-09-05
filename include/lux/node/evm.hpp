@@ -53,6 +53,14 @@ struct Genesis {
     std::uint64_t chain_id  = 0;
     std::uint64_t gas_limit = 30'000'000;
     std::vector<std::pair<Address, Word>> alloc;  // address → starting balance
+
+    // The RPC name this chain answers to. A chain is BORN with its name, the
+    // same way it is born with its id: the Lux primary network's EVM is "C",
+    // and a sovereign L1 (Zoo, Hanzo) has its own EVM under its own name and no
+    // C-Chain at all. Leaving this to the binary would let one node present the
+    // same chain under two names, which is how a network ends up answering for
+    // a chain it does not have.
+    std::string   alias     = "C";
 };
 
 // A decoded, signature-verified transaction. Construction is the verification:
@@ -105,7 +113,7 @@ public:
 
     // ── node::VM ────────────────────────────────────────────────────────────
     Id            chain_id() const override;
-    std::string   alias() const override { return "C"; }
+    std::string   alias() const override;
     std::shared_ptr<node::Block> build() override;
     std::shared_ptr<node::Block> parse(std::span<const std::uint8_t>) override;
     std::shared_ptr<node::Block> get(const Id&) const override;
