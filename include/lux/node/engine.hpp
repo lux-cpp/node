@@ -132,6 +132,11 @@ private:
 
     // Register the block, then run the rounds until it certifies. `decide` and
     // `propose` differ only in what happens between those two steps.
+    //
+    // A registered block that does NOT certify is rejected before this returns.
+    // It is the only honest reading: settle is the whole life of a block here,
+    // so a block it gives up on is a block that will never be accepted, and its
+    // transactions belong back in the pool rather than in a block nobody has.
     std::optional<Decided> settle(const std::shared_ptr<Block>&, int deadline_ms,
                                   const std::function<void()>& after_submit);
 

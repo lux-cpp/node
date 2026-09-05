@@ -38,7 +38,10 @@ using lux::consensus::kEmptyId;
 
 // A block. Consensus never reads its contents: it reads where the block sits
 // (id, parent, height), what executing it produced (root), and later tells it
-// that it was decided. Bytes are what a peer receives, and the only thing a peer
+// HOW it was decided — accepted, or rejected in favour of something else. Both
+// halves, because Go's Decidable has both and a chain told only about the half
+// that went its way keeps holding what the other half would have given back.
+// Bytes are what a peer receives, and the only thing a peer
 // is trusted to send — a receiving node parses and re-executes to derive the
 // position itself, rather than taking a peer's word for the height or the root.
 struct Block {
@@ -62,6 +65,29 @@ struct Block {
     // reports it after a restart, and that is what closes the height to a second
     // signature.
     virtual void accept() = 0;                                // Go Accept
+
+    // The block is decided AGAINST: it can never be accepted, so what it was
+    // holding goes back. Its transactions return to whatever the next build()
+    // draws from, and the state its execution pinned is released.
+    //
+    // THE TRANSACTIONS ARE THE POINT. They were never refused — they lost a
+    // race — and a node that drops them disagrees with every other node about
+    // what is still pending, then proposes a block built from that disagreement.
+    // Go says the same in three places: platformvm's rejector reissues the
+    // block's decision transactions and wakes the builder, xvm's Reject asks
+    // each transaction again against the state that actually won and reissues
+    // the ones that still hold, and both free the block's pinned state.
+    //
+    // NOT the answer to a failed verify(). A block this node refused to vote for
+    // never entered consensus and never took anything out of the pool; Go drops
+    // it where it stands (engine/chain: "built block failed verification —
+    // dropping") and calls Reject only on a block that was registered and then
+    // lost. Rejecting a dropped block would hand back transactions nobody took.
+    //
+    // Decided ONCE, either way. accept and reject are each inert after the
+    // other, because more than one path can reach a decision — Go guards the
+    // same double-decide with pendingBlocks.Decided before it calls either.
+    virtual void reject() = 0;                                // Go Reject
 };
 
 // The chain itself. An L1, an L2 rollup and an L3 differ in what they put in a

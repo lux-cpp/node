@@ -212,9 +212,10 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #   set_root        the validator-set commitment, against Go's encoding
 #   chain_route     every spelling of a chain's path reaches that one chain
 #   archive_proxy   what a relayed answer's status is, when this node is a proxy
+#   block_reject    a block that is not accepted gives its transactions back
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root chain_route archive_proxy)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root chain_route archive_proxy block_reject)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
