@@ -164,8 +164,11 @@ Identity Identity::open(const std::filesystem::path& dir) {
         id.pk_ = read_all(pk_path);
         id.sk_ = read_all(sk_path);
     } else {
-        std::vector<std::uint8_t> pk(std::size_t(mldsa65_pk_size()));
-        std::vector<std::uint8_t> sk(std::size_t(mldsa65_sk_size()));
+        // Braces, not parentheses around a functional cast: `vector<T> v(size_t(f()))`
+        // declares a FUNCTION taking a `size_t(*)()` and returning vector<T>. The
+        // most vexing parse, and the reason this file had never been compiled.
+        std::vector<std::uint8_t> pk(static_cast<std::size_t>(mldsa65_pk_size()));
+        std::vector<std::uint8_t> sk(static_cast<std::size_t>(mldsa65_sk_size()));
         int pk_len = int(pk.size()), sk_len = int(sk.size());
         if (mldsa65_keypair(reinterpret_cast<char*>(pk.data()), &pk_len,
                             reinterpret_cast<char*>(sk.data()), &sk_len) != 0)
@@ -190,8 +193,8 @@ Outcome run_initiator(const Identity& id,
     // 1. Fresh ML-KEM-768 keypair for this session only (never persisted —
     //    matches Go's InitiateHandshake, which calls GenerateKEMKeypair anew
     //    on every dial).
-    std::vector<std::uint8_t> kem_pk(std::size_t(mlkem768_pk_size()));
-    std::vector<std::uint8_t> kem_sk(std::size_t(mlkem768_sk_size()));
+    std::vector<std::uint8_t> kem_pk(static_cast<std::size_t>(mlkem768_pk_size()));
+    std::vector<std::uint8_t> kem_sk(static_cast<std::size_t>(mlkem768_sk_size()));
     {
         int pkl = int(kem_pk.size()), skl = int(kem_sk.size());
         if (mlkem768_keypair(reinterpret_cast<char*>(kem_pk.data()), &pkl,
@@ -217,7 +220,7 @@ Outcome run_initiator(const Identity& id,
 
     // 3. Sign the prefix under the initiator context, then append the
     //    length-prefixed signature to get canonicalBytes.
-    std::vector<std::uint8_t> sig(std::size_t(mldsa65_sig_size()));
+    std::vector<std::uint8_t> sig(static_cast<std::size_t>(mldsa65_sig_size()));
     {
         static constexpr std::string_view kCtx = "NODE_PQ_HANDSHAKE_V1/initiator";
         int sig_len = int(sig.size());
