@@ -43,6 +43,7 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <cctype>
 #include <string>
 #include <thread>
 #include <vector>
@@ -91,6 +92,40 @@ std::string arg_str(int argc, char** argv, const char* flag, std::string dflt) {
     for (int i = 1; i + 1 < argc; ++i)
         if (std::strcmp(argv[i], flag) == 0) return argv[i + 1];
     return dflt;
+}
+
+// A chain alias is written lowercase everywhere below it, so it is folded once
+// here and never again.
+std::string lower_ascii(std::string s) {
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// What this node tells the world it serves. It answers for its OWN chain, and
+// for P and X only when it is a node of the Lux primary network — the network
+// those two chains belong to. Naming a chain here that the node cannot answer
+// is how a directory starts pointing at an outage.
+Rpc::Json chains_served(const std::string& alias) {
+    Rpc::Json j = Rpc::Json::object();
+    j[alias] = "/v1/chain/" + alias;
+    if (alias == "c") {
+        j["p"] = "/v1/chain/p";
+        j["x"] = "/v1/chain/x";
+    }
+    return j;
+}
+
+Rpc::Json endpoints_served(const std::string& alias, const std::string& public_api) {
+    Rpc::Json j = Rpc::Json::object();
+    j["rpc"] = "/v1/chain/" + alias;
+    if (alias == "c") {
+        j["p"] = "/v1/chain/p";
+        j["x"] = "/v1/chain/x";
+    }
+    j["health"] = "/v1/health";
+    j["public"] = public_api;
+    return j;
 }
 
 std::string hex(std::span<const std::uint8_t> b) {
@@ -149,7 +184,8 @@ int main(int argc, char** argv) {
     if (index < 0 || n <= 0 || base_port <= 0 || index >= n) {
         std::fprintf(stderr,
                      "usage: %s --index I --n N --base-port P [--rpc-port R] [--stake S]\n"
-                     "             [--deadline-ms D] [--blocks B] [--chain-id C] [--archive-rpc URL] [--light]\n", prog);
+                     "             [--deadline-ms D] [--blocks B] [--chain-id C] [--alias A]\n"
+                     "             [--archive-rpc URL] [--light]\n", prog);
         return 2;
     }
     const long stake       = arg(argc, argv, "--stake", 20);
@@ -157,6 +193,12 @@ int main(int argc, char** argv) {
     const long rpc_port    = arg(argc, argv, "--rpc-port", 0);
     const long blocks      = arg(argc, argv, "--blocks", 0);  // 0 = until stopped
     const auto chain_id    = std::uint64_t(arg(argc, argv, "--chain-id", long(kLocalChainId)));
+
+    // The name this node's chain answers to. The Lux primary network's EVM is
+    // "c"; a sovereign L1 (Zoo, Hanzo) runs its OWN EVM under its own name and
+    // has no C-Chain, so the two must be separable at the command line rather
+    // than by which binary was built.
+    const std::string alias = lower_ascii(arg_str(argc, argv, "--alias", "c"));
 
     std::string archive_rpc = arg_str(argc, argv, "--archive-rpc", "");
     if (archive_rpc.empty()) {
@@ -217,7 +259,9 @@ int main(int argc, char** argv) {
     std::unique_ptr<evm::Chain> chainp;
     try {
         hostp  = std::make_unique<Node2Host>(std::move(cfg));
-        chainp = std::make_unique<evm::Chain>(local_genesis(chain_id));
+        evm::Genesis g = local_genesis(chain_id);
+        g.alias        = alias;
+        chainp = std::make_unique<evm::Chain>(std::move(g));
     } catch (const std::exception& e) {
         std::fprintf(stderr, "node %ld: cannot start — %s\n", index, e.what());
         return 2;
@@ -226,8 +270,9 @@ int main(int argc, char** argv) {
     evm::Chain& chain = *chainp;
 
     const std::uint16_t port = host.listen_bind();
-    std::printf("node %ld: consensus 127.0.0.1:%u  chain C (eth chainId %llu)\n",
-                index, port, static_cast<unsigned long long>(chain.eth_chain_id()));
+    std::printf("node %ld: consensus 127.0.0.1:%u  chain %s (eth chainId %llu)\n",
+                index, port, alias.c_str(),
+                static_cast<unsigned long long>(chain.eth_chain_id()));
     std::printf("node %ld: genesis state root %s\n", index, hex(chain.state_root()).c_str());
     std::printf("node %ld: validator set root %s\n", index, hex(set_root).c_str());
     std::fflush(stdout);
@@ -246,6 +291,16 @@ int main(int argc, char** argv) {
     if (!archive_rpc.empty()) {
         rpc.set_archive_rpc(archive_rpc);
     }
+    // What this node may relay from the archive. Its OWN chain is the archive's
+    // primary EVM whatever it is called here; P and X exist only on the Lux
+    // primary network, so only a Lux node declares them. A sovereign L1 that
+    // declared "c" would answer for a chain it does not have by handing back
+    // someone else's.
+    rpc.relay(alias, "/v1/bc/C/rpc");
+    if (alias == "c") {
+        rpc.relay("p", "/v1/bc/P");
+        rpc.relay("x", "/v1/bc/X");
+    }
     serve_eth(rpc, chain, client_version);
     const std::string_view prog_view(prog ? prog : "");
     const std::string public_api = (prog_view == "zood" || prog_view.find("zoo") != std::string_view::npos)
@@ -257,21 +312,15 @@ int main(int argc, char** argv) {
         {"index", index},
         {"validators", n},
         {"endpoint", public_api},
-        {"chains", Rpc::Json::object({{"c", "/v1/chain/c"}, {"p", "/v1/chain/p"}, {"x", "/v1/chain/x"}})},
-        {"endpoints", Rpc::Json::object({
-            {"rpc", "/v1/chain/c"},
-            {"p", "/v1/chain/p"},
-            {"x", "/v1/chain/x"},
-            {"health", "/v1/health"},
-            {"public", public_api}
-        })}
+        {"chains", chains_served(alias)},
+        {"endpoints", endpoints_served(alias, public_api)}
     });
     rpc.start();
     std::printf("node %ld: mode light node (frontier resident)\n", index);
     if (!archive_rpc.empty()) {
         std::printf("node %ld: archive RPC %s (proxying historical & P/X state)\n", index, archive_rpc.c_str());
     }
-    std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/c\n", index, rpc.port());
+    std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/%s\n", index, rpc.port(), alias.c_str());
     std::fflush(stdout);
 
     // ── the mesh ────────────────────────────────────────────────────────────

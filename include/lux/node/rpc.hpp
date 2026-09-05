@@ -4,7 +4,10 @@
 // rpc.hpp — the node's HTTP JSON-RPC surface.
 //
 // The paths are Go's, verified against the running node rather than assumed:
-// `/v1/chain/<alias>`, where the alias is the VM's own ("C", "P", "X"). The
+// `/v1/chain/<alias>`, where the alias is the VM's own. The Lux primary
+// network's EVM is "C"; a sovereign L1 runs its own EVM under its own name and
+// has no C-Chain, so the name comes from the chain (evm::Genesis::alias), never
+// from a constant here. The
 // alias is matched without regard to case and the trailing `/rpc` is optional,
 // so `/v1/chain/C/rpc` and `/v1/chain/c` are the same route; `/v1/bc/...` is
 // the same word in the middle and is accepted too. One function decides all of
@@ -81,6 +84,17 @@ public:
     void               set_archive_rpc(std::string url) { archive_rpc_ = std::move(url); }
     const std::string& archive_rpc() const noexcept { return archive_rpc_; }
 
+    // Say that `alias` is answerable from the archive at `upstream_path`. This
+    // is the ONLY thing that makes a path proxyable, so a node relays exactly
+    // the chains its operator said it has upstream and nothing else. A sovereign
+    // L1 declares its own EVM and no C-Chain; a Lux node declares C, P and X.
+    // Without it a hardcoded table would let any node answer for /v1/chain/c —
+    // a chain a sovereign L1 does not have — by relaying someone else's.
+    void relay(std::string alias, std::string upstream_path);
+
+    // The archive path for `alias`, empty when this node relays no such chain.
+    std::string relay_path(const std::string& alias) const;
+
     // THE lock. The driver holds it while it mutates the chain; the Rpc holds it
     // for the duration of every method call.
     std::mutex& guard() noexcept { return mu_; }
@@ -95,6 +109,8 @@ private:
     // Keyed by lowercase chain alias, never by path.
     std::map<std::string, std::map<std::string, Method>> methods_;
     std::string                                     root_alias_;
+    // Chain alias → the path the archive publishes it under. Empty = not relayed.
+    std::map<std::string, std::string>              relays_;
     std::string                                     archive_rpc_;
     Json                                            about_;
     std::mutex                                      mu_;

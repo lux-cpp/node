@@ -171,6 +171,9 @@ struct Frontier {
     Rpc rpc{0};
     explicit Frontier(const std::string& archive) {
         rpc.method("C", "eth_chainId", [](const Rpc::Json&) { return std::string("0x7a69"); });
+        // X is reached through the archive, and saying where is what makes it
+        // reachable — an undeclared chain is refused, never guessed at.
+        rpc.relay("X", "/v1/bc/X");
         rpc.set_archive_rpc(archive);
         rpc.start();
     }

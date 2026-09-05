@@ -56,17 +56,6 @@ ChainPath chain_path(const std::string& path) {
     return out;
 }
 
-// Where the archive publishes a chain. This is the UPSTREAM's shape, measured
-// against a running Go node rather than assumed: it answers `/v1/bc/C/rpc` and
-// `/v1/bc/P`. An alias the archive does not publish is not proxied at all — a
-// guessed path returns a 404 wearing the costume of an outage.
-std::string archive_path(const std::string& alias) {
-    if (alias == "c") return "/v1/bc/C/rpc";
-    if (alias == "p") return "/v1/bc/P";
-    if (alias == "x") return "/v1/bc/X";
-    return "";
-}
-
 // A request this server will read, and no larger. A JSON-RPC call is small; a
 // raw transaction is the biggest thing that arrives, and 1 MiB is far past any
 // of them. The cap is what stops one caller from growing this node's memory.
@@ -175,10 +164,8 @@ int status_of(const std::string& head) {
     return (code >= 100 && code <= 599) ? code : 0;
 }
 
-Proxied proxy_to_archive(const std::string& archive_url, const std::string& alias, const std::string& body) {
-    if (archive_url.empty()) return {};
-    const std::string target_path = archive_path(alias);
-    if (target_path.empty()) return {};
+Proxied proxy_to_archive(const std::string& archive_url, const std::string& target_path, const std::string& body) {
+    if (archive_url.empty() || target_path.empty()) return {};
     std::string url = archive_url;
     if (url.rfind("http://", 0) == 0) url = url.substr(7);
     while (!url.empty() && url.back() == '/') url.pop_back();
@@ -312,6 +299,15 @@ void Rpc::method(std::string alias, std::string name, Method fn) {
     methods_[lower(std::move(alias))][std::move(name)] = std::move(fn);
 }
 void Rpc::root(std::string alias) { root_alias_ = lower(std::move(alias)); }
+
+void Rpc::relay(std::string alias, std::string upstream_path) {
+    relays_[lower(std::move(alias))] = std::move(upstream_path);
+}
+
+std::string Rpc::relay_path(const std::string& alias) const {
+    const auto it = relays_.find(alias);
+    return it == relays_.end() ? std::string{} : it->second;
+}
 void Rpc::about(Json j) { about_ = std::move(j); }
 
 void Rpc::start() {
@@ -461,7 +457,7 @@ void Rpc::answer(int fd) {
         // A chain this node does not keep. With an archive configured it is
         // still answerable, which is how a frontier-only node serves P and X.
         if (!archive_rpc_.empty()) {
-            const Proxied proxied = proxy_to_archive(archive_rpc_, alias, body);
+            const Proxied proxied = proxy_to_archive(archive_rpc_, relay_path(alias), body);
             if (!proxied.empty()) {
                 // The archive's OWN status, not a fresh 200 over its body. This
                 // node is a proxy on this path: it did not answer the question,
@@ -472,10 +468,10 @@ void Rpc::answer(int fd) {
                 return;
             }
         }
-        if (!archive_path(alias).empty()) {
+        if (!relay_path(alias).empty()) {
             write_all(fd, response(200, "OK",
                                    R"({"jsonrpc":"2.0","id":null,)"
-                                   R"("error":{"code":-32000,"message":"light node: P/X chain queries require --archive-rpc to proxy from full archive node"}})"));
+                                   R"("error":{"code":-32000,"message":"light node: this chain is relayed, configure --archive-rpc"}})"));
             return;
         }
         write_all(fd, response(404, "Not Found",
@@ -525,7 +521,7 @@ Rpc::Json Rpc::dispatch(const std::string& alias, const Json& req) {
     const auto  it    = table.find(req["method"].get<std::string>());
     if (it == table.end()) {
         if (!archive_rpc_.empty()) {
-            const Proxied proxied = proxy_to_archive(archive_rpc_, alias, req.dump());
+            const Proxied proxied = proxy_to_archive(archive_rpc_, relay_path(alias), req.dump());
             // Only a SUCCESSFUL archive answer is a JSON-RPC result worth
             // relaying. This site is inside a dispatch whose status has already
             // been decided — a batch is one response — so a 404 body adopted
@@ -551,7 +547,7 @@ Rpc::Json Rpc::dispatch(const std::string& alias, const Json& req) {
         if (e.code == -32000 && !archive_rpc_.empty()) {
             // Same rule as above: an archive that refused is not an answer this
             // node may present as its own.
-            const Proxied proxied = proxy_to_archive(archive_rpc_, alias, req.dump());
+            const Proxied proxied = proxy_to_archive(archive_rpc_, relay_path(alias), req.dump());
             if (proxied.ok()) {
                 try {
                     return Json::parse(proxied.body);

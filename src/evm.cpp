@@ -369,6 +369,8 @@ Id Chain::chain_id() const {
 
 std::uint64_t Chain::eth_chain_id() const noexcept { return st_->genesis.chain_id; }
 
+std::string Chain::alias() const { return st_->genesis.alias; }
+
 std::shared_ptr<node::Block> Chain::build() {
     const auto parent = st_->by_height.at(st_->accepted_height);
     const std::uint64_t height = st_->accepted_height + 1;
