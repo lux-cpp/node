@@ -27,6 +27,7 @@
 #include "lux/node/engine.hpp"
 #include "lux/node/eth.hpp"
 #include "lux/node/evm.hpp"
+#include "lux/node/import.hpp"
 #include "lux/node/node_host.hpp"
 #include "lux/node/rpc.hpp"
 #include "lux/node/validators.hpp"
@@ -149,7 +150,8 @@ int main(int argc, char** argv) {
     if (index < 0 || n <= 0 || base_port <= 0 || index >= n) {
         std::fprintf(stderr,
                      "usage: %s --index I --n N --base-port P [--rpc-port R] [--stake S]\n"
-                     "             [--deadline-ms D] [--blocks B] [--chain-id C] [--archive-rpc URL] [--light]\n", prog);
+                     "             [--deadline-ms D] [--blocks B] [--chain-id C] [--archive-rpc URL] [--light]\n"
+                     "             [--import-chain-data PATH]\n", prog);
         return 2;
     }
     const long stake       = arg(argc, argv, "--stake", 20);
@@ -157,6 +159,12 @@ int main(int argc, char** argv) {
     const long rpc_port    = arg(argc, argv, "--rpc-port", 0);
     const long blocks      = arg(argc, argv, "--blocks", 0);  // 0 = until stopped
     const auto chain_id    = std::uint64_t(arg(argc, argv, "--chain-id", long(kLocalChainId)));
+
+    // Go's flag, spelled Go's way, so one runbook drives all three
+    // implementations: luxd passes --import-chain-data through to the C-Chain's
+    // config and the VM reads the export at startup, before the chain serves
+    // anything. Same name, same moment, same idempotence.
+    const std::string import_path = arg_str(argc, argv, "--import-chain-data", "");
 
     std::string archive_rpc = arg_str(argc, argv, "--archive-rpc", "");
     if (archive_rpc.empty()) {
@@ -231,6 +239,29 @@ int main(int argc, char** argv) {
     std::printf("node %ld: genesis state root %s\n", index, hex(chain.state_root()).c_str());
     std::printf("node %ld: validator set root %s\n", index, hex(set_root).c_str());
     std::fflush(stdout);
+
+    // ── the export, read before anything else looks at the chain ────────────
+    if (!import_path.empty()) {
+        try {
+            const Import in = import_chain_data(chain, import_path);
+            std::printf("node %ld: import %s\n", index, import_path.c_str());
+            std::printf("node %ld: import genesis %s\n", index, hex(in.genesis).c_str());
+            std::printf("node %ld: import tip %s height %llu time %llu\n", index,
+                        hex(in.tip).c_str(), static_cast<unsigned long long>(in.height),
+                        static_cast<unsigned long long>(in.timestamp));
+            std::printf("node %ld: import state root %s (carried from the header — an export "
+                        "holds blocks, not state)\n", index, hex(in.root).c_str());
+            std::printf("node %ld: import %llu blocks ingested, %llu already held, %llu "
+                        "transactions recovered\n", index,
+                        static_cast<unsigned long long>(in.blocks),
+                        static_cast<unsigned long long>(in.skipped),
+                        static_cast<unsigned long long>(in.txs));
+            std::fflush(stdout);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "node %ld: import failed — %s\n", index, e.what());
+            return 2;
+        }
+    }
 
     // ── the RPC, up before consensus ────────────────────────────────────────
     // It must answer while the mesh is still forming, so that "is it listening"
@@ -329,6 +360,35 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     };
+
+    // ── a tip nobody here decided ───────────────────────────────────────────
+    //
+    // Reading an export moves the tip and leaves every consensus frontier below
+    // it missing, so this node knows a height it cannot walk down from. It
+    // stays UP — the RPC answers, so the imported history is readable and the
+    // state is visible rather than silent — and it does not enter the height
+    // loop. The engine would refuse each height anyway; saying so once, plainly,
+    // is the difference between a refusal and a node that looks wedged.
+    if (engine.vm().frontier() < engine.vm().last_accepted_height()) {
+        std::printf("node %ld: NOT A CAUGHT-UP VALIDATOR — tip is height %llu, this node's own "
+                    "decisions stop at height %llu\n", index,
+                    static_cast<unsigned long long>(engine.vm().last_accepted_height()),
+                    static_cast<unsigned long long>(engine.vm().frontier()));
+        std::printf("node %ld: cause: an export was read; it writes blocks and no certificates, "
+                    "so nothing below the tip was decided here\n", index);
+        std::printf("node %ld: effect: this node will NOT build blocks and will NOT vote until "
+                    "those heights are rebuilt from certified peer state\n", index);
+        std::fflush(stdout);
+        while (!g_stop.load()) {
+            host.pump();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        std::printf("node %ld: stopping at height %llu\n", index,
+                    static_cast<unsigned long long>(engine.height()));
+        std::fflush(stdout);
+        rpc.stop();
+        return 0;
+    }
 
     // ── the chain, one height at a time ─────────────────────────────────────
     int rc = 0;
