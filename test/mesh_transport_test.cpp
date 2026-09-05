@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -50,6 +51,16 @@ struct Link {
         if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) { std::puts("socketpair"); std::exit(2); }
         ours = fds[0];
         theirs = fds[1];
+        // The peer end is non-blocking on the FD, not per call. MSG_DONTWAIT is
+        // honoured on recv everywhere and on send only on Linux: on macOS the
+        // flood below fills the socket buffer and then blocks in send forever,
+        // because the transport has already evicted this peer and nothing is
+        // draining. The whole suite stopped on the first test, on one platform.
+        // `ours` is left blocking, which is the property the reader documents:
+        // MSG_DONTWAIT keeps the transport's own fd blocking so writes stay
+        // robust.
+        const int flags = ::fcntl(theirs, F_GETFL, 0);
+        if (flags >= 0) ::fcntl(theirs, F_SETFL, flags | O_NONBLOCK);
     }
     void close_theirs() { if (theirs >= 0) { ::close(theirs); theirs = -1; } }
     ~Link() { close_theirs(); }
