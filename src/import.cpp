@@ -165,6 +165,8 @@ Import import_chain_data(evm::Chain& chain, const std::string& path) {
         // The body is bound to the header it arrived under: the transactions
         // rebuild the header's transactionsRoot, and the uncle list hashes to
         // its ommersHash. Both are recomputed here from the bytes on disk.
+        if (!(*parts)[kTxPart].list || !(*parts)[kOmmerPart].list)
+            throw std::runtime_error("import: transactions and uncles are lists" + at(*number));
         const auto txs = rlp::items((*parts)[kTxPart].payload);
         if (!txs) throw std::runtime_error("import: malformed transaction list" + at(*number));
         if (const Id got = tx_root(*txs), want = hash32((*fields)[kTxs], "transactionsRoot", *number);
