@@ -45,6 +45,14 @@ struct PeerAddr {
 // peer that stops reading makes broadcast fail (and be evicted) rather than hang.
 inline constexpr int kPeerIoTimeoutMs = 2000;
 
+// How long ONE dial attempt may take. A dial that is refused fails at once, but
+// a dial that is dropped — a firewall, a host that is gone, a port bound and
+// never listened on — reports nothing and runs to its timeout. Giving such a
+// dial the whole remaining phase means the peers after it in index order are
+// never dialled at all, so each attempt gets a slice and an unreachable peer is
+// retried on the next round instead of consuming the round.
+inline constexpr int kDialAttemptMs = 250;
+
 class Mesh {
 public:
     // `index` is this node's validator index — it decides dial direction and is

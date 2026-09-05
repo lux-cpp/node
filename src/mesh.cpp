@@ -185,7 +185,8 @@ std::size_t Mesh::connect(const std::map<std::uint32_t, PeerAddr>& peers, int de
             tx_.add_peer(fd);
         }
         for (std::size_t k = 0; k < pending.size();) {
-            const int fd = dial_once(pending[k], std::min(ms_until(deadline), kPeerIoTimeoutMs));
+            const int fd = dial_once(pending[k],
+                                     std::min({ms_until(deadline), kPeerIoTimeoutMs, kDialAttemptMs}));
             if (fd < 0) { ++k; continue; }  // not listening yet (or gone) — swept again next round
             tx_.add_peer(fd);
             pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(k));
