@@ -170,6 +170,25 @@ set(CEVM_TESTING      OFF CACHE BOOL "" FORCE)
 add_subdirectory("${CEVM_DIR}" cevm-build EXCLUDE_FROM_ALL)
 
 # ── node — the NEW host library (the only compiled unit; the rest is header-only)
+# libluxcrypto — the ML-DSA-65 and ML-KEM-768 the post-quantum handshake signs
+# and encapsulates with. It is a Go build output, `make dist` in luxfi/crypto,
+# and it is found the way the other reused trees are rather than named.
+find_checkout(_luxcrypto "libluxcrypto.a"
+  "${CMAKE_SOURCE_DIR}/../../lux/crypto/dist"
+  "${CMAKE_SOURCE_DIR}/../lux/crypto/dist"
+  "$ENV{LUX_LIB_DIR}")
+if(_luxcrypto)
+  message(STATUS "node: luxcrypto   = ${_luxcrypto}")
+  add_library(luxcrypto STATIC IMPORTED)
+  set_target_properties(luxcrypto PROPERTIES
+    IMPORTED_LOCATION "${_luxcrypto}/libluxcrypto.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${_luxcrypto}")
+else()
+  message(FATAL_ERROR
+    "node: no libluxcrypto.a. Build it with `make dist` in luxfi/crypto, or set "
+    "LUX_LIB_DIR to the directory holding it.")
+endif()
+
 add_library(node STATIC
     src/mesh.cpp          # the socket dance
     src/node_host.cpp     # one Party driven over that mesh
@@ -180,9 +199,20 @@ add_library(node STATIC
     src/validators.cpp    # the set-root commitment a vote binds
     src/staking.cpp        # a luxd peer's identity: P-256 cert + NodeID + BLS
     src/peer_tls.cpp       # TLS 1.3 + X25519MLKEM768, over AWS-LC
+    src/pq_handshake.cpp   # ML-DSA-65 identity + ML-KEM-768 session, the strict-PQ link
     src/peer.cpp)          # the p2p Handshake/PushQuery/vote path to a live luxd
 target_include_directories(node PUBLIC include "${ZAP_DIR}")
-target_link_libraries(node PUBLIC consensus Threads::Threads awslc_ssl)
+target_link_libraries(node PUBLIC consensus Threads::Threads awslc_ssl luxcrypto)
+# A Go archive brings its own runtime, which wants the platform frameworks it
+# calls into. Whole-archive so the runtime's initializer survives dead-strip:
+# nothing in C++ calls it, and a linker that keeps only what is called drops it.
+if(APPLE)
+  target_link_libraries(node PUBLIC
+    "-Wl,-force_load,${_luxcrypto}/libluxcrypto.a"
+    "-framework CoreFoundation" "-framework Security" resolv)
+else()
+  target_link_libraries(node PUBLIC -Wl,--whole-archive luxcrypto -Wl,--no-whole-archive)
+endif()
 # evm-state carries the StateDB, process_block and the Merkle-Patricia-Trie; evm
 # is the interpreter behind evmc_create_cevm. lux::crypto-secp256k1 is what
 # recovers a transaction's sender, and nlohmann_json is the RPC's codec.
