@@ -45,6 +45,12 @@ $ curl -s -X POST -H 'content-type: application/json' \
   codec/wire   encode/decode_vote REUSE consensus/.../zap/vote_codec.hpp
                Writer/Reader/           zap-cpp-core/.../zap/wire.hpp
                write_frame_locked
+  luxd peer    Peer               NEW  src/peer.cpp — the OTHER wire: one link to a
+                                       real luxd. TLS 1.3 (peer_tls), then the
+                                       strict-PQ handshake, then p2p + a vote.
+  pq handshake pq::run_initiator  NEW  src/pq_handshake.cpp — ML-KEM-768 session and
+                                       ML-DSA-65 identity, transport-agnostic; the
+                                       frame lambdas in peer.cpp are its one binding.
   consensus    Node / Wave /      REUSE consensus (the gate, unmodified)
                QuorumCertEngine
   crypto       consensus::bls    REUSE consensus (consensus DST) + blst
@@ -152,7 +158,8 @@ conan install ../../luxcpp/cevm -pr ../../luxcpp/cevm/.github/conan/manylinux-re
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=../../luxcpp/cevm/build-node/build/Release/generators/conan_toolchain.cmake
 cmake --build build -j
-ctest --test-dir build --output-on-failure    # 44: node, consensus, and cevm's parity gates
+ctest --test-dir build --output-on-failure    # 41: node, consensus, and cevm's parity gates
+                                             # (evm-gethdiff skips without a geth to diff)
 ./scripts/chain.sh                            # 5 processes serving one C-Chain over JSON-RPC
 ./scripts/cluster.sh build/noded 19310 5      # 5 real PROCESSES, consensus only
 ./scripts/cluster.sh build/noded 19310 5 4    # ...with validator 4 held down
@@ -200,6 +207,17 @@ takes α). Use a worktree pinned to the commit you mean and pass
   way, because `Tx::decode` rejects the overflow for an unrelated reason and
   `parse` frees the reservation on its way out. So the bound is asserted on
   `rlp::item` directly, and the allocation on `VmPeak`.
+- `pq_handshake_test` — the strict-PQ peer handshake, in two halves. The first
+  is known-answer: the hexadecimal in it was printed by Go
+  (`ids.NodeIDSchemeMLDSA65.DeriveMLDSA`, `kem.HashTranscript`,
+  `KEMSession.DeriveAEADKey`) and nothing in this repository can produce those
+  strings, which is exactly what a round trip between two C++ ends cannot give
+  you. The second is a real `socketpair` against a responder transcribed from
+  `RespondHandshake`, and its load-bearing assertion is that both ends derive
+  the SAME session key: the responder builds its canonical bytes from its own
+  fields while the initiator recovers them from a parse, so an asymmetric
+  transcript shows up as two different keys rather than as a handshake that
+  reports success.
 
 Verified clean under ThreadSanitizer and ASan+UBSan+Leak (run TSan under
 `setarch -R`; instrumentation covers node + consensus, never blst/bls).
@@ -254,10 +272,11 @@ NOT REAL YET — named, not hidden:
   process over ZAP (`vms/rpcchainvm/zap`, MsgBuildBlock=9 … MsgBlockReject=30).
   This node links cevm directly. The `VM` interface is the seam a ZAP client
   would implement, so the split is a transport change rather than a rewrite.
-- **PQ is absent.** No ML-KEM-768 handshake, no ML-DSA-65 identity or block
-  signing. `luxcpp/pqclean` and `luxcpp/lattice` are not linked by node. Quasar
-  here is classical blst. Nothing here pretends otherwise.
-- **The peer handshake is 4 plaintext bytes** (see below).
+- **PQ reaches the luxd peer path and nothing else.** `lux-join` now runs the
+  ML-KEM-768 + ML-DSA-65 handshake against a real luxd (below). Block signing
+  is still classical blst, and node's OWN internal mesh handshake is still 4
+  plaintext bytes — two different wires, and only the first is post-quantum.
+- **The internal mesh handshake is 4 plaintext bytes** (see below).
 
 ## The bug that was here, and why no gate saw it
 
@@ -302,11 +321,17 @@ transaction and block gossip; live JSON-RPC.
 
 Does NOT yet, in the order it matters:
 
-- **Peer authentication.** The index handshake is 4 plaintext bytes. A stranger
-  that connects first takes a validator's inbound slot, which is a liveness DoS
-  even though safety holds (votes self-identify by pubkey and the gate verifies
-  BLS + set membership). Go ZAP has an X25519 + ML-KEM-768 hybrid handshake with
-  AEAD; node uses only the frame layer — no reqID, no multiplexing, no ZAP RPC.
+- **Authentication on node's OWN mesh.** The index handshake is 4 plaintext
+  bytes. A stranger that connects first takes a validator's inbound slot, which
+  is a liveness DoS even though safety holds (votes self-identify by pubkey and
+  the gate verifies BLS + set membership). This is the internal mesh, not the
+  luxd peer path: that one is authenticated, by the ML-DSA-65 handshake above.
+  Go ZAP has an X25519 + ML-KEM-768 hybrid handshake with AEAD; node uses only
+  the frame layer — no reqID, no multiplexing, no ZAP RPC.
+- **A PQ responder.** `pq::run_initiator` has no counterpart, because nothing
+  in this node is dialled by a luxd. Adding one before something accepts a
+  connection would be another file that compiles and is never called, which is
+  the state this whole section is about.
 - **Sampling.** `Node2Host::round` drives the wave from the committee this node
   can *reach* — a connectivity measure, not a poll of anyone's opinion. It is one
   expression, in one place, and photon sampling replaces exactly it.
@@ -346,9 +371,76 @@ on Linux: the KEM round-trips to an agreeing shared secret, ML-DSA-65 signs at
 Nothing needs to be vendored from `luxcpp/pqclean` or `luxcpp/lattice` for
 either.
 
-What is NOT done is every place they would be USED: the peer handshake is still
-four plaintext bytes, NodeID is still an index, and blocks are still signed with
-classical BLS. Those are the work; the crypto under them is not.
+One place now USES them, and it is the one that faces a real network. The rest
+is unchanged: node's own mesh handshake is still four plaintext bytes, its
+internal NodeID is still an index, and blocks are still signed with classical
+BLS.
+
+## The strict-PQ peer handshake, and the two ways it was wrong
+
+`Peer::connect` runs `pq::run_initiator` over the TLS session it has just
+established and before a single p2p byte — luxd's `RunPQHandshakeConn`, the
+initiator half. `pq_handshake.cpp` had been written for this and never called,
+and "written and never called" turned out to conceal two defects that no amount
+of reading had caught.
+
+**The C ABI arguments were transposed.** `mldsa65_sign_ctx` and
+`mldsa65_verify_ctx` take the message before the context; this file declared
+them the other way round. They have C linkage, so the declaration and the
+definition need not agree for the program to link — the arguments simply
+arrive in the wrong registers. The effect is not a subtly wrong signature: the
+transcript arrives where FIPS 204 expects a context, contexts are capped at 255
+bytes, and signing fails outright every time. The peer path could never have
+completed a handshake even once.
+
+**The AEAD transcript carried the INIT twice.** Go's `resp.canonicalBytes()` is
+the response alone; `resp.transcriptPrefix(init)` is the whole INIT followed by
+those same fields. The port built one from the other, so `bindAEADTranscript`
+received `INIT ‖ INIT ‖ RESP` where Go builds `INIT ‖ RESP`. This one is
+silent. Both ends complete, both bind each other's NodeID, neither reports
+anything — and the two session keys differ. Nothing consumes the key yet on
+either side (luxd stores it as `pqAEADKey` and encrypts nothing with it), so it
+would have sat there looking healthy until the AEAD wrapper landed and broke
+every link at once.
+
+Both were confirmed against a REAL Go responder before and after: a program
+calling `peer.RunPQHandshakeConn` on the ingress side of a socket, against this
+node's initiator. With the transposed arguments, signing fails and Go reports
+`read PQ INIT: EOF`. With the doubled transcript, both sides succeed and report
+different AEAD keys. Fixed, the two derive the same 32 bytes, which means every
+byte of both canonical messages, the binding, the TupleHash and the key
+derivation agree across the two implementations. The same check over TLS
+(luxd's own `tls_config.go` settings, group 0x11ec) has `lux-join` complete the
+handshake against Go end to end.
+
+**Whether it runs is a genesis fact, not a negotiation.** Go's
+`profileRequiresPQHandshake` runs the handshake for `ProfileStrictPQ` and
+`ProfileFIPS` and skips it otherwise, and a chain whose genesis carries no
+`securityProfile.json` pin boots classical-compat. luxfi/genesis pins profileID
+1 for mainnet, testnet and local/localnet and profileID 2 for devnet, so
+`lux-join` maps network id 3 to permissive and everything else to strict-PQ.
+Guessing desyncs the link on its first frame in either direction, which is why
+the axis is a `Peer::connect` parameter and never a default.
+
+One consequence is easy to miss: `verifyPQIdentityBinding` replaces the peer's
+TLS-cert NodeID with the ML-DSA-derived one the moment the handshake completes.
+So does this side. A quorum vote gossiped after the handshake names the
+key-derived NodeID, because that is the name luxd now files this validator
+under; naming the certificate hash there would address a validator it no longer
+has.
+
+The handshake's own framing is `[4-byte BE length][payload]`, capped at 16 KiB
+— the same shape as the p2p wire and a different rule: p2p counts its tag byte
+in the length and caps at 2 MiB, this counts nothing extra and has no tag.
+Three wires, one repository, three caps.
+
+Two things about the build were the same defect wearing another hat.
+`src/keccak.cpp` was in no target either, so the library had the handshake's
+symbols and not the SHAKE256 under them — nothing noticed until something
+linked. And `nm build/luxd` was the wrong place to look for the result: `luxd`,
+`zood` and `noded` are three names for `src/noded.cpp`, which has no peer path
+and reports zero `peer` symbols as well as zero `pq` ones. `lux-join` is the
+binary that carries this path; it went from 0 handshake symbols to 15.
 
 ## Whose message this node signs
 

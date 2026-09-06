@@ -12,14 +12,18 @@
 #include <fstream>
 #include <stdexcept>
 
-// lux-crypto's C ABI (github.com/luxfi/crypto/bindings/cabi) — ground-truth
-// symbol names confirmed via `nm -D libluxcrypto.so` (no "lux_" prefix, one
-// dylib-per-machine build; the exact spelling matters for the linker and
-// does not appear this way in every doc that describes this library).
-// `_ctx` variants were ADDED to this port (see LLM.md) because the
-// unqualified mldsa65_sign/verify hardcode an EMPTY FIPS 204 context, which
-// is a different signed message than this handshake's non-empty context
-// strings.
+// lux-crypto's C ABI (github.com/luxfi/crypto/bindings/cabi), transcribed
+// from the `libluxcrypto.h` that cgo generates beside the archive. The
+// transcription is the whole risk here: these have C linkage, so a
+// declaration whose PARAMETER ORDER disagrees with the definition links
+// cleanly and the arguments simply arrive in the wrong registers. The `_ctx`
+// pair takes the message BEFORE the context; this file had them the other
+// way round, which signed the context string under the transcript as
+// context. Nothing caught it because nothing called it.
+//
+// The `_ctx` variants exist because the unqualified mldsa65_sign/verify
+// hardcode an EMPTY FIPS 204 context, and the same bytes signed under a
+// different context are a different signature.
 extern "C" {
 int mlkem768_keypair(char* pk, int* pkLen, char* sk, int* skLen);
 int mlkem768_decapsulate(char* skData, int skLen, char* ctData, int ctLen, char* ss, int* ssLen);
@@ -27,9 +31,9 @@ int mlkem768_pk_size();
 int mlkem768_sk_size();
 int mlkem768_ct_size();
 int mldsa65_keypair(char* pk, int* pkLen, char* sk, int* skLen);
-int mldsa65_sign_ctx(char* skData, int skLen, char* ctxData, int ctxLen, char* msgData, int msgLen,
+int mldsa65_sign_ctx(char* skData, int skLen, char* msgData, int msgLen, char* ctxData, int ctxLen,
                      char* sig, int* sigLen);
-int mldsa65_verify_ctx(char* pkData, int pkLen, char* ctxData, int ctxLen, char* msgData, int msgLen,
+int mldsa65_verify_ctx(char* pkData, int pkLen, char* msgData, int msgLen, char* ctxData, int ctxLen,
                        char* sigData, int sigLen);
 int mldsa65_pk_size();
 int mldsa65_sk_size();
@@ -103,14 +107,45 @@ private:
     std::size_t                   at_ = 0;
 };
 
-// cSHAKE256(x, out, "TupleHash", "NODE_TRANSCRIPT_V1") over a SINGLE
-// already-concatenated input — luxd's HashTranscript is called with one
-// []byte at this call site (bindAEADTranscript's output), so the general
-// N-ary TupleHash construction degenerates to one encode_string + one
-// right_encode(L) here, which is what this reproduces directly rather than
-// through an N-ary helper nothing else in this port needs.
-std::array<std::uint8_t, 48> hash_transcript(std::span<const std::uint8_t> transcript) {
-    auto x = keccak::encode_string(transcript);
+}  // namespace
+
+std::vector<std::uint8_t> frame(std::span<const std::uint8_t> payload) {
+    if (payload.size() > kFrameMax)
+        throw std::runtime_error("pq: frame payload exceeds the 16 KiB cap");
+    std::vector<std::uint8_t> out;
+    out.reserve(4 + payload.size());
+    put_u32_be(out, std::uint32_t(payload.size()));
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
+}
+
+std::uint32_t body_size(std::span<const std::uint8_t, 4> header) {
+    const std::uint32_t n = (std::uint32_t(header[0]) << 24) | (std::uint32_t(header[1]) << 16) |
+                            (std::uint32_t(header[2]) << 8) | std::uint32_t(header[3]);
+    if (n > kFrameMax) throw std::runtime_error("pq: peer announced a frame over the 16 KiB cap");
+    return n;
+}
+
+std::vector<std::uint8_t> bind_transcript(std::span<const std::uint8_t> init_canonical,
+                                          std::span<const std::uint8_t> resp_canonical,
+                                          std::uint8_t profile,
+                                          const std::array<std::uint8_t, 32>& chain_id,
+                                          std::span<const std::uint8_t> init_mldsa_pub,
+                                          std::span<const std::uint8_t> resp_mldsa_pub) {
+    std::vector<std::uint8_t> out;
+    out.reserve(init_canonical.size() + resp_canonical.size() + 1 + chain_id.size() +
+                init_mldsa_pub.size() + resp_mldsa_pub.size());
+    out.insert(out.end(), init_canonical.begin(), init_canonical.end());
+    out.insert(out.end(), resp_canonical.begin(), resp_canonical.end());
+    out.push_back(profile);
+    out.insert(out.end(), chain_id.begin(), chain_id.end());
+    out.insert(out.end(), init_mldsa_pub.begin(), init_mldsa_pub.end());
+    out.insert(out.end(), resp_mldsa_pub.begin(), resp_mldsa_pub.end());
+    return out;
+}
+
+std::array<std::uint8_t, 48> transcript_hash(std::span<const std::uint8_t> transcript) {
+    auto x  = keccak::encode_string(transcript);
     auto re = keccak::right_encode(48ull * 8);
     x.insert(x.end(), re.begin(), re.end());
     std::array<std::uint8_t, 48> out{};
@@ -118,19 +153,18 @@ std::array<std::uint8_t, 48> hash_transcript(std::span<const std::uint8_t> trans
     return out;
 }
 
-std::array<std::uint8_t, 32> derive_aead_key(std::uint8_t scheme_id,
-                                             const std::array<std::uint8_t, 32>& shared_secret,
-                                             const std::array<std::uint8_t, 48>& transcript_hash) {
+std::array<std::uint8_t, 32> aead_key(std::uint8_t scheme,
+                                      const std::array<std::uint8_t, 32>& shared_secret,
+                                      const std::array<std::uint8_t, 48>& transcript) {
     std::vector<std::uint8_t> in;
-    in.push_back(scheme_id);
+    in.reserve(1 + shared_secret.size() + transcript.size());
+    in.push_back(scheme);
     in.insert(in.end(), shared_secret.begin(), shared_secret.end());
-    in.insert(in.end(), transcript_hash.begin(), transcript_hash.end());
+    in.insert(in.end(), transcript.begin(), transcript.end());
     std::array<std::uint8_t, 32> out{};
     keccak::cshake256(in, out, "KEMDerive", "NODE_AEAD_V1");
     return out;
 }
-
-}  // namespace
 
 std::array<std::uint8_t, 20> derive_node_id(std::span<const std::uint8_t> mldsa_pub,
                                             const std::array<std::uint8_t, 32>& chain_id) {
@@ -226,8 +260,8 @@ Outcome run_initiator(const Identity& id,
         int sig_len = int(sig.size());
         if (mldsa65_sign_ctx(reinterpret_cast<char*>(const_cast<std::uint8_t*>(id.secret_key().data())),
                              int(id.secret_key().size()),
-                             const_cast<char*>(kCtx.data()), int(kCtx.size()),
                              reinterpret_cast<char*>(init_prefix.data()), int(init_prefix.size()),
+                             const_cast<char*>(kCtx.data()), int(kCtx.size()),
                              reinterpret_cast<char*>(sig.data()), &sig_len) != 0) {
             out.error = "mldsa65_sign_ctx (INIT) failed";
             return out;
@@ -239,48 +273,84 @@ Outcome run_initiator(const Identity& id,
 
     write_frame(init_bytes);
 
-    // 4. Read and parse RESP.
+    // 4. Read and parse RESP. The transport call is the caller's to fail —
+    //    a Quiet or a closed link belongs to peer_tls and propagates — but
+    //    the bytes it returns are a stranger's, so a truncated or overlong
+    //    field is this function's `ok == false`, not an exception escaping
+    //    into a caller that has no better answer for it.
     const auto resp_bytes = read_frame();
-    Cursor r(resp_bytes);
-    const std::uint8_t resp_version = r.u8();
-    const std::uint8_t resp_profile = r.u8();
-    std::array<std::uint8_t, 32> resp_chain{};
-    r.fixed(resp_chain);
-    const std::uint8_t resp_kem_scheme = r.u8();
-    std::array<std::uint8_t, 20> resp_node_id{};
-    r.fixed(resp_node_id);
-    const auto resp_mldsa_pub = r.bytes();
-    const auto resp_kem_ct    = r.bytes();
-    const auto resp_sig       = r.bytes();
-    if (r.remaining() != 0) { out.error = "RESP has trailing bytes"; return out; }
 
+    std::uint8_t                 resp_version = 0, resp_profile = 0, resp_kem_scheme = 0;
+    std::array<std::uint8_t, 32> resp_chain{};
+    std::array<std::uint8_t, 20> resp_node_id{};
+    std::vector<std::uint8_t>    resp_mldsa_pub, resp_kem_ct, resp_sig;
+    try {
+        Cursor r(resp_bytes);
+        resp_version = r.u8();
+        resp_profile = r.u8();
+        r.fixed(resp_chain);
+        resp_kem_scheme = r.u8();
+        r.fixed(resp_node_id);
+        resp_mldsa_pub = r.bytes();
+        resp_kem_ct    = r.bytes();
+        resp_sig       = r.bytes();
+        if (r.remaining() != 0) { out.error = "RESP has trailing bytes"; return out; }
+    } catch (const std::exception& e) {
+        out.error = e.what();
+        return out;
+    }
+
+    // 5. Every cross-axis check, and every length, BEFORE any signature work
+    //    — Go's validateRemoteResp, in its order and for its stated reason:
+    //    a peer that sends garbage should not be able to spend this node's
+    //    ML-DSA verifier on it. The lengths are not a formality either;
+    //    these buffers cross into a cgo boundary that trusts them.
     if (resp_version != kProtocolVersionV1) { out.error = "RESP: unexpected ProtocolVersion"; return out; }
     if (resp_profile != kProfileStrictPQ) { out.error = "RESP: unexpected Profile"; return out; }
     if (resp_chain != chain_id) { out.error = "RESP: ChainID mismatch"; return out; }
     if (resp_kem_scheme != kKEMSchemeMLKEM768) { out.error = "RESP: unexpected KEMScheme"; return out; }
+    if (resp_node_id == std::array<std::uint8_t, 20>{}) { out.error = "RESP: NodeID is zero"; return out; }
+    if (resp_mldsa_pub.size() != std::size_t(mldsa65_pk_size())) {
+        out.error = "RESP: ML-DSA public key is the wrong size";
+        return out;
+    }
+    if (resp_kem_ct.size() != std::size_t(mlkem768_ct_size())) {
+        out.error = "RESP: KEM ciphertext is the wrong size";
+        return out;
+    }
+    if (resp_sig.size() != std::size_t(mldsa65_sig_size())) {
+        out.error = "RESP: signature is the wrong size";
+        return out;
+    }
 
-    // 5. resp.transcriptPrefix(init) = init.canonicalBytes() ++ RESP fields
-    //    up to (excluding) Sig.
-    std::vector<std::uint8_t> resp_prefix = init_bytes;  // init.canonicalBytes()
-    resp_prefix.push_back(resp_version);
-    resp_prefix.push_back(resp_profile);
-    resp_prefix.insert(resp_prefix.end(), resp_chain.begin(), resp_chain.end());
-    resp_prefix.push_back(resp_kem_scheme);
-    resp_prefix.insert(resp_prefix.end(), resp_node_id.begin(), resp_node_id.end());
-    append_lp(resp_prefix, resp_mldsa_pub);
-    append_lp(resp_prefix, resp_kem_ct);
+    // 6. What the responder signed is the WHOLE INIT followed by its own
+    //    fields up to (excluding) Sig — resp.transcriptPrefix(init). Its
+    //    canonicalBytes are those fields ALONE plus the signature: the two
+    //    byte strings share a tail, not a head, and conflating them puts
+    //    the INIT into the transcript twice.
+    std::vector<std::uint8_t> resp_fields;
+    resp_fields.push_back(resp_version);
+    resp_fields.push_back(resp_profile);
+    resp_fields.insert(resp_fields.end(), resp_chain.begin(), resp_chain.end());
+    resp_fields.push_back(resp_kem_scheme);
+    resp_fields.insert(resp_fields.end(), resp_node_id.begin(), resp_node_id.end());
+    append_lp(resp_fields, resp_mldsa_pub);
+    append_lp(resp_fields, resp_kem_ct);
+
+    std::vector<std::uint8_t> resp_prefix = init_bytes;
+    resp_prefix.insert(resp_prefix.end(), resp_fields.begin(), resp_fields.end());
 
     {
         static constexpr std::string_view kCtx = "NODE_PQ_HANDSHAKE_V1/responder";
         const int rc = mldsa65_verify_ctx(
             const_cast<char*>(reinterpret_cast<const char*>(resp_mldsa_pub.data())), int(resp_mldsa_pub.size()),
-            const_cast<char*>(kCtx.data()), int(kCtx.size()),
             const_cast<char*>(reinterpret_cast<const char*>(resp_prefix.data())), int(resp_prefix.size()),
+            const_cast<char*>(kCtx.data()), int(kCtx.size()),
             const_cast<char*>(reinterpret_cast<const char*>(resp_sig.data())), int(resp_sig.size()));
         if (rc != 0) { out.error = "responder signature failed"; return out; }
     }
 
-    // 6. Decapsulate to recover the shared secret.
+    // 7. Decapsulate to recover the shared secret.
     std::array<std::uint8_t, 32> shared_secret{};
     {
         int ss_len = int(shared_secret.size());
@@ -294,26 +364,22 @@ Outcome run_initiator(const Identity& id,
         }
     }
 
-    // 7. bindAEADTranscript(init, resp) = init.canonicalBytes() ++
-    //    resp.canonicalBytes() ++ Profile ++ ChainID ++ init.MLDSAPub ++
-    //    resp.MLDSAPub — then TupleHash256/cSHAKE256 into the 48-byte
-    //    TranscriptHash, then cSHAKE256 into the 32-byte AEAD key.
-    std::vector<std::uint8_t> resp_canonical = resp_prefix;
+    // 8. Bind both messages and both identities, hash, and derive the key.
+    std::vector<std::uint8_t> resp_canonical = resp_fields;
     append_lp(resp_canonical, resp_sig);
 
-    std::vector<std::uint8_t> full_transcript = init_bytes;
-    full_transcript.insert(full_transcript.end(), resp_canonical.begin(), resp_canonical.end());
-    full_transcript.push_back(kProfileStrictPQ);
-    full_transcript.insert(full_transcript.end(), chain_id.begin(), chain_id.end());
-    full_transcript.insert(full_transcript.end(), id.public_key().begin(), id.public_key().end());
-    full_transcript.insert(full_transcript.end(), resp_mldsa_pub.begin(), resp_mldsa_pub.end());
+    const auto bound  = bind_transcript(init_bytes, resp_canonical, kProfileStrictPQ, chain_id,
+                                        id.public_key(), resp_mldsa_pub);
+    const auto digest = transcript_hash(bound);
+    const auto key    = aead_key(kKEMSchemeMLKEM768, shared_secret, digest);
 
-    const auto transcript_hash = hash_transcript(full_transcript);
-    const auto aead_key        = derive_aead_key(kKEMSchemeMLKEM768, shared_secret, transcript_hash);
-
-    // 8. Bind the responder's claimed NodeID to the ML-DSA key it just
-    //    proved possession of — verifyPQIdentityBinding, same predicate
-    //    luxd applies to OUR init.
+    // 9. Bind the responder's claimed NodeID to the ML-DSA key it just
+    //    proved possession of — verifyPQIdentityBinding, the same predicate
+    //    luxd applies to OUR init. A signature over a transcript naming a
+    //    NodeID proves only that the signer chose to name it; this is what
+    //    ties the name to the key, and the chain id is `ids.Empty` here
+    //    because that is the domain a node's primary identity is derived
+    //    under.
     const auto derived = derive_node_id(resp_mldsa_pub);
     if (derived != resp_node_id) {
         out.error = "peer identity binding failed: claimed NodeID does not match its ML-DSA key";
@@ -321,9 +387,9 @@ Outcome run_initiator(const Identity& id,
     }
 
     out.ok             = true;
-    out.peer_node_id    = resp_node_id;
+    out.peer_node_id   = resp_node_id;
     out.peer_mldsa_pub = resp_mldsa_pub;
-    out.aead_key        = aead_key;
+    out.aead_key       = key;
     return out;
 }
 

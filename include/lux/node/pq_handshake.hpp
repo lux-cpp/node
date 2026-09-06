@@ -10,13 +10,22 @@
 // from (and running on top of) the TLS group negotiation `peer_tls.hpp`
 // already does.
 //
-// THIS LAYER IS NOT OPTIONAL ON THIS NETWORK. Verified empirically: a
-// bare-TLS peer (this crate's own classical p2p Handshake, sent without
-// this exchange first) completed the TLS 1.3 X25519MLKEM768 session six
-// times against a live luxd and was closed immediately after every time —
-// `network/network.go`'s security-profile resolution defaults to
-// STRICT_E2E_PQ whenever no genesis pin says otherwise (a hardening change
-// since node.rs's original proof, which ran classical-compat). See LLM.md.
+// WHETHER THIS LAYER RUNS IS A PROPERTY OF THE CHAIN, NOT OF THE PEER, and
+// the two answers are not interchangeable. `network/network.go`'s
+// `profileRequiresPQHandshake` runs it for `ProfileStrictPQ` and
+// `ProfileFIPS` and skips it entirely otherwise; a node whose genesis
+// carries no `securityProfile.json` pin boots classical-compat
+// (`node/node.go`'s `applySecurityProfile`). Guessing either way desyncs the
+// link on its first frame. Sent to a permissive peer, a 6512-byte INIT is
+// read as a p2p frame whose tag byte is 0x01, CompressedZstd, and fails to
+// decompress; withheld from a strict-PQ peer, the p2p Handshake frame is
+// read as an INIT whose first byte is the tag 0x04 and fails
+// `ErrHandshakeBadVersion`. Both end in an immediate close, which is the
+// observation behind the earlier note here that bare TLS "was closed every
+// time" — true, and true for the same reason in reverse. So the axis is a
+// parameter of `peer::Peer::connect`, never a default in this file. The
+// shipped pins are strict-PQ for mainnet, testnet and local/localnet, and
+// permissive for devnet.
 //
 // Why a NodeID derivation SEPARATE from `staking.hpp`'s: the classical
 // NodeID (hash160 of the TLS certificate) and this one (SHAKE256 of the
@@ -72,6 +81,51 @@ private:
 [[nodiscard]] std::array<std::uint8_t, 20> derive_node_id(std::span<const std::uint8_t> mldsa_pub,
                                                            const std::array<std::uint8_t, 32>& chain_id = {});
 
+// ── Framing (network/peer/pq_frame.go) ──────────────────────────────────
+// One INIT or RESP goes on the wire as a 4-byte big-endian length and that
+// many bytes, with no tag. It is the same shape the p2p wire uses and a
+// different rule: p2p counts its tag byte in the length and caps at 2 MiB,
+// this counts nothing extra and caps at 16 KiB. The largest legitimate
+// frame is 6896 bytes (ML-KEM-1024 INIT), so the cap refuses an allocation
+// a stranger asked for before making it.
+inline constexpr std::uint32_t kFrameMax = 16u * 1024u;
+
+// The bytes to write for one message. Throws if the payload is over the cap.
+[[nodiscard]] std::vector<std::uint8_t> frame(std::span<const std::uint8_t> payload);
+// How many bytes follow a frame header. Throws if the peer announced more
+// than the cap — refused before the buffer is allocated, as Go refuses it.
+[[nodiscard]] std::uint32_t body_size(std::span<const std::uint8_t, 4> header);
+
+// ── The key schedule (network/peer/handshake.go, network/kem/mlkem.go) ──
+// Three functions because Go has three, and because the concatenation
+// order below is the part of this protocol that no two-C++-ends test can
+// check: both sides would agree on the same wrong bytes. Each is a value a
+// known-answer test pins against the Go implementation directly.
+
+// `bindAEADTranscript`: the two wire messages, then profile, chain id and
+// both identity keys again. The repetition is Go's and is deliberate — a
+// disagreement about profile or chain surfaces here even if the encoding of
+// either message drifted. Note that `resp_canonical` is the RESPONSE ALONE,
+// which is not the same byte string the responder signs (that one carries
+// the whole INIT in front of it).
+[[nodiscard]] std::vector<std::uint8_t> bind_transcript(std::span<const std::uint8_t> init_canonical,
+                                                        std::span<const std::uint8_t> resp_canonical,
+                                                        std::uint8_t profile,
+                                                        const std::array<std::uint8_t, 32>& chain_id,
+                                                        std::span<const std::uint8_t> init_mldsa_pub,
+                                                        std::span<const std::uint8_t> resp_mldsa_pub);
+
+// `kem.HashTranscript`: SP 800-185 TupleHash256 with customization
+// "NODE_TRANSCRIPT_V1", over ONE tuple element — the arity every call site
+// in the peer handshake uses, so the general N-ary form is not reproduced.
+[[nodiscard]] std::array<std::uint8_t, 48> transcript_hash(std::span<const std::uint8_t> transcript);
+
+// `KEMSession.DeriveAEADKey`: cSHAKE256(N="KEMDerive", S="NODE_AEAD_V1")
+// over the scheme byte, the raw KEM secret and the transcript hash.
+[[nodiscard]] std::array<std::uint8_t, 32> aead_key(std::uint8_t scheme,
+                                                    const std::array<std::uint8_t, 32>& shared_secret,
+                                                    const std::array<std::uint8_t, 48>& transcript);
+
 // What a completed handshake proves and produces. `ok == false` means the
 // link must be dropped — there is no partial-trust state in this protocol.
 struct Outcome {
@@ -79,7 +133,12 @@ struct Outcome {
     std::string                   error;
     std::array<std::uint8_t, 20>  peer_node_id{};
     std::vector<std::uint8_t>     peer_mldsa_pub;
-    std::array<std::uint8_t, 32>  aead_key{};  // derived, not yet consumed — see LLM.md
+    // Derived, and deliberately not consumed: luxd stores this on the peer
+    // as `pqAEADKey` and encrypts nothing with it, so post-handshake p2p
+    // frames are plaintext inside TLS on both sides. Its value still
+    // matters — two ends that derived different keys disagreed about the
+    // transcript, which is what makes it worth returning and asserting on.
+    std::array<std::uint8_t, 32>  aead_key{};
 };
 
 // Runs the FULL initiator side over an already-open, already-TLS-upgraded

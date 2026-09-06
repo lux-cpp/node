@@ -1,8 +1,8 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// staking.hpp — the identity a luxd peer link is conducted under. Two keys,
-// answering two different questions, exactly as node.rs and Go keep them:
+// staking.hpp — the identity a luxd peer link is conducted under. Three keys,
+// answering three different questions, exactly as node.rs and Go keep them:
 //
 //   - a self-signed ECDSA P-256 certificate. `NodeID = ripemd160(sha256(cert
 //     DER))`, so the certificate IS the validator's name — a regenerated one
@@ -13,14 +13,24 @@
 //     `lux::consensus::bls::keygen`). It signs consensus votes (kVoteDST) and
 //     proves possession of itself (kPopDST) — both over the SAME curve as
 //     Go's `luxfi/crypto`, so a proof made here verifies there.
+//   - an ML-DSA-65 keypair, which signs the strict-PQ peer handshake and
+//     whose public half derives the NodeID that handshake binds. It is here
+//     rather than in a second identity object because that is what it is:
+//     Go's `config.StakingMLDSA`, sitting beside the staking certificate,
+//     and `NewLocalIdentityFromStakingKey` refuses anything else — an
+//     ephemeral per-process key signs a name no peer can find in the
+//     validator set.
 //
-// Both live under one directory, one file each, mode 0600: `staker.der` (the
-// certificate), `staker.key` (the EC private key, SEC1/DER), `bls.key` (the
-// raw 32-byte BLS secret). `open()` loads what is there and creates what is
-// not — it never regenerates a file that exists, because that would silently
-// change who this validator is.
+// All three live under one directory, one file each, mode 0600: `staker.der`
+// (the certificate), `staker.key` (the EC private key, SEC1/DER), `bls.key`
+// (the raw 32-byte BLS secret), `mldsa.pub.raw` and `mldsa.key.raw`.
+// `open()` loads what is there and creates what is not — it never regenerates
+// a file that exists, because that would silently change who this validator
+// is.
 
 #pragma once
+
+#include "lux/node/pq_handshake.hpp"
 
 #include <array>
 #include <cstdint>
@@ -67,6 +77,11 @@ public:
     [[nodiscard]] const std::array<std::uint8_t, 32>& bls_sk() const noexcept { return bls_sk_; }
     [[nodiscard]] const std::array<std::uint8_t, 48>& bls_pk() const noexcept { return bls_pk_; }
 
+    // The ML-DSA-65 half, for the strict-PQ peer handshake. Its `node_id()`
+    // is NOT `node_id()` above: one names this validator to the TLS layer,
+    // the other to a peer that completed the PQ handshake.
+    [[nodiscard]] const pq::Identity& mldsa() const noexcept { return mldsa_; }
+
     // 96-byte compressed BLS signature over `msg` under kPopDST — the one
     // primitive both proof-of-possession uses in this port need (see
     // `genesis_pop()` and the handshake's `bls_ip_pop()` below for the two
@@ -86,6 +101,7 @@ private:
     std::array<std::uint8_t, 20> node_id_{};
     std::array<std::uint8_t, 32> bls_sk_{};
     std::array<std::uint8_t, 48> bls_pk_{};
+    pq::Identity                 mldsa_;
     void* ec_key_ = nullptr;  // EC_KEY*, opaque here so this header stays free of AWS-LC's C API
 };
 

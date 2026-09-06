@@ -138,9 +138,13 @@ void Identity::close() noexcept {
     if (ec_key_) { EC_KEY_free(reinterpret_cast<EC_KEY*>(ec_key_)); ec_key_ = nullptr; }
 }
 
+// These are written out rather than defaulted for one reason — `ec_key_` is a
+// raw owning pointer — and they carry one hazard because of it: a member added
+// to the class and not to both of them is silently dropped on every move, and
+// `open()` returns by move. Every member below is here for that reason.
 Identity::Identity(Identity&& o) noexcept
     : cert_der_(std::move(o.cert_der_)), node_id_(o.node_id_), bls_sk_(o.bls_sk_), bls_pk_(o.bls_pk_),
-      ec_key_(o.ec_key_) {
+      mldsa_(std::move(o.mldsa_)), ec_key_(o.ec_key_) {
     o.ec_key_ = nullptr;
 }
 Identity& Identity::operator=(Identity&& o) noexcept {
@@ -150,6 +154,7 @@ Identity& Identity::operator=(Identity&& o) noexcept {
         node_id_  = o.node_id_;
         bls_sk_   = o.bls_sk_;
         bls_pk_   = o.bls_pk_;
+        mldsa_    = std::move(o.mldsa_);
         ec_key_   = o.ec_key_;
         o.ec_key_ = nullptr;
     }
@@ -199,6 +204,8 @@ Identity Identity::open(const std::filesystem::path& dir) {
     }
     if (lux::consensus::bls::sk_to_pk(id.bls_sk_.data(), id.bls_pk_.data()) != 0)
         throw std::runtime_error("staking: bls sk_to_pk failed");
+
+    id.mldsa_ = pq::Identity::open(dir);
 
     return id;
 }

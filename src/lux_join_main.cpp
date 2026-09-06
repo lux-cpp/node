@@ -62,6 +62,20 @@ bool parse_hex32(std::string s, std::array<std::uint8_t, 32>& out) {
     return true;
 }
 
+// The chain-wide security profile, taken from the same place luxd takes it:
+// the genesis pin for this network. luxfi/genesis ships a
+// `securityProfile.json` per network — profileID 1, strict-PQ, for mainnet
+// (1), testnet (2) and local/localnet (1337); profileID 2, permissive, for
+// devnet (3). A network this table does not name is treated as strict-PQ,
+// which is the safe direction for a wrong guess: offering the handshake to a
+// peer that does not run it fails loudly on the first frame, whereas
+// withholding it conducts the link over bare TLS without saying so, and that
+// silent downgrade is what the profile exists to prevent.
+lux::node::peer::Profile profile_of(std::uint32_t network_id) {
+    using lux::node::peer::Profile;
+    return network_id == 3 ? Profile::Permissive : Profile::StrictPQ;
+}
+
 bool split_host_port(const std::string& addr, std::string& host, std::uint16_t& port) {
     const auto pos = addr.rfind(':');
     if (pos == std::string::npos) return false;
@@ -111,9 +125,15 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
+    const auto profile = profile_of(network_id);
+
     auto id = lux::node::staking::Identity::open(staker_dir);
     std::printf("lux-join lux-join/v0.1.0 (C++)\n");
     std::printf("  identity      %s\n", id.node_id_string().c_str());
+    std::printf("  pq identity   %s\n",
+               ("NodeID-" + lux::node::staking::cb58(id.mldsa().node_id())).c_str());
+    std::printf("  profile       %s\n",
+               lux::node::peer::requires_pq(profile) ? "strict-pq" : "permissive");
     std::printf("  bls pubkey    0x%s\n", hex(std::span<const std::uint8_t>(id.bls_pk().data(), 48)).c_str());
     std::printf("  network       %u\n", network_id);
     std::printf("  chain id      0x%s\n", hex(std::span<const std::uint8_t>(chain_id.data(), 32)).c_str());
@@ -128,9 +148,13 @@ int main(int argc, char** argv) {
         try {
             std::printf("lux-join: dialing %s:%u ...\n", host.c_str(), staking_port);
             std::fflush(stdout);
-            auto peer = lux::node::peer::Peer::connect(host, staking_port, id, network_id, advertise_port,
-                                                        std::chrono::milliseconds(5000));
+            auto peer = lux::node::peer::Peer::connect(host, staking_port, id, profile, network_id,
+                                                        advertise_port, std::chrono::milliseconds(15000));
             std::printf("lux-join: TLS 1.3 (X25519MLKEM768) session established\n");
+            if (const auto& pq_peer = peer.peer_node_id(); pq_peer)
+                std::printf("lux-join: PQ handshake complete — peer is %s, this node is %s\n",
+                           ("NodeID-" + lux::node::staking::cb58(*pq_peer)).c_str(),
+                           ("NodeID-" + lux::node::staking::cb58(peer.node_id())).c_str());
             std::fflush(stdout);
 
             peer.join(std::chrono::milliseconds(15000));

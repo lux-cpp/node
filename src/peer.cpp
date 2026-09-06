@@ -64,10 +64,57 @@ std::vector<std::uint8_t> read_frame_body(peer_tls::Connection& conn, std::chron
 }  // namespace
 
 Peer Peer::connect(const std::string& host, std::uint16_t port, const staking::Identity& id,
-                   std::uint32_t network_id, std::uint16_t advertise_port,
-                   std::chrono::milliseconds tls_timeout) {
-    auto conn = peer_tls::Connection::connect(host, port, id.cert_der(), id.ec_key(), tls_timeout);
-    return Peer(std::move(conn), id, network_id, advertise_port);
+                   Profile profile, std::uint32_t network_id, std::uint16_t advertise_port,
+                   std::chrono::milliseconds timeout) {
+    auto conn = peer_tls::Connection::connect(host, port, id.cert_der(), id.ec_key(), timeout);
+    Peer p(std::move(conn), id, network_id, advertise_port);
+    if (requires_pq(profile)) p.secure(timeout);
+    return p;
+}
+
+// The strict-PQ handshake, over the session TLS has just established and
+// before a single p2p byte. `pq::run_initiator` owns the protocol and knows
+// nothing about this transport; the two lambdas below are the whole binding,
+// and they are the only place in this repository that writes a PQ frame.
+//
+// The dialer initiates, and that is not a preference: luxd assigns the role
+// by direction (`isIngress == false` initiates), so a peer this node dialled
+// is always the responder and there is nothing to negotiate.
+void Peer::secure(std::chrono::milliseconds deadline) {
+    const auto until = std::chrono::steady_clock::now() + deadline;
+    auto left = [&] {
+        const auto now = std::chrono::steady_clock::now();
+        return now >= until ? std::chrono::milliseconds(0)
+                            : std::chrono::duration_cast<std::chrono::milliseconds>(until - now);
+    };
+
+    const auto outcome = pq::run_initiator(
+        id_->mldsa(),
+        [&](std::span<const std::uint8_t> body) { conn_.write_all(pq::frame(body)); },
+        [&] {
+            std::array<std::uint8_t, 4> header{};
+            // Silence here is not the quiet of a healthy idle link: this side
+            // has already sent INIT, and luxd answers it before anything else
+            // it will ever send, so a deadline with nothing on it means the
+            // peer refused us rather than that it had nothing to say.
+            try {
+                conn_.read_exact(header, left());
+            } catch (const peer_tls::Quiet&) {
+                throw std::runtime_error("peer: luxd sent no PQ RESP");
+            }
+            std::vector<std::uint8_t> body(pq::body_size(header));
+            conn_.read_exact(body, left());
+            return body;
+        });
+
+    if (!outcome.ok) throw std::runtime_error("peer: PQ handshake refused: " + outcome.error);
+
+    // luxd has just replaced its notion of who is on this link with the
+    // key-derived NodeID, and so must this side: every later message that
+    // names this validator — the quorum vote above all — has to name it the
+    // way the peer now files it.
+    peer_node_id_ = outcome.peer_node_id;
+    node_id_      = id_->mldsa().node_id();
 }
 
 void Peer::send_handshake() {
@@ -211,9 +258,12 @@ void Peer::cast_vote(const Id& outer_id, const Id& canonical_id, const Id& paren
         return;
 
     // quorum::vote payload: nodeID(20) || sigLen(u32 BE) || sig — Go's
-    // chains/quorum.go `encodeSignedVote`.
+    // chains/quorum.go `encodeSignedVote`. The NodeID is the one this LINK
+    // is known by, which on a strict-PQ chain is the ML-DSA-derived one: a
+    // vote naming the TLS-cert NodeID after the PQ handshake has run names a
+    // validator luxd no longer has under that name.
     std::vector<std::uint8_t> payload;
-    payload.insert(payload.end(), id_->node_id().begin(), id_->node_id().end());
+    payload.insert(payload.end(), node_id_.begin(), node_id_.end());
     put_u32_be(payload, std::uint32_t(sig.size()));
     payload.insert(payload.end(), sig.begin(), sig.end());
 

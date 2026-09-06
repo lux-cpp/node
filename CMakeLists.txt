@@ -197,8 +197,9 @@ add_library(node STATIC
     src/rpc.cpp           # HTTP JSON-RPC
     src/eth.cpp           # the eth methods, mounted on an Rpc
     src/validators.cpp    # the set-root commitment a vote binds
-    src/staking.cpp        # a luxd peer's identity: P-256 cert + NodeID + BLS
+    src/staking.cpp        # a luxd peer's identity: P-256 cert + NodeID + BLS + ML-DSA
     src/peer_tls.cpp       # TLS 1.3 + X25519MLKEM768, over AWS-LC
+    src/keccak.cpp         # SHAKE256/cSHAKE256 and the SP 800-185 encodings under them
     src/pq_handshake.cpp   # ML-DSA-65 identity + ML-KEM-768 session, the strict-PQ link
     src/peer.cpp)          # the p2p Handshake/PushQuery/vote path to a live luxd
 target_include_directories(node PUBLIC include "${ZAP_DIR}")
@@ -260,9 +261,11 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #   chain_route     every spelling of a chain's path reaches that one chain
 #   archive_proxy   what a relayed answer's status is, when this node is a proxy
 #   block_reject    a block that is not accepted gives its transactions back
+#   pq_handshake    the strict-PQ peer handshake: Go's own answers to the three
+#                   derivations, then a full exchange over a real socket pair
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root chain_route archive_proxy block_reject)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root chain_route archive_proxy block_reject pq_handshake)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
