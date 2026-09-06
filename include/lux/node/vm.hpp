@@ -112,6 +112,15 @@ struct VM {
     // anything, and the height that seeds the decided-height frontier.
     virtual Id last_accepted() const = 0;                                     // Go LastAccepted
     virtual std::uint64_t last_accepted_height() const = 0;
+
+    // The highest height this node itself DECIDED, which is not always the
+    // height it has accepted: a chain that can import blocks moves its tip
+    // without a certificate under it, and the frontier is the part it signed
+    // for. For a chain that advances only through accept() the two are the
+    // same, which is why that is the default here — four of the chain VMs
+    // override it with exactly this body, and the one that grows an import
+    // path must answer with what it certified instead.
+    virtual std::uint64_t frontier() const { return last_accepted_height(); }
 };
 
 }  // namespace lux::node
