@@ -42,7 +42,7 @@ check() { if [[ "$2" == "$3" ]]; then echo "  ok    $1"; else echo "  FAIL  $1";
 rpc() { # rpc <node-index> <method> [params-json]
   curl -s --max-time 10 -X POST -H 'content-type: application/json' \
     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":${3:-[]}}" \
-    "http://127.0.0.1:$((RPC + $1))/v1/chain/C/rpc" \
+    "http://127.0.0.1:$((RPC + $1))/v1/chain/c/rpc" \
   | sed -n 's/.*"result":"\?\([^,"}]*\)"\?.*/\1/p'
 }
 
@@ -74,7 +74,7 @@ ROOT0=""
 for i in $(seq 0 $((N - 1))); do
   R="$(curl -s --max-time 10 -X POST -H 'content-type: application/json' \
         --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"$HEX\",false]}" \
-        "http://127.0.0.1:$((RPC + i))/v1/chain/C/rpc" \
+        "http://127.0.0.1:$((RPC + i))/v1/chain/c/rpc" \
       | sed -n 's/.*"stateRoot":"\([^"]*\)".*/\1/p')"
   [[ -z "$ROOT0" ]] && ROOT0="$R"
   check "node $i state root at block $HEX" "$R" "$ROOT0"
@@ -83,7 +83,7 @@ done
 echo "== the genesis root is a real root, not a constant =="
 G="$(curl -s --max-time 10 -X POST -H 'content-type: application/json' \
       --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x0",false]}' \
-      "http://127.0.0.1:$RPC/v1/chain/C/rpc" | sed -n 's/.*"stateRoot":"\([^"]*\)".*/\1/p')"
+      "http://127.0.0.1:$RPC/v1/chain/c/rpc" | sed -n 's/.*"stateRoot":"\([^"]*\)".*/\1/p')"
 if [[ "$G" =~ ^0x[0-9a-f]{64}$ && "$G" != "0x$(printf '0%.0s' {1..64})" ]]; then
   echo "  ok    genesis state root $G"
 else

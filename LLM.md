@@ -16,7 +16,7 @@ not in the quorum, so divergence stalls a height instead of forking it.
 ```
 $ curl -s -X POST -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
-    http://127.0.0.1:19850/v1/chain/C/rpc
+    http://127.0.0.1:19850/v1/chain/c/rpc
 {"id":1,"jsonrpc":"2.0","result":"0x7a69"}
 ```
 
