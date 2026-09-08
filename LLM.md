@@ -20,6 +20,70 @@ $ curl -s -X POST -H 'content-type: application/json' \
 {"id":1,"jsonrpc":"2.0","result":"0x7a69"}
 ```
 
+## The network is a file, not a convention
+
+`noded` used to take `--index I --n N --base-port P` and DERIVE its validator set
+from those three numbers. That set was a private convention: it could only ever
+agree with copies of itself that had been told the same three numbers, and an
+operator had no way to describe one network to more than one implementation. The
+flags are gone. What replaces them is the file the Rust node already reads:
+
+```
+noded --data DIR --publish                      # once per validator
+noded --committee FILE --peers a:p,b:p,... [--data DIR]
+```
+
+One line per validator, three hex fields, `#` starts a comment:
+
+```
+<identity>  the ML-DSA-65 public key it is NAMED by (its node id is
+            keccak256(identity)[..20])
+<key>       the 48-byte compressed BLS public key it votes with
+<proof>     its proof of possession over node ‖ key, CHECKED on load
+```
+
+Weight is 1 per validator. **File order is kept**, because `--peers` is
+positional against it — the third address belongs to the third line, and the
+entry at this node's own seat is where it listens. A node finds ITSELF by name:
+its seat is where its own identity sits, so two processes cannot be told they are
+the same validator, and no validator can be handed a seat it holds no key for.
+
+Refused, and by the same clauses the Rust reader refuses: a file with no
+validators, a line that is not three fields, a field that is not hex, a validator
+listed twice. Possession is refused at the door — `Committee::validators()` goes
+through `consensus::admit`, so a member whose proof does not bind its name to its
+key never reaches the gate.
+
+**The root is the same number in three languages.** `test/committee/four.txt` is
+a committee of four whose seats 0 and 2 the Rust node published and whose seats 1
+and 3 this one did. For that file:
+
+```
+C++   lux::node::Committee::root()          cd75055e…f40ba23f
+Rust  lux_node::engine::Committee::root()   cd75055e…f40ba23f
+Go    luxfi/validators SetRoot              cd75055e…f40ba23f
+```
+
+Computed, not asserted: the Go value came from a program importing
+`github.com/luxfi/validators` unmodified, the Rust one from a program with a path
+dependency on `lux-rs/node`. The Rust node also ADMITS all four — the C++-published
+proofs verify under its `ValidatorSet`, and the C++ node admits the Rust-published
+ones.
+
+Two things this does not yet buy, both measured:
+
+- **The link is not shared, only the description.** The Rust mesh speaks ZAP with
+  a post-quantum greeting; this one speaks a 4-byte big-endian index handshake.
+  Both daemons read the same committee and seat themselves in it; they cannot
+  form a mesh with each other.
+- **Two validators cannot decide anything.** `WaveConfig::feasible(2)` sizes the
+  committee at `kMinBFTCommittee` = 4 and asks for `two_thirds_count(4)` = 3
+  confirming votes, which 2 reachable validators can never cast; and
+  `cert.cpp` refuses a Quasar certificate outright below 4 seats. Run two
+  processes on a two-line committee and they publish, seat themselves, agree on
+  the set root, form the mesh — and report `height 1 NOT CERTIFIED before
+  deadline`. Four is the floor.
+
 ## Layer decomposition (decomplected — each layer is independently testable)
 
 ```
@@ -162,7 +226,7 @@ conan install ../../luxcpp/cevm -pr ../../luxcpp/cevm/.github/conan/manylinux-re
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=../../luxcpp/cevm/build-node/build/Release/generators/conan_toolchain.cmake
 cmake --build build -j
-ctest --test-dir build --output-on-failure    # 41: node, consensus, and cevm's parity gates
+ctest --test-dir build --output-on-failure    # 53: node, consensus, and cevm's parity gates
                                              # (evm-gethdiff skips without a geth to diff)
 ./scripts/chain.sh                            # 5 processes serving one C-Chain over JSON-RPC
 ./scripts/cluster.sh build/noded 19310 5      # 5 real PROCESSES, consensus only
@@ -185,6 +249,11 @@ differs (`consensus::Node` is `consensus::Party`, and its constructor no longer
 takes α). Use a worktree pinned to the commit you mean and pass
 `-DCONSENSUS_DIR`.
 
+- `committee_test` — the network description: the parse, the four refusals, the
+  seat, the root, and the possession proof. The fixtures are REAL FILES and half
+  of them were published by the Rust node, so "both read this" is a fact about
+  one artifact; the expected root is Go's, computed by a program importing
+  `luxfi/validators`, so the encoder is never compared to itself.
 - `frame_reader_test` — the reassembler alone: fragmentation, batching, the
   rejection latch, and the per-link frame cap.
 - `wire_vector_test` — the two formats node owns end to end, written as literal
@@ -237,6 +306,25 @@ asserted in a comment.
   error and three fields of exactly 32/48/96 bytes, zero trailing.
 - **The signed message and the floors** are consensus's, checked against the
   Go-generated corpus by `conformance_test`, which runs in this suite.
+- **The validator-set root** is `luxfi/validators SetRoot`, and the committee
+  file feeds it the same bytes the Go P-chain path would — the 20-byte node id,
+  weight big-endian, and the key UNCOMPRESSED.
+
+Two things found while pinning that root, both in trees this repo only reads:
+
+- **Go's own root depends on how Go was built.** `SetRoot` hashes whatever bytes
+  the caller hands it, and the caller hands it
+  `crypto/bls.PublicKeyToUncompressedBytes`, which returns blst's 96 bytes under
+  `//go:build cgo` and the COMPRESSED 48 under `//go:build !cgo`. The same source
+  over the same four validators: `cd75055e…f40ba23f` with cgo, `87db179d…8b2ba615` without. Two
+  Go nodes built differently commit to different roots and would refuse each
+  other's votes. Measured by building one program both ways.
+- **A validator has two names, and they disagree.** The committee names it
+  `keccak256(mldsa_pub)[..20]` (Rust `pq::name`, matched here); luxd's peer
+  handshake names the same key `SHAKE256("NODE_ID_V1" ‖ …)[..20]`
+  (`pq::derive_node_id`, `luxfi/ids NodeIDScheme.DeriveMLDSA`). Nothing reconciles
+  them, so a node's committee seat and the identity its link proves are different
+  20 bytes.
 
 ## What is real, and what is not (measured, not asserted)
 
