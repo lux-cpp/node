@@ -425,21 +425,51 @@ validator nobody seated is refused even though its handshake completes.
 Held to Go, not to itself: a C++ initiator completed a handshake against
 `mesh/peer.RunPQHandshakeConn` with the C++ daemon's own keypair, both ends
 derived `6c7de15f…0c5ba4f5`, and each derived the other's name identically. That
-exchange is `test/pq/handshake.json`.
+exchange is `test/pq/handshake.json`, made against the published libraries:
+`luxfi/node`'s `mesh/peer` as the responder (it resolves `luxfi/crypto v1.20.9`,
+though its handshake never calls it) and `luxfi/crypto v1.20.11` on this side.
 
 Three things about it worth knowing before touching it:
 
-- **`mldsa65_sign_ctx` takes the CONTEXT before the message.** The C++ had the
-  transcription the other way round, which links cleanly under C linkage and
-  makes the library answer -2 to every signature. Both the library and the tests
-  now `#include <libluxcrypto.h>` instead of restating the ABI.
+- **`mldsa65_sign_ctx` takes the MESSAGE before the context** — and two builds of
+  libluxcrypto have shipped with those two the other way round from each other.
+  The published library is message-first (and `v1.20.9` has no `_ctx` pair at
+  all); `~/work/lux/crypto` was for a while a stale snapshot with no remote whose
+  pair is context-first. This file has been on both sides of it, and the note
+  further down — "the C ABI arguments were transposed" — was right the first
+  time: it is the snapshot that is the outlier.
+
+  **A swap does not look like a swap.** FIPS 204 caps a CONTEXT at 255 bytes and
+  says nothing about message length, so with the two exchanged everything up to
+  255 bytes still signs and verifies and everything longer returns -2 — which
+  reads as a message-size limit. Measured against the published build:
+
+  ```
+  message length     1  100  254  255  256  512  3199  6512  9615  16384
+  correct order      0    0    0    0    0    0     0     0     0      0
+  swapped            0    0    0    0   -2   -2    -2    -2    -2     -2
+  ```
+
+  It is emphatically NOT `LUX_GPU_MLDSA_MSG_LEN_CAP`. That constant lives in an
+  accelerator plugin which is not loaded here; `backend.Resolved()` never returns
+  GPU without one, so `batchVerifyGPU` returns `(false, nil)` at its first gate
+  and the `ErrInvalidArgument` hard-error path is unreachable. With the order
+  right, the published library signs and verifies 16 KiB without complaint.
+
+  **Nothing in Go can catch it**, which is why it survived: `mesh/peer`'s
+  handshake signs through `cloudflare/circl` directly and never calls the C ABI.
+  That ABI exists for C++, Rust, Python and TypeScript, so no Go test exercises
+  it. Only a C caller can guard the order, so `pq_handshake_test` round-trips a
+  6512-byte sign and verify through it — and says out loud that a 255-byte one
+  proves nothing. Fixed in `luxfi/crypto` v1.20.11.
 - **Signing is deterministic, and it had to be made so.** LP-10602 mandates it
   and Go signs that way (`mldsa65.SignTo(..., randomized=false)`), but the C ABI
   offered only `SignCtx(rand.Reader, ...)`, so two signatures over one message
   differed and a published handshake could be checked and never reproduced.
-  `mldsa65_sign_ctx_det` was added to `luxfi/crypto`'s cabi for it. The vector
-  now carries both secrets and both signatures are RE-MADE and compared — the
-  responder's included, which is Go's own bytes.
+  `mldsa65_sign_ctx_det` is in `luxfi/crypto` v1.20.10, with its argument order
+  corrected to match its siblings in v1.20.11. The vector carries both secrets
+  and both signatures are RE-MADE and compared — the responder's included, which
+  is Go's own bytes.
 - **The link binds a peer's name at chain zero,** which is what Go does
   (`peer.go verifyPQIdentityBinding`) and what a name is. The chain the link
   carries scopes the session; the chain a committee line carries scopes the
