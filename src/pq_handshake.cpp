@@ -34,11 +34,21 @@ namespace {
 // THE ARGUMENT ORDER, SAID ONCE. Secret, then context, then message — cgo's
 // order, and the only order the library answers to. Everything else in this
 // file asks for a signature by name.
-std::vector<std::uint8_t> sign_ctx(std::span<const std::uint8_t> secret, std::string_view ctx,
-                                   std::span<const std::uint8_t> message) {
+//
+// AND IT IS THE DETERMINISTIC ENTRY POINT. FIPS 204 signing is hedged by
+// default and that is the right default in general — the per-signature
+// randomness is defence in depth against side-channel leakage. It is the wrong
+// one here: LP-10602 mandates deterministic signing so that a handshake can be
+// written down and reproduced, and Go's node signs it that way
+// (`mldsa65.SignTo(..., randomized=false)`). Signed hedged, this node could
+// verify a published vector and never reproduce one.
+}  // namespace
+
+std::vector<std::uint8_t> sign(std::span<const std::uint8_t> secret, std::string_view ctx,
+                               std::span<const std::uint8_t> message) {
     std::vector<std::uint8_t> sig(static_cast<std::size_t>(mldsa65_sig_size()));
     int                       len = int(sig.size());
-    const int                 rc  = mldsa65_sign_ctx(
+    const int                 rc  = mldsa65_sign_ctx_det(
         const_cast<char*>(reinterpret_cast<const char*>(secret.data())), int(secret.size()),
         const_cast<char*>(ctx.data()), int(ctx.size()),
         const_cast<char*>(reinterpret_cast<const char*>(message.data())), int(message.size()),
@@ -47,8 +57,6 @@ std::vector<std::uint8_t> sign_ctx(std::span<const std::uint8_t> secret, std::st
     sig.resize(std::size_t(len));
     return sig;
 }
-
-}  // namespace
 
 bool verify(std::span<const std::uint8_t> public_key, std::string_view ctx,
             std::span<const std::uint8_t> message, std::span<const std::uint8_t> sig) {
@@ -279,14 +287,14 @@ Outcome run_initiator(const Identity& id,
     init_prefix.push_back(kProfileStrictPQ);
     init_prefix.insert(init_prefix.end(), chain_id.begin(), chain_id.end());
     init_prefix.push_back(kKEMSchemeMLKEM768);
-    const auto me = id.node_id(chain_id);
+    const auto me = id.node_id();
     init_prefix.insert(init_prefix.end(), me.begin(), me.end());
     append_lp(init_prefix, id.public_key());
     append_lp(init_prefix, kem_pk);
 
     // 3. Sign the prefix under the initiator context, then append the
     //    length-prefixed signature to get canonicalBytes.
-    const std::vector<std::uint8_t> sig = sign_ctx(id.secret_key(), kContextInitiator, init_prefix);
+    const std::vector<std::uint8_t> sig = sign(id.secret_key(), kContextInitiator, init_prefix);
     if (sig.empty()) {
         out.error = "mldsa65_sign_ctx (INIT) failed";
         return out;
@@ -397,13 +405,13 @@ Outcome run_initiator(const Identity& id,
     //    NodeID proves only that the signer chose to name it; this is what
     //    ties the name to the key.
     //
-    //    ON THIS CHAIN, which is where this parts company with Go: `peer.go`
+    //    AT CHAIN ZERO, which is what Go does and what a name IS: `peer.go`
     //    derives the binding under `ids.Empty` whatever chain the handshake
-    //    carries, so it proves a name that is the same name on every network.
-    //    A committee names a validator OF a chain (LP-10603), so a link that
-    //    proved the chainless name would prove something the seat is not.
-    //    Identical to Go for the primary link, where the chain IS empty.
-    const auto derived = derive_node_id(resp_mldsa_pub, chain_id);
+    //    carries, because a node does not change its name when it joins another
+    //    chain. The chain the link carries scopes the SESSION; the chain a
+    //    committee line carries scopes the ENTITLEMENT (LP-10603). Neither of
+    //    them scopes the name.
+    const auto derived = derive_node_id(resp_mldsa_pub);
     if (derived != resp_node_id) {
         out.error = "peer identity binding failed: claimed NodeID does not match its ML-DSA key";
         return out;
@@ -476,7 +484,7 @@ Outcome run_responder(const Identity& id,
         out.error = "initiator signature failed";
         return out;
     }
-    if (derive_node_id(peer_mldsa_pub, chain_id) != peer_node_id) {
+    if (derive_node_id(peer_mldsa_pub) != peer_node_id) {
         out.error = "peer identity binding failed: claimed NodeID does not match its ML-DSA key";
         return out;
     }
@@ -499,7 +507,7 @@ Outcome run_responder(const Identity& id,
     }
 
     // 4. This node's own fields, signed with the WHOLE INIT in front of them.
-    const auto            me = id.node_id(chain_id);
+    const auto            me = id.node_id();
     std::vector<std::uint8_t> fields;
     fields.push_back(kProtocolVersionV1);
     fields.push_back(kProfileStrictPQ);
@@ -512,7 +520,7 @@ Outcome run_responder(const Identity& id,
     std::vector<std::uint8_t> signed_over = init_bytes;
     signed_over.insert(signed_over.end(), fields.begin(), fields.end());
 
-    const std::vector<std::uint8_t> sig = sign_ctx(id.secret_key(), kContextResponder, signed_over);
+    const std::vector<std::uint8_t> sig = sign(id.secret_key(), kContextResponder, signed_over);
     if (sig.empty()) {
         out.error = "mldsa65_sign_ctx (RESP) failed";
         return out;

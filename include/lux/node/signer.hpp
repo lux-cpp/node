@@ -8,9 +8,8 @@
 //
 //   identity   an ML-DSA-65 keypair (FIPS 204). The public half is what a
 //              committee line NAMES this validator by, and the node id is what
-//              that key derives ON A CHAIN — so the name and the key are the
-//              same fact, and the same key is a different validator on every
-//              network rather than a bearer credential on all of them.
+//              that key derives — one name, on every chain it serves, and the
+//              same one its links prove.
 //   consensus  a BLS12-381 secret. What a vote is signed with, and what the
 //              proof of possession in a committee line proves this node holds.
 //
@@ -44,10 +43,8 @@ public:
     // key does not start with a fresh one silently.
     [[nodiscard]] static Signer open(const std::filesystem::path& dir);
 
-    // The name this validator is known by on `chain`.
-    [[nodiscard]] Node node(const std::array<std::uint8_t, 32>& chain) const {
-        return identity_.node_id(chain);
-    }
+    // The name this validator is known by. There is one.
+    [[nodiscard]] Node node() const { return identity_.node_id(); }
 
     // The identity a link proves. One ML-DSA keypair in this process: the name
     // in the committee and the name on the wire are the same key, so they
@@ -58,9 +55,9 @@ public:
     [[nodiscard]] const lux::consensus::PubKey&       key() const noexcept { return key_; }
 
     // The line this validator publishes so others can put it in a committee of
-    // `chain`. The proof of possession is over this validator's OWN name on that
-    // chain, so a line published for one network is not a line on another: the
-    // proof there is over a name nobody derives.
+    // `chain`. The name in it is the same everywhere; the PROOF is over
+    // `chain ‖ node ‖ key`, so a line published for one network authorises
+    // nothing on another.
     [[nodiscard]] std::string publish(const std::array<std::uint8_t, 32>& chain) const;
 
 private:

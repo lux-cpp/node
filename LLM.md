@@ -41,14 +41,19 @@ One line per validator, three hex fields, `#` starts a comment:
 <proof>     its proof of possession over node ‖ key, CHECKED on load
 ```
 
-**A validator is named for a chain.** The id is `ids.NodeIDScheme.DeriveMLDSA`
-— `SHAKE256` over `left_encode`-framed `"NODE_ID_V1" ‖ chain ‖ scheme ‖ key`,
-first 20 bytes — the same derivation the link handshake proves, so the name in
-the file and the name on the wire are the same 20 bytes. The chain is not IN the
-file; it is in the derivation of every name, which is what stops a published
-line from being a bearer credential on every network at once. `--chain-id`
-decides who the file names, and reading it under another chain names four
-strangers whose proofs check against nothing.
+**One node, one name — and the chain is in the PROOF.** The id is
+`ids.NodeIDScheme.DeriveMLDSA` at chain ZERO — `SHAKE256` over
+`left_encode`-framed `"NODE_ID_V1" ‖ 0 ‖ scheme ‖ key`, first 20 bytes — which
+is the value Go's `node.Node` gives itself (`MyNodeID = DeriveNodeID(ids.Empty)`)
+and the one the link handshake re-derives to check a peer. A node does not
+change its name when it joins another chain.
+
+What is scoped is the ENTITLEMENT: the possession proof is signed over
+`chain ‖ node ‖ key`, so a line published for one network authorises nothing on
+another. `--chain-id` decides which chain a file is good on. Put the chain in
+the name instead and a node has as many names as it has chains; leave it out of
+both and a committee line is a bearer credential on every network at once
+(LP-10603).
 
 Weight is 1 per validator. **File order is kept**, because `--peers` is
 positional against it — the third address belongs to the third line, and the
@@ -62,26 +67,30 @@ listed twice. Possession is refused at the door — `Committee::validators()` go
 through `consensus::admit`, so a member whose proof does not bind its name to its
 key never reaches the gate.
 
-**The names and the root are Go's.** `test/committee/four.txt` is four lines
-this daemon published, read as a committee of the local C-Chain
-(`evm::chain_id(31337)` = `c066f0c6…c51ede87`):
+**The names and the root are the same in three languages.**
+`test/committee/four.txt` is four lines this daemon published, entitled on the
+local C-Chain (`evm::chain_id(31337)` = `c066f0c6…c51ede87`):
 
 ```
-C++   Committee::read(...).root()      33fb8fd2…3b12e5a2
-Go    luxfi/validators SetRoot         33fb8fd2…3b12e5a2
+C++   Committee::read(...).root()      de34e8d1…dfa696e7
+Rust  lux_node::engine::Committee       de34e8d1…dfa696e7
+Go    luxfi/validators SetRoot          de34e8d1…dfa696e7
 ```
 
-and the four names agree one for one with `ids.NodeIDScheme.DeriveMLDSA`.
-Computed, not asserted: the Go values come from a program importing
-`luxfi/validators` and `luxfi/ids` unmodified.
+and the four names agree one for one in all three. Computed, not asserted: the
+Go values come from a program importing `luxfi/validators` and `luxfi/ids`
+unmodified, the Rust one from a path dependency on `lux-rs/node`. Go also checks
+every proof over `chain ‖ node ‖ key` with its own `bls.VerifyProofOfPossession`
+and answers "proof holds on this chain" for all four — and "PROOF DOES NOT HOLD"
+for the same file read as a committee of another network.
 
-The Rust node reads the same file today and gets `28046095…7e1e4051`, then
-refuses the set with `PopInvalid` — it still names a validator
-`keccak256(identity)[..20]`, with no chain, so the proofs in the file are proofs
-over names it does not derive. That is the migration, not a disagreement: the
-same LP-10603 port is in flight there. `test/committee/unbound.txt` keeps a file
-from before the chain was in the name, and the C++ reader refuses it for exactly
-this reason.
+Rust computes the same names and the same root and then refuses the set with
+`PopInvalid`: it still checks the node-bound `node ‖ key` proof, where the file
+now carries the chain-scoped one. That is the remaining half of the LP-10603
+port, in flight there.
+
+`test/committee/elsewhere.txt` is those same four validators publishing for a
+different chain: the same names, and not one of them admitted here.
 
 Two validators still cannot decide anything, which has nothing to do with the
 file: `WaveConfig::feasible(2)` sizes the committee at `kMinBFTCommittee` = 4 and
@@ -384,12 +393,15 @@ Three findings came out of making that work:
   `dial tcp: address /tmp/luxd-vm-*/vm.sock: missing port in address`. That is
   why Go's socket path is opt-in, and this host matches Go rather than
   preferring the better transport.
-- **`luxcpp/zap-cpp-core`'s client cannot read a Go plugin's error.** Go writes
+- **`zap-cpp-core` could not read a Go plugin's error, and now can.** Go writes
   the error body RAW after the request id (`api/zap/transport.go:507`); the C++
-  `ZapClient` reads it as a length-prefixed string and, failing that, drops the
-  payload — so every real error arrives as `truncated error response`. The codec
-  (frames, `Reader`, `Writer`) is used as it stands; the call/answer pairing is
-  nine lines in `plugin.cpp` until the SDK is fixed.
+  server wrote and the client read a length-prefixed string, self-consistently,
+  so every C++-to-C++ test passed and every error from a Go peer arrived as
+  `truncated error response` with the message gone. Fixed in both halves on
+  `lux-cpp/zap-cpp-core` branch `net/error-body-is-raw`, with a conformance case
+  that pins the bytes rather than a round trip — a round trip is exactly what
+  missed it. `plugin.cpp` uses `ZapClient` again; the workaround is gone. **This
+  node needs that branch**: the header is consumed from the working tree.
 - **The execution state root does not cross this boundary.** `BlockResponse`
   carries id, parent, bytes, height and timestamp and no root, because Go's
   proposervm answers `ids.Empty` for that axis. A plugin-hosted chain must
@@ -421,17 +433,17 @@ Three things about it worth knowing before touching it:
   transcription the other way round, which links cleanly under C linkage and
   makes the library answer -2 to every signature. Both the library and the tests
   now `#include <libluxcrypto.h>` instead of restating the ABI.
-- **This node cannot sign deterministically.** LP-10602 asks for it and Go does it
-  (`mldsa65.SignTo(..., randomized=false)`); the C ABI goes through
-  `priv.SignCtx(rand.Reader, ...)`, so two signatures over one message differ.
-  Measured. A vector's signatures are therefore VERIFIED here, not reproduced —
-  which still pins every byte of the transcript they cover. A deterministic entry
-  point in `luxfi/crypto`'s cabi would close it.
-- **Go binds the peer's name under `ids.Empty`,** whatever chain the handshake
-  carries (`peer.go verifyPQIdentityBinding`). This binds it under the handshake's
-  chain, because a committee names a validator OF a chain and a link that proved
-  the chainless name would prove something the seat is not. Identical to Go on the
-  primary link, where the chain is empty.
+- **Signing is deterministic, and it had to be made so.** LP-10602 mandates it
+  and Go signs that way (`mldsa65.SignTo(..., randomized=false)`), but the C ABI
+  offered only `SignCtx(rand.Reader, ...)`, so two signatures over one message
+  differed and a published handshake could be checked and never reproduced.
+  `mldsa65_sign_ctx_det` was added to `luxfi/crypto`'s cabi for it. The vector
+  now carries both secrets and both signatures are RE-MADE and compared — the
+  responder's included, which is Go's own bytes.
+- **The link binds a peer's name at chain zero,** which is what Go does
+  (`peer.go verifyPQIdentityBinding`) and what a name is. The chain the link
+  carries scopes the session; the chain a committee line carries scopes the
+  entitlement; neither scopes the name.
 
 Two things found while pinning the set root, both in trees this repo only reads:
 
@@ -444,8 +456,8 @@ Two things found while pinning the set root, both in trees this repo only reads:
   other's votes. Measured by building one program both ways.
 - **A validator used to have two names.** The committee named it
   `keccak256(mldsa_pub)[..20]`; the link handshake named the same key
-  `SHAKE256("NODE_ID_V1" ‖ chain ‖ scheme ‖ key)[..20]`. It has one now, and it is
-  the second — the chain-bound one, which is `pq::derive_node_id` here and
+  `SHAKE256("NODE_ID_V1" ‖ 0 ‖ scheme ‖ key)[..20]`. It has one now, and it is
+  the second, which is `pq::derive_node_id` here and
   `ids.NodeIDScheme.DeriveMLDSA` in Go. There is one derivation in this tree and
   the committee calls it.
 

@@ -205,11 +205,11 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // THE CHAIN NAMES THE VALIDATORS. A committee line is a line about a
-    // validator OF a chain, so this is needed before the file is read and
-    // before this node knows its own name — and it is the same 32 bytes every
-    // vote carries, so a node cannot be a member of one network and vote on
-    // another.
+    // THE CHAIN A COMMITTEE LINE IS GOOD ON. It is not in the name — a node
+    // answers to one name everywhere — it is what every proof in the file is
+    // signed over, so a line published for another network authorises nothing
+    // here. Needed before the file is read, and it is the same 32 bytes every
+    // vote carries.
     const Id chain_id = evm::chain_id(eth);
 
     // The keys: everything else is named by them.
@@ -252,11 +252,11 @@ int main(int argc, char** argv) {
     // where its own identity is listed, so two processes cannot be told they
     // are the same validator, and a validator cannot be handed a seat it holds
     // no key for.
-    const auto seat = committee.seat(me.node(chain_id));
+    const auto seat = committee.seat(me.node());
     if (!seat) {
         std::fprintf(stderr,
                      "%s: this validator (%s) is not in %s; add the line --publish prints\n",
-                     prog, hex(me.node(chain_id)).c_str(), committee_path.c_str());
+                     prog, hex(me.node()).c_str(), committee_path.c_str());
         return 2;
     }
     const long index = long(*seat);
@@ -338,10 +338,10 @@ int main(int argc, char** argv) {
     evm::Chain& chain = *chainp;
 
     const std::uint16_t port = host.listen_bind();
-    std::printf("node %ld: chain %s — the network its validators are named for\n", index,
+    std::printf("node %ld: chain %s — the network its validators are entitled on\n", index,
                 hex(chain_id).c_str());
     std::printf("node %ld: validator %s, seat %ld of %ld in %s\n", index,
-                hex(me.node(chain_id)).c_str(), index, n, committee_path.c_str());
+                hex(me.node()).c_str(), index, n, committee_path.c_str());
     std::printf("node %ld: consensus 127.0.0.1:%u  chain C (eth chainId %llu)\n",
                 index, port, static_cast<unsigned long long>(chain.eth_chain_id()));
     std::printf("node %ld: genesis state root %s\n", index, hex(chain.state_root()).c_str());

@@ -17,8 +17,8 @@
 //     <identity> <key> <proof>
 //
 //   identity  the ML-DSA-65 public key this validator is NAMED by. Its name —
-//             its node id — is `pq::derive_node_id(identity, chain)`, so a
-//             validator cannot claim a name it cannot sign for.
+//             its node id — is `pq::derive_node_id(identity)`, so a validator
+//             cannot claim a name it cannot sign for.
 //   key       the 48-byte COMPRESSED BLS public key it votes with.
 //   proof     its proof of possession over node ‖ key, which is CHECKED when
 //             the set is built and not taken on trust.
@@ -27,13 +27,17 @@
 // ignored. Every validator carries weight 1: this file says who may vote, and
 // the stake a P-chain computed is a different fact from a different source.
 //
-// A COMMITTEE IS A COMMITTEE OF A CHAIN. The chain is not in the file; it is in
-// the DERIVATION of every name, so the same published line is a different
-// validator on every network. Take it out and a line is a bearer credential on
-// all of them at once: a set assembled for a test network is a set on the live
-// one, and a validator retired on one chain is still a validator on the next.
-// So `read` takes the chain, and a file read under the wrong one names four
-// strangers rather than four validators (LP-10603).
+// ONE NODE, ONE NAME, and the chain is in the PROOF. A name identifies and a
+// proof authorises, and it is the authorisation that is scoped: the node id is
+// derived at chain zero — the same value Go's `node.Node` gives itself, the
+// same one the peer link re-derives to check a peer — and the possession proof
+// is signed over `chain ‖ node ‖ key`. So a validator answers to one name
+// everywhere it serves, and a line published for one network proves nothing on
+// another. Put the chain in the NAME instead and a node changes its name when
+// it joins a second chain; leave it out of BOTH and a committee line is a
+// bearer credential on every network at once (LP-10603).
+//
+// `read` therefore takes the chain for the PROOF, not for the name.
 //
 // FILE ORDER IS KEPT, and that is load-bearing rather than incidental: a peer
 // list is POSITIONS (`--peers a:p,b:p,...`), so the third address belongs to
@@ -60,7 +64,7 @@ using lux::consensus::Node;
 
 // One validator, exactly as it published itself.
 struct Member {
-    Node                      node{};      // derive_node_id(identity, chain)
+    Node                      node{};      // derive_node_id(identity), chain zero
     std::uint64_t             weight = 1;  // one line, one vote
     std::vector<std::uint8_t> identity;    // ML-DSA-65 public key
     std::vector<std::uint8_t> key;         // compressed G1 BLS public key
@@ -69,7 +73,7 @@ struct Member {
 
 class Committee {
 public:
-    // Read what the validators published, as validators OF `chain`. Throws
+    // Read what the validators published, as validators entitled on `chain`. Throws
     // std::runtime_error naming the line and the clause that refused: a
     // malformed committee is not a smaller committee, it is a network this node
     // has not been told about.
@@ -91,8 +95,15 @@ public:
 
     [[nodiscard]] const std::vector<Member>& members() const noexcept { return members_; }
     [[nodiscard]] std::size_t                size() const noexcept { return members_.size(); }
-    // The chain these validators are validators OF.
+    // The chain these validators are entitled on — what their proofs are over.
     [[nodiscard]] const std::array<std::uint8_t, 32>& chain() const noexcept { return chain_; }
+
+    // The 100 bytes a committee proof is made over: `chain ‖ node ‖ key`. One
+    // statement of it, because the signer and the checker must agree exactly
+    // and they live in different files.
+    [[nodiscard]] static std::vector<std::uint8_t> claim(
+        const std::array<std::uint8_t, 32>& chain, const Node& node,
+        std::span<const std::uint8_t> key);
 
     // The commitment every vote binds — Go's encoding, over the UNCOMPRESSED
     // key. Computed by the one implementation this repo has of it
@@ -100,14 +111,15 @@ public:
     [[nodiscard]] Id root() const;
 
     // The weighted set the finality gate is built over, with every member's
-    // possession PROVEN — the same door, in the same order, that Rust's
-    // `ValidatorSet::insert` and Go's registration hold: no key, zero weight,
-    // possession, duplicate key, duplicate node, weight overflow. Throws
-    // std::runtime_error naming the clause and the validator it fell on.
+    // possession PROVEN over `chain ‖ node ‖ key`. The clauses are the ones a
+    // registration door holds, in the order it holds them — encoding, then
+    // possession, then one key per node and one node per key — and the message
+    // is the committee's rather than a registration's, which is the whole of
+    // what makes a line valid here and nowhere else. Throws std::runtime_error
+    // naming the clause and the validator it fell on.
     //
     // Ordered by compressed key rather than by file: the gate keys on the key,
-    // this is the order the door canonicalises to, and `seat()` above is the
-    // one place that answers a positional question.
+    // and `seat()` above is the one place that answers a positional question.
     [[nodiscard]] std::vector<lux::consensus::Validator> validators() const;
 
 private:

@@ -14,12 +14,12 @@
 // program that imports both packages unmodified — not by this code, which would
 // only prove this code is deterministic.
 //
-// AND THE NAMES ARE NAMES ON A CHAIN. Read the same file under a different
-// chain and it names four different validators with a different root, which is
-// the property that stops a published line from being a credential on every
-// network at once (LP-10603). `unbound.txt` is a file from before that was
-// true — lines whose proofs are over a name derived from the key alone — and it
-// is refused rather than half-read.
+// AND THE NAME IS THE SAME EVERYWHERE. A node answers to one name on every
+// chain it serves; what is scoped is the PROOF, which is signed over
+// `chain ‖ node ‖ key`. So the same file read as a committee of another network
+// names the same four validators — and admits none of them, because their
+// proofs authorise them here and nowhere else. `elsewhere.txt` is the mirror of
+// that: the same four, publishing for a different chain (LP-10603).
 
 #include "lux/node/committee.hpp"
 
@@ -54,9 +54,8 @@ std::string hex(std::span<const std::uint8_t> b) {
 std::string hex(const Id& id) { return hex(std::span<const std::uint8_t>(id.data(), id.size())); }
 std::string hex(const Node& n) { return hex(std::span<const std::uint8_t>(n.data(), n.size())); }
 
-// The chain those four are validators OF: the local C-Chain, whose 32-byte id
-// is `evm::chain_id(31337)`. It is not decoration — every name above is a
-// function of it.
+// The chain those four are ENTITLED on: the local C-Chain, whose 32-byte id is
+// `evm::chain_id(31337)`. It is not in any name above — it is in every proof.
 const std::array<std::uint8_t, 32> kChain = [] {
     std::array<std::uint8_t, 32> c{};
     const char*                  hex = "c066f0c6c80088c742bf27c7e3f8d5ad18a903a4162ba17dba4168e1c51ede87";
@@ -96,15 +95,15 @@ void refuses(const std::string& fixture, const std::string& because) {
 // ML-DSA public key each published. Independently computed: Go's
 // x/crypto/sha3.NewLegacyKeccak256 over the same file.
 const char* const kNames[] = {
-    "42eebf978769a20c42aa5e1c703fcbadcddf8806",
-    "9c7383ad3ca9820641e0babbca11862679f63cdd",
-    "38f6dbe13314653c4af4598a79f7e0f375a1c9a1",
-    "ccf17d93d74b9e7ce3c6b207f57dcd92a69ff10c",
+    "bafa8bdb0612e1c07161b50c705270b835a19b03",
+    "dbe40be3fb369a4a21bdbc92ffd15983f4904374",
+    "d34f2b65e4d42df87011e4b61dc669cf1a8df4da",
+    "21e1c5fb625cec5450231e6d922a42d734ea7329",
 };
 
 // github.com/luxfi/validators SetRoot over that committee, weight 1 each, keys
 // uncompressed — the number a Go validator would fold into every vote.
-const char* const kRoot = "33fb8fd25c96ed64ee11952cf49fb6bc8f522b510fe4aca2044792e53b12e5a2";
+const char* const kRoot = "de34e8d1948f90d09610c8737c6487d494e093ba01680f1a54095a1cdfa696e7";
 
 
 }  // namespace
@@ -138,44 +137,47 @@ int main() {
         std::printf("        %s\n", hex(root).c_str());
     }
 
-    // ── the chain is not decoration ─────────────────────────────────────────
+    // ── the name is not scoped; the proof is ────────────────────────────────
     {
         check(kChain == lux::node::evm::chain_id(31337),
               "the fixture chain is the local C-Chain's own id, not a constant");
-        // The SAME file, read as a committee of a different network. Every name
-        // moves, so the root moves: a line published for one chain names nobody
-        // on another, which is the whole of a committee file's scope.
-        std::array<std::uint8_t, 32> elsewhere{};
-        elsewhere.fill(0x11);
-        const Committee other = Committee::read(slurp("four.txt"), elsewhere);
-        bool             moved = other.size() == four.size();
-        for (std::size_t i = 0; i < other.size() && moved; ++i)
-            moved = other.members()[i].node != four.members()[i].node;
-        check(moved, "the same file under another chain names four other validators");
-        check(hex(other.root()) != kRoot, "and commits to another root");
-        std::printf("        %s\n", hex(other.root()).c_str());
-        // ...and those four cannot vote: their proofs are over names nobody
-        // derives here, so the door refuses the set rather than admitting it.
+
+        // THE SAME FILE, read as a committee of another network. The four names
+        // do not move — a node does not change its name when it joins a second
+        // chain — and neither does the root, which commits to names and keys.
+        // What moves is the entitlement: not one of them can vote there.
+        std::array<std::uint8_t, 32> another{};
+        another.fill(0x11);
+        const Committee there = Committee::read(slurp("four.txt"), another);
+        bool            same  = there.size() == four.size();
+        for (std::size_t i = 0; i < there.size() && same; ++i)
+            same = there.members()[i].node == four.members()[i].node;
+        check(same, "the same file on another chain names the same four validators");
+        check(hex(there.root()) == kRoot, "and commits to the same root");
         try {
-            (void)other.validators();
-            check(false, "a committee read under the wrong chain is refused");
+            (void)there.validators();
+            check(false, "and admits none of them");
         } catch (const std::exception& e) {
-            check(true, std::string("a committee read under the wrong chain is refused: ") + e.what());
+            check(true, std::string("and admits none of them: ") + e.what());
         }
     }
 
-    // ── a line from before the chain was in the name ────────────────────────
-    // unbound.txt was published when a validator's name was the hash of its key
-    // alone. The lines are well formed and the proofs are real; they are proofs
-    // over a different name, and this is what that looks like from here.
+    // ── a line published for somewhere else ─────────────────────────────────
+    // elsewhere.txt is these same four validators, publishing for a different
+    // chain. Same identities, same voting keys, same names — and proofs that
+    // authorise them there. Here they authorise nothing, which is the whole of
+    // what a committee file's scope is.
     {
-        const Committee unbound = Committee::read(slurp("unbound.txt"), kChain);
-        check(unbound.size() == 4, "an unbound file still parses: the shape did not change");
+        const Committee elsewhere = Committee::read(slurp("elsewhere.txt"), kChain);
+        bool            same      = elsewhere.size() == four.size();
+        for (std::size_t i = 0; i < elsewhere.size() && same; ++i)
+            same = elsewhere.members()[i].node == four.members()[i].node;
+        check(same, "a line published elsewhere names the same validator");
         try {
-            (void)unbound.validators();
-            check(false, "a proof over an unbound name is refused");
+            (void)elsewhere.validators();
+            check(false, "and is refused here");
         } catch (const std::exception& e) {
-            check(true, std::string("a proof over an unbound name is refused: ") + e.what());
+            check(true, std::string("and is refused here: ") + e.what());
         }
     }
 

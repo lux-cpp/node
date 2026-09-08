@@ -3,6 +3,7 @@
 
 #include "lux/node/plugin.hpp"
 
+#include "lux/zap/client.hpp"
 #include "lux/zap/wire.hpp"
 
 #include <arpa/inet.h>
@@ -15,7 +16,6 @@
 
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <stdexcept>
 
 extern char** environ;
@@ -156,70 +156,29 @@ private:
 };
 
 struct Chain::State {
-    int           fd    = -1;
-    ::pid_t       child = -1;
-    std::string   dir;          // the bootstrap socket's temp dir, if any
-    Start         with;
-    Id            accepted{};
-    std::uint64_t height = 0;
-    std::uint32_t next   = 0;   // the request id, which Go requires and matches on
-    std::mutex    writing;
+    lux::zap::ZapClient link;
+    ::pid_t             child = -1;
+    std::string         dir;          // the bootstrap socket's temp dir, if any
+    Start               with;
+    Id                  accepted{};
+    std::uint64_t       height = 0;
 
-    // ONE CALL, AND WHY IT IS NOT `lux::zap::ZapClient`.
-    //
-    // The codec below is the SDK's — its frames, its Reader and its Writer, so
-    // there is no second encoding of anything. What is NOT the SDK's is the
-    // call/answer pairing, and the reason is a defect: on an error frame
-    // `ZapClient` reads the body as a length-prefixed string
-    // (`client.hpp`: `elen` then `elen` bytes) and drops the payload. Go writes
-    // the error RAW — `conn.Write(reqID, msgType|MsgResponseFlag|MsgErrorFlag,
-    // []byte(err.Error()))` (`api/zap/transport.go:507`) — so every real error
-    // from a Go plugin comes back as "truncated error response" and the message
-    // is gone. Measured against the shipped EVM plugin.
-    //
-    // A chain that cannot say why it refused is a chain nobody can operate, so
-    // the pairing lives here until the SDK is fixed, and it is nine lines.
+    // One call, with the two refusals a caller cannot tell apart from outside
+    // told apart here: the transport failed, or the chain said no and said why.
     std::vector<std::uint8_t> call(std::uint8_t msg, const lux::zap::Writer& body,
                                    const char* what) {
-        std::lock_guard<std::mutex> one_at_a_time(writing);
-        const std::uint32_t         id = ++next;
-
-        std::vector<std::uint8_t> out;
-        out.reserve(4 + body.size());
-        out.push_back(std::uint8_t(id >> 24));
-        out.push_back(std::uint8_t(id >> 16));
-        out.push_back(std::uint8_t(id >> 8));
-        out.push_back(std::uint8_t(id));
-        out.insert(out.end(), body.data(), body.data() + body.size());
-
-        std::mutex unused;
-        if (!lux::zap::write_frame_locked(fd, unused, msg, out.data(), out.size()))
-            throw std::runtime_error(std::string(what) + ": the link went away");
-
-        std::uint8_t              type = 0;
-        std::vector<std::uint8_t> in;
-        if (!lux::zap::read_frame(fd, type, in) || in.size() < lux::zap::ReqIdSize)
-            throw std::runtime_error(std::string(what) + ": no answer");
-
-        const std::uint32_t answered = (std::uint32_t(in[0]) << 24) | (std::uint32_t(in[1]) << 16) |
-                                       (std::uint32_t(in[2]) << 8) | std::uint32_t(in[3]);
-        if (answered != id)
-            throw std::runtime_error(std::string(what) + ": answered another request");
-
-        std::vector<std::uint8_t> payload(in.begin() + lux::zap::ReqIdSize, in.end());
-        if (lux::zap::is_error(type))
-            throw std::runtime_error(std::string(what) + ": " +
-                                     std::string(payload.begin(), payload.end()));
-        if (lux::zap::strip_flags(type) != msg)
+        const auto r = link.call(msg, body);
+        if (r.is_error) throw std::runtime_error(std::string(what) + ": " + r.err_str);
+        if (lux::zap::strip_flags(r.resp_type) != msg)
             throw std::runtime_error(std::string(what) + ": answered a different message");
-        return payload;
+        return r.payload;
     }
 };
 
 Chain::Chain() : st_(std::make_unique<State>()) {}
 
 Chain::~Chain() {
-    if (st_->fd >= 0) { ::shutdown(st_->fd, SHUT_RDWR); ::close(st_->fd); }
+    st_->link.close();
     if (st_->child > 0) {
         ::kill(st_->child, SIGTERM);
         int status = 0;
@@ -308,7 +267,8 @@ std::unique_ptr<Chain> Chain::start(const std::filesystem::path& path, const Sta
     const std::string where(addr.begin(), addr.end());
     const int         fd = reach(where);
     if (fd < 0) throw std::runtime_error("plugin: cannot reach it at " + where);
-    chain->st_->fd = fd;
+    std::string err;
+    if (!chain->st_->link.attach(fd, err)) throw std::runtime_error("plugin: " + err);
 
     // Initialize, field for field with zapwire.InitializeRequest. The two
     // trailing server addresses are empty: those are handles onto live node

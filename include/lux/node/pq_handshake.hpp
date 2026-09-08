@@ -142,6 +142,14 @@ inline constexpr std::uint32_t kFrameMax = 16u * 1024u;
                                                     const std::array<std::uint8_t, 32>& shared_secret,
                                                     const std::array<std::uint8_t, 48>& transcript);
 
+// `secret`'s ML-DSA-65 signature over `message` under the FIPS 204 context
+// `ctx`, DETERMINISTIC — the same key, message and context always give the same
+// bytes, which is what lets a handshake be published as a vector and reproduced
+// rather than merely checked (LP-10602). Empty on failure.
+[[nodiscard]] std::vector<std::uint8_t> sign(std::span<const std::uint8_t> secret,
+                                             std::string_view              ctx,
+                                             std::span<const std::uint8_t> message);
+
 // Whether `sig` is `public_key`'s ML-DSA-65 signature over `message` under the
 // FIPS 204 context `ctx`. The one verification in this protocol, and public
 // because holding an implementation to a published handshake IS a verification

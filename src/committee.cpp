@@ -3,14 +3,16 @@
 
 #include "lux/node/committee.hpp"
 
-#include "lux/consensus/registration.hpp"  // admit — the one door a member enters by
+#include "lux/consensus/bls.hpp"           // key_validate, and the proof's domain tag
 #include "lux/node/pq_handshake.hpp"       // derive_node_id — the one naming rule
 #include "lux/node/validators.hpp"         // validator_set_root — the one commitment
 
 #include <blst.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
+#include <tuple>
 
 namespace lux::node {
 namespace {
@@ -73,7 +75,44 @@ std::vector<std::uint8_t> uncompressed(const std::vector<std::uint8_t>& key) {
     return out;
 }
 
+// Whether `proof` is `key`'s signature over `message` under the
+// proof-of-possession domain.
+//
+// NOT `bls::pop_verify`, and the difference is the message: that one builds
+// `node ‖ key` itself, which is the REGISTRATION proof and is pinned across
+// three languages by a frozen corpus. A committee proof covers the chain as
+// well, so the message is the caller's — which is exactly what `bls::pop_sign`
+// already assumes ("the CALLER decides what message a proof binds"). The
+// consensus surface exposes that general SIGN and only the specialised VERIFY;
+// until it exposes the pair, the pairing is here, under the tag that surface
+// publishes.
+bool proves(std::span<const std::uint8_t> message, const std::vector<std::uint8_t>& key,
+            const std::vector<std::uint8_t>& proof) {
+    blst_p1_affine pk;
+    blst_p2_affine sig;
+    if (key.size() != 48 || blst_p1_uncompress(&pk, key.data()) != BLST_SUCCESS) return false;
+    if (proof.size() != 96 || blst_p2_uncompress(&sig, proof.data()) != BLST_SUCCESS) return false;
+    // The identity and an off-subgroup point are refused as the encoding they
+    // are, not later as a pairing that happens to fail.
+    if (blst_p1_affine_is_inf(&pk) || !blst_p1_affine_in_g1(&pk)) return false;
+    if (blst_p2_affine_is_inf(&sig) || !blst_p2_affine_in_g2(&sig)) return false;
+    return blst_core_verify_pk_in_g1(
+               &pk, &sig, /*hash_or_encode=*/true, message.data(), message.size(),
+               reinterpret_cast<const byte*>(lux::consensus::bls::kPopDST),
+               lux::consensus::bls::kPopDSTLen, nullptr, 0) == BLST_SUCCESS;
+}
+
 }  // namespace
+
+std::vector<std::uint8_t> Committee::claim(const std::array<std::uint8_t, 32>& chain,
+                                           const Node& node, std::span<const std::uint8_t> key) {
+    std::vector<std::uint8_t> m;
+    m.reserve(chain.size() + node.size() + key.size());
+    m.insert(m.end(), chain.begin(), chain.end());
+    m.insert(m.end(), node.begin(), node.end());
+    m.insert(m.end(), key.begin(), key.end());
+    return m;
+}
 
 Committee Committee::read(std::string_view text, const std::array<std::uint8_t, 32>& chain) {
     Committee   c;
@@ -106,9 +145,10 @@ Committee Committee::read(std::string_view text, const std::array<std::uint8_t, 
         Member m;
         m.identity = decode(parts[0], number, "identity");
         // THE ONE NAMING RULE, and it is the handshake's: a validator's name is
-        // what its ML-DSA key derives on THIS chain, so the name in the file and
-        // the name the link proves are the same 20 bytes.
-        m.node     = pq::derive_node_id(m.identity, chain);
+        // what its ML-DSA key derives, at chain zero, so the name in the file
+        // and the name the link proves are the same 20 bytes — on every chain
+        // it serves.
+        m.node     = pq::derive_node_id(m.identity);
         m.weight   = 1;
         m.key      = decode(parts[1], number, "key");
         m.proof    = decode(parts[2], number, "proof");
@@ -148,17 +188,46 @@ Id Committee::root() const {
 }
 
 std::vector<lux::consensus::Validator> Committee::validators() const {
-    std::vector<lux::consensus::Registration> asking;
-    asking.reserve(members_.size());
-    for (const auto& m : members_)
-        asking.push_back(lux::consensus::Registration{m.node, m.key, m.proof, m.weight});
+    std::vector<lux::consensus::Validator> set;
+    set.reserve(members_.size());
 
-    lux::consensus::CanonicalSet   admitted;
-    const lux::consensus::Admission said = lux::consensus::admit(std::move(asking), admitted);
-    if (!said)
-        throw std::runtime_error(std::string(lux::consensus::admission_name(said.why)) + ": " +
-                                 encode(said.node));
-    return admitted.weights();
+    for (const auto& m : members_) {
+        const auto refuse = [&m](const char* why) {
+            throw std::runtime_error(std::string(why) + ": " + encode(m.node));
+        };
+
+        // ENCODING, then POSSESSION — the order a registration door holds them
+        // in, and for its reason: a member that is not a key at all should not
+        // reach the pairing. `key_validate` is the BLS spec's own clause plus
+        // Lux's fourth (one point, one encoding), so a second spelling of a key
+        // is refused here rather than admitted as a key no proof was made for.
+        if (m.key.size() != std::tuple_size_v<lux::consensus::PubKey>) refuse("no key");
+        if (!lux::consensus::bls::key_validate(m.key.data())) refuse("key encoding");
+        if (m.weight == 0) refuse("zero weight");
+        if (!proves(claim(chain_, m.node, m.key), m.key, m.proof)) refuse("possession");
+
+        lux::consensus::PubKey key{};
+        std::copy(m.key.begin(), m.key.end(), key.begin());
+
+        // ONE KEY PER NODE, ONE NODE PER KEY. Two seats behind one key is a
+        // quorum smaller than it looks; two keys behind one node is a node that
+        // can sign twice. `read` already refused a repeated name, so this is the
+        // key half — and it is checked over the CANONICAL spelling, which
+        // key_validate has just established.
+        for (const auto& seated : set)
+            if (seated.pubkey == key) refuse("duplicate key");
+
+        set.push_back(lux::consensus::Validator{key, m.weight});
+    }
+
+    // Canonical order: ascending by compressed key, which is what decides
+    // signature bit indices, so every node that admits the same file holds the
+    // same set in the same order.
+    std::sort(set.begin(), set.end(),
+              [](const lux::consensus::Validator& a, const lux::consensus::Validator& b) {
+                  return a.pubkey < b.pubkey;
+              });
+    return set;
 }
 
 }  // namespace lux::node

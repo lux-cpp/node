@@ -101,14 +101,10 @@ Signer Signer::open(const std::filesystem::path& dir) {
 }
 
 std::string Signer::publish(const std::array<std::uint8_t, 32>& chain) const {
-    const Node me = node(chain);
-
-    // The proof binds node ‖ key, 68 bytes, under the proof-of-possession
-    // domain — the message `bls::pop_verify` checks and the one the committee
-    // door will hold this line to.
-    std::array<std::uint8_t, lux::consensus::bls::kNodeLen + 48> message{};
-    std::copy(me.begin(), me.end(), message.begin());
-    std::copy(key_.begin(), key_.end(), message.begin() + lux::consensus::bls::kNodeLen);
+    // The proof binds chain ‖ node ‖ key under the proof-of-possession domain
+    // — Committee::claim, which is the one statement of those bytes, so the
+    // signer here and the checker there cannot drift.
+    const auto message = Committee::claim(chain, node(), key_);
 
     lux::consensus::Signature proof{};
     if (lux::consensus::bls::pop_sign(secret_.data(), message.data(), message.size(),

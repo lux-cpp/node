@@ -37,7 +37,7 @@ public:
         l.chain = chain_;
         l.seat  = [this](const std::array<std::uint8_t, 20>& who) -> std::optional<std::uint32_t> {
             for (std::uint32_t i = 0; i < ids_.size(); ++i)
-                if (ids_[i].node_id(chain_) == who) return i;
+                if (ids_[i].node_id() == who) return i;
             return std::nullopt;
         };
         return l;
@@ -52,7 +52,7 @@ public:
     }
 
     [[nodiscard]] std::array<std::uint8_t, 20> name(std::uint32_t seat) const {
-        return ids_[seat].node_id(chain_);
+        return ids_[seat].node_id();
     }
     [[nodiscard]] const std::array<std::uint8_t, 32>& chain() const noexcept { return chain_; }
 

@@ -16,15 +16,13 @@
 //   pqgo <pub> <priv> <chain> 127.0.0.1:PORT     # the Go responder, fixed keys
 //   pq_vector_test --against 127.0.0.1:PORT      # this, printing the vector
 //
-// WHAT IS VERIFIED RATHER THAN REPRODUCED. LP-10602 asks for deterministic
-// ML-DSA-65 so a signature is reproducible. Go signs deterministically
-// (`mldsa65.SignTo(..., randomized=false)`); the C ABI this node signs through
-// does not — `mldsa65_sign_ctx` calls `priv.SignCtx(rand.Reader, ...)`, so two
-// signatures over one message differ. Measured, not assumed. A signature is
-// therefore CHECKED here, not recomputed: the check is over a transcript this
-// code rebuilds from the frame, so a prefix that was one byte different would
-// fail it. Everything with no randomness in it — both prefixes, the binding,
-// the transcript hash and the session key — is recomputed and compared.
+// EVERY VALUE IS REPRODUCED, signatures included. That was not true when this
+// was written: the C ABI signed through `SignCtx(rand.Reader, ...)`, so two
+// signatures over one message differed and a published one could only be
+// checked. `mldsa65_sign_ctx_det` was added to `luxfi/crypto`'s cabi for
+// exactly this — LP-10602 mandates deterministic signing so a handshake can be
+// written down — and the vector carries both secrets, so both signatures are
+// re-made here and compared byte for byte against the ones on the wire.
 
 #include "lux/node/pq_handshake.hpp"
 
@@ -183,7 +181,8 @@ int generate(const std::string& against, const std::string& dir,
     j["init_frame"]    = hex(init_frame);
     j["resp_frame"]    = hex(resp_frame);
     j["responder_id"]  = hex(out.peer_node_id);
-    j["shared_secret"] = hex(out.shared_secret);
+    j["initiator_secret"] = hex(id.secret_key());
+    j["shared_secret"]    = hex(out.shared_secret);
     j["aead_key"]      = hex(out.aead_key);
     std::printf("%s\n", j.dump(2).c_str());
     return 0;
@@ -255,6 +254,25 @@ int main(int argc, char** argv) {
           "the responder's signature holds over init_bytes ‖ its own fields");
     check(!pq::verify(resp.mldsa_pub, pq::kContextInitiator, resp_prefix, resp.sig),
           "and not under the initiator's role");
+
+    // ── and both signatures, re-made ────────────────────────────────────────
+    // The strongest form of the check: not "this signature verifies over the
+    // prefix I rebuilt" but "signing that prefix gives back these exact bytes".
+    // It holds only because the signing is deterministic.
+    {
+        const auto secret = unhex(j["initiator_secret"].get<std::string>());
+        const auto again  = pq::sign(secret, pq::kContextInitiator, init_prefix);
+        check(again.size() == init.sig.size() &&
+                  std::equal(again.begin(), again.end(), init.sig.begin()),
+              "signing prefix_init again gives the signature on the wire");
+    }
+    {
+        const auto secret = unhex(j["responder_secret"].get<std::string>());
+        const auto again  = pq::sign(secret, pq::kContextResponder, resp_prefix);
+        check(again.size() == resp.sig.size() &&
+                  std::equal(again.begin(), again.end(), resp.sig.begin()),
+              "and signing prefix_resp gives the one GO put on the wire");
+    }
 
     // ── the binding, the hash, and the key ──────────────────────────────────
     const auto bound  = pq::bind_transcript(init_frame, resp_frame, init.profile, chain,
