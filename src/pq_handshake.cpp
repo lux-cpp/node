@@ -12,37 +12,50 @@
 #include <fstream>
 #include <stdexcept>
 
-// lux-crypto's C ABI (github.com/luxfi/crypto/bindings/cabi), transcribed
-// from the `libluxcrypto.h` that cgo generates beside the archive. The
-// transcription is the whole risk here: these have C linkage, so a
-// declaration whose PARAMETER ORDER disagrees with the definition links
-// cleanly and the arguments simply arrive in the wrong registers. The `_ctx`
-// pair takes the message BEFORE the context; this file had them the other
-// way round, which signed the context string under the transcript as
-// context. Nothing caught it because nothing called it.
+// lux-crypto's C ABI, INCLUDED rather than transcribed.
+//
+// These have C linkage, so a hand-written declaration whose parameter order
+// disagrees with the definition links cleanly and the arguments arrive in the
+// wrong registers. That is not hypothetical: this file carried a transcription
+// with the message before the context, which is the opposite of what cgo
+// generates, and the library answered -2 to every signature it was asked for.
+// The header that ships beside the archive is the one statement of the ABI, so
+// it is the one this file reads.
 //
 // The `_ctx` variants exist because the unqualified mldsa65_sign/verify
 // hardcode an EMPTY FIPS 204 context, and the same bytes signed under a
 // different context are a different signature.
-extern "C" {
-int mlkem768_keypair(char* pk, int* pkLen, char* sk, int* skLen);
-int mlkem768_decapsulate(char* skData, int skLen, char* ctData, int ctLen, char* ss, int* ssLen);
-int mlkem768_pk_size();
-int mlkem768_sk_size();
-int mlkem768_ct_size();
-int mldsa65_keypair(char* pk, int* pkLen, char* sk, int* skLen);
-int mldsa65_sign_ctx(char* skData, int skLen, char* msgData, int msgLen, char* ctxData, int ctxLen,
-                     char* sig, int* sigLen);
-int mldsa65_verify_ctx(char* pkData, int pkLen, char* msgData, int msgLen, char* ctxData, int ctxLen,
-                       char* sigData, int sigLen);
-int mldsa65_pk_size();
-int mldsa65_sk_size();
-int mldsa65_sig_size();
-}
+#include <libluxcrypto.h>
 
 namespace lux::node::pq {
 
 namespace {
+
+// THE ARGUMENT ORDER, SAID ONCE. Secret, then context, then message — cgo's
+// order, and the only order the library answers to. Everything else in this
+// file asks for a signature by name.
+std::vector<std::uint8_t> sign_ctx(std::span<const std::uint8_t> secret, std::string_view ctx,
+                                   std::span<const std::uint8_t> message) {
+    std::vector<std::uint8_t> sig(static_cast<std::size_t>(mldsa65_sig_size()));
+    int                       len = int(sig.size());
+    const int                 rc  = mldsa65_sign_ctx(
+        const_cast<char*>(reinterpret_cast<const char*>(secret.data())), int(secret.size()),
+        const_cast<char*>(ctx.data()), int(ctx.size()),
+        const_cast<char*>(reinterpret_cast<const char*>(message.data())), int(message.size()),
+        reinterpret_cast<char*>(sig.data()), &len);
+    if (rc != 0) return {};
+    sig.resize(std::size_t(len));
+    return sig;
+}
+
+bool verify_ctx(std::span<const std::uint8_t> public_key, std::string_view ctx,
+                std::span<const std::uint8_t> message, std::span<const std::uint8_t> sig) {
+    return mldsa65_verify_ctx(
+               const_cast<char*>(reinterpret_cast<const char*>(public_key.data())), int(public_key.size()),
+               const_cast<char*>(ctx.data()), int(ctx.size()),
+               const_cast<char*>(reinterpret_cast<const char*>(message.data())), int(message.size()),
+               const_cast<char*>(reinterpret_cast<const char*>(sig.data())), int(sig.size())) == 0;
+}
 
 void write_private(const std::filesystem::path& path, std::span<const std::uint8_t> data) {
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -254,19 +267,10 @@ Outcome run_initiator(const Identity& id,
 
     // 3. Sign the prefix under the initiator context, then append the
     //    length-prefixed signature to get canonicalBytes.
-    std::vector<std::uint8_t> sig(static_cast<std::size_t>(mldsa65_sig_size()));
-    {
-        static constexpr std::string_view kCtx = "NODE_PQ_HANDSHAKE_V1/initiator";
-        int sig_len = int(sig.size());
-        if (mldsa65_sign_ctx(reinterpret_cast<char*>(const_cast<std::uint8_t*>(id.secret_key().data())),
-                             int(id.secret_key().size()),
-                             reinterpret_cast<char*>(init_prefix.data()), int(init_prefix.size()),
-                             const_cast<char*>(kCtx.data()), int(kCtx.size()),
-                             reinterpret_cast<char*>(sig.data()), &sig_len) != 0) {
-            out.error = "mldsa65_sign_ctx (INIT) failed";
-            return out;
-        }
-        sig.resize(std::size_t(sig_len));
+    const std::vector<std::uint8_t> sig = sign_ctx(id.secret_key(), kContextInitiator, init_prefix);
+    if (sig.empty()) {
+        out.error = "mldsa65_sign_ctx (INIT) failed";
+        return out;
     }
     std::vector<std::uint8_t> init_bytes = init_prefix;
     append_lp(init_bytes, sig);
@@ -340,14 +344,9 @@ Outcome run_initiator(const Identity& id,
     std::vector<std::uint8_t> resp_prefix = init_bytes;
     resp_prefix.insert(resp_prefix.end(), resp_fields.begin(), resp_fields.end());
 
-    {
-        static constexpr std::string_view kCtx = "NODE_PQ_HANDSHAKE_V1/responder";
-        const int rc = mldsa65_verify_ctx(
-            const_cast<char*>(reinterpret_cast<const char*>(resp_mldsa_pub.data())), int(resp_mldsa_pub.size()),
-            const_cast<char*>(reinterpret_cast<const char*>(resp_prefix.data())), int(resp_prefix.size()),
-            const_cast<char*>(kCtx.data()), int(kCtx.size()),
-            const_cast<char*>(reinterpret_cast<const char*>(resp_sig.data())), int(resp_sig.size()));
-        if (rc != 0) { out.error = "responder signature failed"; return out; }
+    if (!verify_ctx(resp_mldsa_pub, kContextResponder, resp_prefix, resp_sig)) {
+        out.error = "responder signature failed";
+        return out;
     }
 
     // 7. Decapsulate to recover the shared secret.

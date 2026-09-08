@@ -45,22 +45,10 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-// The responder half of the C ABI. `mlkem768_encapsulate` is deliberately
-// absent from the node library: nothing in this node responds to a PQ
-// handshake, and declaring a primitive the production path never calls is how
-// a stub becomes permanent.
-extern "C" {
-int mlkem768_encapsulate(char* pkData, int pkLen, char* ct, int* ctLen, char* ss, int* ssLen);
-int mldsa65_keypair(char* pk, int* pkLen, char* sk, int* skLen);
-int mldsa65_sign_ctx(char* skData, int skLen, char* msgData, int msgLen, char* ctxData, int ctxLen,
-                     char* sig, int* sigLen);
-int mldsa65_verify_ctx(char* pkData, int pkLen, char* msgData, int msgLen, char* ctxData, int ctxLen,
-                       char* sigData, int sigLen);
-int mldsa65_pk_size();
-int mldsa65_sk_size();
-int mldsa65_sig_size();
-int mlkem768_ct_size();
-}
+// The C ABI, from the header cgo generates beside the archive. Transcribing it
+// by hand is what put the message before the context in two files at once —
+// C linkage, so the wrong order links and the library simply answers -2.
+#include <libluxcrypto.h>
 
 namespace pq = lux::node::pq;
 
@@ -201,8 +189,9 @@ struct Responder {
             init_signature_ok =
                 mldsa65_verify_ctx(reinterpret_cast<char*>(const_cast<std::uint8_t*>(init_mldsa_pub.data())),
                                    int(init_mldsa_pub.size()),
+                                   const_cast<char*>(kCtx.data()), int(kCtx.size()),
                                    reinterpret_cast<char*>(const_cast<std::uint8_t*>(init.data())),
-                                   int(prefix_len), const_cast<char*>(kCtx.data()), int(kCtx.size()),
+                                   int(prefix_len),
                                    reinterpret_cast<char*>(const_cast<std::uint8_t*>(init_sig.data())),
                                    int(init_sig.size())) == 0;
         }
@@ -241,8 +230,8 @@ struct Responder {
             static constexpr std::string_view kCtx = "NODE_PQ_HANDSHAKE_V1/responder";
             int sig_len = int(sig.size());
             if (mldsa65_sign_ctx(reinterpret_cast<char*>(sk.data()), int(sk.size()),
-                                 reinterpret_cast<char*>(signed_over.data()), int(signed_over.size()),
                                  const_cast<char*>(kCtx.data()), int(kCtx.size()),
+                                 reinterpret_cast<char*>(signed_over.data()), int(signed_over.size()),
                                  reinterpret_cast<char*>(sig.data()), &sig_len) != 0)
                 throw std::runtime_error("mldsa65_sign_ctx failed");
             sig.resize(std::size_t(sig_len));

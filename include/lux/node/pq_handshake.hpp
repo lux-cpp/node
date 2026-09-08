@@ -45,6 +45,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace lux::node::pq {
@@ -56,6 +57,13 @@ namespace lux::node::pq {
 inline constexpr std::uint8_t kKEMSchemeMLKEM768 = 0x01;
 inline constexpr std::uint8_t kProfileStrictPQ    = 0x01;
 inline constexpr std::uint8_t kProtocolVersionV1  = 0x01;
+
+// THE ROLE IS PART OF THE SIGNED MESSAGE, and that is the whole of the replay
+// argument: without it a responder's signature is a well-formed initiator's
+// signature over the same bytes. The version is in there for the same reason,
+// one protocol version ahead.
+inline constexpr std::string_view kContextInitiator = "NODE_PQ_HANDSHAKE_V1/initiator";
+inline constexpr std::string_view kContextResponder = "NODE_PQ_HANDSHAKE_V1/responder";
 
 // This validator's post-quantum identity: an ML-DSA-65 keypair, persisted
 // (mode 0600) exactly like `staking::Identity`'s BLS key — regenerating it
