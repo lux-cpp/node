@@ -3,7 +3,8 @@
 
 #include "lux/node/signer.hpp"
 
-#include "lux/consensus/bls.hpp"  // keygen, sk_to_pk, pop_sign — one BLS surface
+#include "lux/consensus/bls.hpp"     // keygen, sk_to_pk, pop_sign — one BLS surface
+#include "lux/node/pq_handshake.hpp"  // derive_node_id — the one naming rule
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -12,14 +13,11 @@
 #include <span>
 #include <stdexcept>
 
-// libluxcrypto's C ABI — the same ML-DSA-65 the Go and Rust nodes are named by.
-// Symbol names as the library exports them (no prefix); confirmed against
-// `nm -D libluxcrypto.so`.
-extern "C" {
-int mldsa65_keypair(char* pk, int* pkLen, char* sk, int* skLen);
-int mldsa65_pk_size();
-int mldsa65_sk_size();
-}
+// libluxcrypto's C ABI — the same ML-DSA-65 the Go and Rust nodes are named by,
+// declared by the header cgo generates beside the archive rather than by hand.
+// A transcription of a C-linkage declaration is a thing that can be wrong and
+// still link; this file does not have one.
+#include <libluxcrypto.h>
 
 namespace lux::node {
 namespace {
@@ -112,8 +110,6 @@ Signer Signer::open(const std::filesystem::path& dir) {
         k.identity_ = std::move(pk);
         k.signer_   = std::move(sk);
     }
-    k.node_ = name(k.identity_);
-
     // The vote.
     if (std::filesystem::exists(vote_at)) {
         const auto raw = read_whole(vote_at);
@@ -134,12 +130,18 @@ Signer Signer::open(const std::filesystem::path& dir) {
     return k;
 }
 
-std::string Signer::publish() const {
+Node Signer::node(const std::array<std::uint8_t, 32>& chain) const {
+    return pq::derive_node_id(identity_, chain);
+}
+
+std::string Signer::publish(const std::array<std::uint8_t, 32>& chain) const {
+    const Node me = node(chain);
+
     // The proof binds node ‖ key, 68 bytes, under the proof-of-possession
     // domain — the message `bls::pop_verify` checks and the one the committee
     // door will hold this line to.
     std::array<std::uint8_t, lux::consensus::bls::kNodeLen + 48> message{};
-    std::copy(node_.begin(), node_.end(), message.begin());
+    std::copy(me.begin(), me.end(), message.begin());
     std::copy(key_.begin(), key_.end(), message.begin() + lux::consensus::bls::kNodeLen);
 
     lux::consensus::Signature proof{};

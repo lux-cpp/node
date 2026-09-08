@@ -374,15 +374,17 @@ Chain::Chain(Genesis genesis) : st_(std::make_unique<State>()) {
 
 Chain::~Chain() = default;
 
-Id Chain::chain_id() const {
+Id chain_id(std::uint64_t eth) {
     // The consensus chain id is the keccak of the EVM chain id under a fixed
     // label, so the two ids are one decision: a chain cannot be configured with
     // an EVM id of 31337 and a consensus id belonging to some other chain.
     std::vector<std::uint8_t> tag{'l', 'u', 'x', '-', 'e', 'v', 'm', ':'};
     for (int i = 7; i >= 0; --i)
-        tag.push_back(static_cast<std::uint8_t>((st_->genesis.chain_id >> (i * 8)) & 0xff));
+        tag.push_back(static_cast<std::uint8_t>((eth >> (i * 8)) & 0xff));
     return keccak(tag);
 }
+
+Id Chain::chain_id() const { return evm::chain_id(st_->genesis.chain_id); }
 
 std::uint64_t Chain::eth_chain_id() const noexcept { return st_->genesis.chain_id; }
 

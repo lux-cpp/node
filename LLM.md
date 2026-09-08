@@ -36,11 +36,19 @@ noded --committee FILE --peers a:p,b:p,... [--data DIR]
 One line per validator, three hex fields, `#` starts a comment:
 
 ```
-<identity>  the ML-DSA-65 public key it is NAMED by (its node id is
-            keccak256(identity)[..20])
+<identity>  the ML-DSA-65 public key it is NAMED by
 <key>       the 48-byte compressed BLS public key it votes with
 <proof>     its proof of possession over node ‖ key, CHECKED on load
 ```
+
+**A validator is named for a chain.** The id is `ids.NodeIDScheme.DeriveMLDSA`
+— `SHAKE256` over `left_encode`-framed `"NODE_ID_V1" ‖ chain ‖ scheme ‖ key`,
+first 20 bytes — the same derivation the link handshake proves, so the name in
+the file and the name on the wire are the same 20 bytes. The chain is not IN the
+file; it is in the derivation of every name, which is what stops a published
+line from being a bearer credential on every network at once. `--chain-id`
+decides who the file names, and reading it under another chain names four
+strangers whose proofs check against nothing.
 
 Weight is 1 per validator. **File order is kept**, because `--peers` is
 positional against it — the third address belongs to the third line, and the
@@ -54,35 +62,34 @@ listed twice. Possession is refused at the door — `Committee::validators()` go
 through `consensus::admit`, so a member whose proof does not bind its name to its
 key never reaches the gate.
 
-**The root is the same number in three languages.** `test/committee/four.txt` is
-a committee of four whose seats 0 and 2 the Rust node published and whose seats 1
-and 3 this one did. For that file:
+**The names and the root are Go's.** `test/committee/four.txt` is four lines
+this daemon published, read as a committee of the local C-Chain
+(`evm::chain_id(31337)` = `c066f0c6…c51ede87`):
 
 ```
-C++   lux::node::Committee::root()          cd75055e…f40ba23f
-Rust  lux_node::engine::Committee::root()   cd75055e…f40ba23f
-Go    luxfi/validators SetRoot              cd75055e…f40ba23f
+C++   Committee::read(...).root()      33fb8fd2…3b12e5a2
+Go    luxfi/validators SetRoot         33fb8fd2…3b12e5a2
 ```
 
-Computed, not asserted: the Go value came from a program importing
-`github.com/luxfi/validators` unmodified, the Rust one from a program with a path
-dependency on `lux-rs/node`. The Rust node also ADMITS all four — the C++-published
-proofs verify under its `ValidatorSet`, and the C++ node admits the Rust-published
-ones.
+and the four names agree one for one with `ids.NodeIDScheme.DeriveMLDSA`.
+Computed, not asserted: the Go values come from a program importing
+`luxfi/validators` and `luxfi/ids` unmodified.
 
-Two things this does not yet buy, both measured:
+The Rust node reads the same file today and gets `28046095…7e1e4051`, then
+refuses the set with `PopInvalid` — it still names a validator
+`keccak256(identity)[..20]`, with no chain, so the proofs in the file are proofs
+over names it does not derive. That is the migration, not a disagreement: the
+same LP-10603 port is in flight there. `test/committee/unbound.txt` keeps a file
+from before the chain was in the name, and the C++ reader refuses it for exactly
+this reason.
 
-- **The link is not shared, only the description.** The Rust mesh speaks ZAP with
-  a post-quantum greeting; this one speaks a 4-byte big-endian index handshake.
-  Both daemons read the same committee and seat themselves in it; they cannot
-  form a mesh with each other.
-- **Two validators cannot decide anything.** `WaveConfig::feasible(2)` sizes the
-  committee at `kMinBFTCommittee` = 4 and asks for `two_thirds_count(4)` = 3
-  confirming votes, which 2 reachable validators can never cast; and
-  `cert.cpp` refuses a Quasar certificate outright below 4 seats. Run two
-  processes on a two-line committee and they publish, seat themselves, agree on
-  the set root, form the mesh — and report `height 1 NOT CERTIFIED before
-  deadline`. Four is the floor.
+Two validators still cannot decide anything, which has nothing to do with the
+file: `WaveConfig::feasible(2)` sizes the committee at `kMinBFTCommittee` = 4 and
+asks for `two_thirds_count(4)` = 3 confirming votes, which 2 reachable validators
+can never cast; and `cert.cpp` refuses a Quasar certificate outright below 4
+seats. Run two processes on a two-line committee and they publish, seat
+themselves, agree on the set root, form the mesh — and report `height 1 NOT
+CERTIFIED before deadline`. Four is the floor.
 
 ## Layer decomposition (decomplected — each layer is independently testable)
 
@@ -226,7 +233,7 @@ conan install ../../luxcpp/cevm -pr ../../luxcpp/cevm/.github/conan/manylinux-re
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=../../luxcpp/cevm/build-node/build/Release/generators/conan_toolchain.cmake
 cmake --build build -j
-ctest --test-dir build --output-on-failure    # 53: node, consensus, and cevm's parity gates
+ctest --test-dir build --output-on-failure    # 52: node, consensus, and cevm's parity gates
                                              # (evm-gethdiff skips without a geth to diff)
 ./scripts/chain.sh                            # 5 processes serving one C-Chain over JSON-RPC
 ./scripts/cluster.sh build/noded 19310 5      # 5 real PROCESSES, consensus only
@@ -319,12 +326,12 @@ Two things found while pinning that root, both in trees this repo only reads:
   over the same four validators: `cd75055e…f40ba23f` with cgo, `87db179d…8b2ba615` without. Two
   Go nodes built differently commit to different roots and would refuse each
   other's votes. Measured by building one program both ways.
-- **A validator has two names, and they disagree.** The committee names it
-  `keccak256(mldsa_pub)[..20]` (Rust `pq::name`, matched here); luxd's peer
-  handshake names the same key `SHAKE256("NODE_ID_V1" ‖ …)[..20]`
-  (`pq::derive_node_id`, `luxfi/ids NodeIDScheme.DeriveMLDSA`). Nothing reconciles
-  them, so a node's committee seat and the identity its link proves are different
-  20 bytes.
+- **A validator used to have two names.** The committee named it
+  `keccak256(mldsa_pub)[..20]`; the link handshake named the same key
+  `SHAKE256("NODE_ID_V1" ‖ chain ‖ scheme ‖ key)[..20]`. It has one now, and it is
+  the second — the chain-bound one, which is `pq::derive_node_id` here and
+  `ids.NodeIDScheme.DeriveMLDSA` in Go. There is one derivation in this tree and
+  the committee calls it.
 
 ## What is real, and what is not (measured, not asserted)
 

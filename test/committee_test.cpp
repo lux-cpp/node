@@ -4,22 +4,26 @@
 // committee_test.cpp — the network description, held to the one every other
 // implementation reads.
 //
-// THE FIXTURES ARE REAL FILES, and half of them were not written by this code:
-// `test/committee/four.txt` is a network of four whose seats 0 and 2 are lines
-// the RUST node published (`lux-node --data nN --publish`) and whose seats 1
-// and 3 are lines this one did — real ML-DSA-65 identities, real BLS keys, real
-// proofs of possession, interleaved so that a reader which only understood its
-// own daemon's lines would fail on the very first seat it did not write. The
-// Rust node reads this same file and admits all four; the refusal fixtures are
-// files a reader can hand to either daemon and watch both say no.
+// THE FIXTURES ARE REAL FILES: `test/committee/four.txt` is four lines the
+// daemon published (`zood --data vN --publish`), with real ML-DSA-65
+// identities, real BLS keys and real proofs of possession. The refusal fixtures
+// are files a reader can hand to any implementation and watch it say no.
 //
-// THE EXPECTED ROOT IS GO'S. It was computed by `github.com/luxfi/validators
-// SetRoot` over this exact committee, by a Go program that imports that package
-// unmodified — not by this encoder, which would only prove the encoder is
-// deterministic. The Rust node's `Committee::root()` agrees with it for the
-// same file. Three implementations, one number.
+// THE EXPECTED NAMES AND ROOT ARE GO'S. The names were computed by
+// `ids.NodeIDScheme.DeriveMLDSA` and the root by `validators.SetRoot`, in a Go
+// program that imports both packages unmodified — not by this code, which would
+// only prove this code is deterministic.
+//
+// AND THE NAMES ARE NAMES ON A CHAIN. Read the same file under a different
+// chain and it names four different validators with a different root, which is
+// the property that stops a published line from being a credential on every
+// network at once (LP-10603). `unbound.txt` is a file from before that was
+// true — lines whose proofs are over a name derived from the key alone — and it
+// is refused rather than half-read.
 
 #include "lux/node/committee.hpp"
+
+#include "lux/node/evm.hpp"  // chain_id — the network the names are bound to
 
 #include <cstdio>
 #include <fstream>
@@ -50,6 +54,19 @@ std::string hex(std::span<const std::uint8_t> b) {
 std::string hex(const Id& id) { return hex(std::span<const std::uint8_t>(id.data(), id.size())); }
 std::string hex(const Node& n) { return hex(std::span<const std::uint8_t>(n.data(), n.size())); }
 
+// The chain those four are validators OF: the local C-Chain, whose 32-byte id
+// is `evm::chain_id(31337)`. It is not decoration — every name above is a
+// function of it.
+const std::array<std::uint8_t, 32> kChain = [] {
+    std::array<std::uint8_t, 32> c{};
+    const char*                  hex = "c066f0c6c80088c742bf27c7e3f8d5ad18a903a4162ba17dba4168e1c51ede87";
+    for (std::size_t i = 0; i < c.size(); ++i) {
+        const auto nib = [](char x) { return x <= '9' ? x - '0' : x - 'a' + 10; };
+        c[i] = static_cast<std::uint8_t>((nib(hex[2 * i]) << 4) | nib(hex[2 * i + 1]));
+    }
+    return c;
+}();
+
 std::string slurp(const std::string& fixture) {
     const std::string path = std::string(COMMITTEE_FIXTURES) + "/" + fixture;
     std::ifstream     f(path, std::ios::binary);
@@ -66,7 +83,7 @@ std::string slurp(const std::string& fixture) {
 // What a refusal looks like: read() threw, and it said which clause.
 void refuses(const std::string& fixture, const std::string& because) {
     try {
-        Committee::read(slurp(fixture));
+        Committee::read(slurp(fixture), kChain);
         check(false, fixture + " is refused (" + because + ")");
     } catch (const std::exception& e) {
         const std::string said = e.what();
@@ -79,33 +96,24 @@ void refuses(const std::string& fixture, const std::string& because) {
 // ML-DSA public key each published. Independently computed: Go's
 // x/crypto/sha3.NewLegacyKeccak256 over the same file.
 const char* const kNames[] = {
-    "5e8e5ad8382a21edae8974fd0b76d3e9aa9f13ca",
-    "8d38e307c511268d69aebed7ec942e1bdfe948c6",
-    "6ec1033ac692b4a418698d0a9df7ce02b4d23137",
-    "5d427d60f64d0e194da96f7076295e521ec346cd",
+    "42eebf978769a20c42aa5e1c703fcbadcddf8806",
+    "9c7383ad3ca9820641e0babbca11862679f63cdd",
+    "38f6dbe13314653c4af4598a79f7e0f375a1c9a1",
+    "ccf17d93d74b9e7ce3c6b207f57dcd92a69ff10c",
 };
 
 // github.com/luxfi/validators SetRoot over that committee, weight 1 each, keys
 // uncompressed — the number a Go validator would fold into every vote.
-const char* const kRoot = "cd75055e9fe042eb3064cb2d13a189067ac3fa87ba227586166a75d1f40ba23f";
+const char* const kRoot = "33fb8fd25c96ed64ee11952cf49fb6bc8f522b510fe4aca2044792e53b12e5a2";
+
 
 }  // namespace
 
 int main() {
     std::printf("node — the committee file, and the network it describes\n\n");
 
-    // ── the naming rule ─────────────────────────────────────────────────────
-    // A validator's name is keccak256 of the key it is published under, first
-    // 20 bytes. Pinned against the published Keccak-256 value for the empty
-    // input, so the hash itself is held to the standard and not to this build.
-    {
-        const std::vector<std::uint8_t> nothing;
-        check(hex(name(nothing)) == "c5d2460186f7233c927e7db2dcc703c0e500b653",
-              "a name is keccak256 of the identity, truncated to 20 bytes");
-    }
-
     // ── the parse ───────────────────────────────────────────────────────────
-    const Committee four = Committee::read(slurp("four.txt"));
+    const Committee four = Committee::read(slurp("four.txt"), kChain);
     check(four.size() == 4, "four published lines are four validators");
     {
         bool named = four.size() == 4;
@@ -130,9 +138,50 @@ int main() {
         std::printf("        %s\n", hex(root).c_str());
     }
 
+    // ── the chain is not decoration ─────────────────────────────────────────
+    {
+        check(kChain == lux::node::evm::chain_id(31337),
+              "the fixture chain is the local C-Chain's own id, not a constant");
+        // The SAME file, read as a committee of a different network. Every name
+        // moves, so the root moves: a line published for one chain names nobody
+        // on another, which is the whole of a committee file's scope.
+        std::array<std::uint8_t, 32> elsewhere{};
+        elsewhere.fill(0x11);
+        const Committee other = Committee::read(slurp("four.txt"), elsewhere);
+        bool             moved = other.size() == four.size();
+        for (std::size_t i = 0; i < other.size() && moved; ++i)
+            moved = other.members()[i].node != four.members()[i].node;
+        check(moved, "the same file under another chain names four other validators");
+        check(hex(other.root()) != kRoot, "and commits to another root");
+        std::printf("        %s\n", hex(other.root()).c_str());
+        // ...and those four cannot vote: their proofs are over names nobody
+        // derives here, so the door refuses the set rather than admitting it.
+        try {
+            (void)other.validators();
+            check(false, "a committee read under the wrong chain is refused");
+        } catch (const std::exception& e) {
+            check(true, std::string("a committee read under the wrong chain is refused: ") + e.what());
+        }
+    }
+
+    // ── a line from before the chain was in the name ────────────────────────
+    // unbound.txt was published when a validator's name was the hash of its key
+    // alone. The lines are well formed and the proofs are real; they are proofs
+    // over a different name, and this is what that looks like from here.
+    {
+        const Committee unbound = Committee::read(slurp("unbound.txt"), kChain);
+        check(unbound.size() == 4, "an unbound file still parses: the shape did not change");
+        try {
+            (void)unbound.validators();
+            check(false, "a proof over an unbound name is refused");
+        } catch (const std::exception& e) {
+            check(true, std::string("a proof over an unbound name is refused: ") + e.what());
+        }
+    }
+
     // ── comments, blank lines and indentation are not validators ────────────
     {
-        const Committee noisy = Committee::read(slurp("noisy.txt"));
+        const Committee noisy = Committee::read(slurp("noisy.txt"), kChain);
         bool            same  = noisy.size() == four.size();
         for (std::size_t i = 0; i < noisy.size() && same; ++i)
             same = noisy.members()[i].node == four.members()[i].node;
@@ -152,7 +201,7 @@ int main() {
                            : Committee::line(m.identity, m.key, m.proof);
             text += "\n";
         }
-        const Committee same = Committee::read(text);
+        const Committee same = Committee::read(text, kChain);
         check(same.members()[0].node == four.members()[0].node,
               "a field written 0x-first names the same validator");
         check(hex(same.root()) == kRoot, "and the committee commits to the same root");
@@ -163,7 +212,7 @@ int main() {
         std::string written;
         for (const auto& m : four.members())
             written += Committee::line(m.identity, m.key, m.proof) + "\n";
-        const Committee again = Committee::read(written);
+        const Committee again = Committee::read(written, kChain);
         bool            same  = again.size() == four.size();
         for (std::size_t i = 0; i < again.size() && same; ++i)
             same = again.members()[i].node == four.members()[i].node;
@@ -200,7 +249,7 @@ int main() {
         // proof: a real proof, made by a real key, that does not bind this node
         // to this key. It parses — nothing about a line's shape is wrong — and
         // the door refuses it.
-        const Committee forged = Committee::read(slurp("forged.txt"));
+        const Committee forged = Committee::read(slurp("forged.txt"), kChain);
         check(forged.size() == 4, "a forged line still parses: the shape is not the proof");
         try {
             (void)forged.validators();
@@ -222,7 +271,7 @@ int main() {
             text += Committee::line(m.identity, m.key, proof) + "\n";
         }
         try {
-            (void)Committee::read(text).validators();
+            (void)Committee::read(text, kChain).validators();
             check(false, "a proof with one bit moved is refused");
         } catch (const std::exception& e) {
             check(true, std::string("a proof with one bit moved is refused: ") + e.what());

@@ -105,6 +105,14 @@ struct Past {
     std::vector<std::uint8_t> bytes;        // the block's own RLP, verbatim
 };
 
+// The 32-byte consensus id of the C-Chain whose EVM chain id is `eth`.
+//
+// A free function because two callers need it and only one of them has a
+// chain: `Chain::chain_id()` answers with it, and a daemon reading a committee
+// needs it BEFORE it builds anything — a validator is named for a chain, so
+// the name cannot wait for the chain to exist. One definition either way.
+[[nodiscard]] Id chain_id(std::uint64_t eth);
+
 // The C-Chain. Owns the EVM state, the mempool, and every block it has built or
 // accepted.
 //

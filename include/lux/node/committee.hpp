@@ -17,7 +17,7 @@
 //     <identity> <key> <proof>
 //
 //   identity  the ML-DSA-65 public key this validator is NAMED by. Its name —
-//             its node id — is keccak256(identity) truncated to 20 bytes, so a
+//             its node id — is `pq::derive_node_id(identity, chain)`, so a
 //             validator cannot claim a name it cannot sign for.
 //   key       the 48-byte COMPRESSED BLS public key it votes with.
 //   proof     its proof of possession over node ‖ key, which is CHECKED when
@@ -26,6 +26,14 @@
 // `#` starts a comment and runs to the end of the line; blank lines are
 // ignored. Every validator carries weight 1: this file says who may vote, and
 // the stake a P-chain computed is a different fact from a different source.
+//
+// A COMMITTEE IS A COMMITTEE OF A CHAIN. The chain is not in the file; it is in
+// the DERIVATION of every name, so the same published line is a different
+// validator on every network. Take it out and a line is a bearer credential on
+// all of them at once: a set assembled for a test network is a set on the live
+// one, and a validator retired on one chain is still a validator on the next.
+// So `read` takes the chain, and a file read under the wrong one names four
+// strangers rather than four validators (LP-10603).
 //
 // FILE ORDER IS KEPT, and that is load-bearing rather than incidental: a peer
 // list is POSITIONS (`--peers a:p,b:p,...`), so the third address belongs to
@@ -37,6 +45,7 @@
 #include "lux/consensus/cert.hpp"                // Node — the 20-byte identity
 #include "lux/consensus/quorum_cert_engine.hpp"  // Id, Validator
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -49,18 +58,9 @@ namespace lux::node {
 using lux::consensus::Id;
 using lux::consensus::Node;
 
-// The name a validator is known by: keccak256(identity), first 20 bytes.
-//
-// NOT `pq::derive_node_id`, which answers the same question for a different
-// wire — SHAKE256 under "NODE_ID_V1", the scheme luxd's peer handshake binds a
-// TLS link to. The committee's naming is the Rust node's `pq::name`, and the
-// two disagree for the same key. Which one is right is a question about which
-// network is being joined, so this states its own and does not guess.
-[[nodiscard]] Node name(std::span<const std::uint8_t> identity);
-
 // One validator, exactly as it published itself.
 struct Member {
-    Node                      node{};      // keccak256(identity)[..20]
+    Node                      node{};      // derive_node_id(identity, chain)
     std::uint64_t             weight = 1;  // one line, one vote
     std::vector<std::uint8_t> identity;    // ML-DSA-65 public key
     std::vector<std::uint8_t> key;         // compressed G1 BLS public key
@@ -69,14 +69,16 @@ struct Member {
 
 class Committee {
 public:
-    // Read what the validators published. Throws std::runtime_error naming the
-    // line and the clause that refused: a malformed committee is not a smaller
-    // committee, it is a network this node has not been told about.
+    // Read what the validators published, as validators OF `chain`. Throws
+    // std::runtime_error naming the line and the clause that refused: a
+    // malformed committee is not a smaller committee, it is a network this node
+    // has not been told about.
     //
     // Refused: no validators at all, a line that is not three fields, a field
     // that is not hex, and a validator listed twice — two seats behind one key
     // is a quorum smaller than it looks.
-    [[nodiscard]] static Committee read(std::string_view text);
+    [[nodiscard]] static Committee read(std::string_view text,
+                                         const std::array<std::uint8_t, 32>& chain);
 
     // What one validator publishes so others can put it in their committee.
     [[nodiscard]] static std::string line(std::span<const std::uint8_t> identity,
@@ -89,6 +91,8 @@ public:
 
     [[nodiscard]] const std::vector<Member>& members() const noexcept { return members_; }
     [[nodiscard]] std::size_t                size() const noexcept { return members_.size(); }
+    // The chain these validators are validators OF.
+    [[nodiscard]] const std::array<std::uint8_t, 32>& chain() const noexcept { return chain_; }
 
     // The commitment every vote binds — Go's encoding, over the UNCOMPRESSED
     // key. Computed by the one implementation this repo has of it
@@ -107,7 +111,8 @@ public:
     [[nodiscard]] std::vector<lux::consensus::Validator> validators() const;
 
 private:
-    std::vector<Member> members_;
+    std::vector<Member>          members_;
+    std::array<std::uint8_t, 32> chain_{};
 };
 
 }  // namespace lux::node

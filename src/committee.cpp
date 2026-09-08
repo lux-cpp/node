@@ -4,10 +4,10 @@
 #include "lux/node/committee.hpp"
 
 #include "lux/consensus/registration.hpp"  // admit — the one door a member enters by
+#include "lux/node/pq_handshake.hpp"       // derive_node_id — the one naming rule
 #include "lux/node/validators.hpp"         // validator_set_root — the one commitment
 
 #include <blst.h>
-#include <test/state/hash_utils.hpp>  // cevm::keccak256
 
 #include <cstdio>
 #include <stdexcept>
@@ -75,15 +75,9 @@ std::vector<std::uint8_t> uncompressed(const std::vector<std::uint8_t>& key) {
 
 }  // namespace
 
-Node name(std::span<const std::uint8_t> identity) {
-    const auto h = cevm::keccak256({identity.data(), identity.size()});
-    Node       id{};
-    for (std::size_t i = 0; i < id.size(); ++i) id[i] = static_cast<std::uint8_t>(h.bytes[i]);
-    return id;
-}
-
-Committee Committee::read(std::string_view text) {
+Committee Committee::read(std::string_view text, const std::array<std::uint8_t, 32>& chain) {
     Committee   c;
+    c.chain_ = chain;
     std::size_t number = 0;
     while (!text.empty()) {
         const std::size_t cut  = text.find('\n');
@@ -111,7 +105,10 @@ Committee Committee::read(std::string_view text) {
 
         Member m;
         m.identity = decode(parts[0], number, "identity");
-        m.node     = name(m.identity);
+        // THE ONE NAMING RULE, and it is the handshake's: a validator's name is
+        // what its ML-DSA key derives on THIS chain, so the name in the file and
+        // the name the link proves are the same 20 bytes.
+        m.node     = pq::derive_node_id(m.identity, chain);
         m.weight   = 1;
         m.key      = decode(parts[1], number, "key");
         m.proof    = decode(parts[2], number, "proof");

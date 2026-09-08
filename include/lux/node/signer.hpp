@@ -7,9 +7,10 @@
 // Two keys, two jobs, and they are not interchangeable:
 //
 //   identity   an ML-DSA-65 keypair (FIPS 204). The public half is what a
-//              committee line NAMES this validator by, and the node id is
-//              keccak256 of it — so the name and the key are the same fact and
-//              a validator cannot claim a name it cannot sign for.
+//              committee line NAMES this validator by, and the node id is what
+//              that key derives ON A CHAIN — so the name and the key are the
+//              same fact, and the same key is a different validator on every
+//              network rather than a bearer credential on all of them.
 //   consensus  a BLS12-381 secret. What a vote is signed with, and what the
 //              proof of possession in a committee line proves this node holds.
 //
@@ -42,24 +43,23 @@ public:
     // key does not start with a fresh one silently.
     [[nodiscard]] static Signer open(const std::filesystem::path& dir);
 
-    // The name this validator is known by in a committee.
-    [[nodiscard]] Node node() const noexcept { return node_; }
+    // The name this validator is known by on `chain`.
+    [[nodiscard]] Node node(const std::array<std::uint8_t, 32>& chain) const;
 
     [[nodiscard]] const std::array<std::uint8_t, 32>& secret() const noexcept { return secret_; }
     [[nodiscard]] const lux::consensus::PubKey&       key() const noexcept { return key_; }
 
-    // The line this validator publishes so others can put it in a committee.
-    // The proof of possession is over this validator's OWN name, so a line
-    // lifted from one committee cannot be pasted into another under a different
-    // name.
-    [[nodiscard]] std::string publish() const;
+    // The line this validator publishes so others can put it in a committee of
+    // `chain`. The proof of possession is over this validator's OWN name on that
+    // chain, so a line published for one network is not a line on another: the
+    // proof there is over a name nobody derives.
+    [[nodiscard]] std::string publish(const std::array<std::uint8_t, 32>& chain) const;
 
 private:
     std::vector<std::uint8_t>    identity_;  // ML-DSA-65 public key
     std::vector<std::uint8_t>    signer_;    // ML-DSA-65 secret key
     std::array<std::uint8_t, 32> secret_{};  // BLS secret
     lux::consensus::PubKey       key_{};     // BLS public, compressed
-    Node                         node_{};    // keccak256(identity_)[..20]
 };
 
 }  // namespace lux::node

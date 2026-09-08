@@ -186,6 +186,7 @@ int main(int argc, char** argv) {
     // behind: making a validator identity is a thing to do on purpose.
     const bool        publish        = has_flag(argc, argv, "--publish");
     const std::string data           = arg_str(argc, argv, "--data", ".lux");
+    const auto        eth            = std::uint64_t(arg(argc, argv, "--chain-id", long(kLocalChainId)));
     const std::string committee_path = arg_str(argc, argv, "--committee", "");
     const std::string peer_list      = arg_str(argc, argv, "--peers", "");
     if (!publish && (committee_path.empty() || peer_list.empty())) {
@@ -193,14 +194,22 @@ int main(int argc, char** argv) {
                      "usage: %s --committee FILE --peers a:p,b:p,... [--data DIR] [--rpc-port R]\n"
                      "             [--deadline-ms D] [--blocks B] [--chain-id C] [--archive-rpc URL]\n"
                      "             [--import-chain-data PATH]\n"
-                     "       %s --data DIR --publish\n"
+                     "       %s --data DIR --publish [--chain-id C]\n"
                      "\n"
                      "--committee names the validators of this network, one published line each;\n"
                      "--publish makes a line for it. --peers gives every validator's mesh address\n"
-                     "in committee order, and the entry at this node's own seat is where it listens.\n",
+                     "in committee order, and the entry at this node's own seat is where it listens.\n"
+                     "A validator is named for a chain, so --chain-id decides who the file names.\n",
                      prog, prog);
         return 2;
     }
+
+    // THE CHAIN NAMES THE VALIDATORS. A committee line is a line about a
+    // validator OF a chain, so this is needed before the file is read and
+    // before this node knows its own name — and it is the same 32 bytes every
+    // vote carries, so a node cannot be a member of one network and vote on
+    // another.
+    const Id chain_id = evm::chain_id(eth);
 
     // The keys: everything else is named by them.
     std::unique_ptr<Signer> mep;
@@ -215,7 +224,7 @@ int main(int argc, char** argv) {
     // What this validator publishes so others can put it in their committee.
     // Public halves only; the proof is over this validator's own name.
     if (publish) {
-        std::printf("%s\n", me.publish().c_str());
+        std::printf("%s\n", me.publish(chain_id).c_str());
         return 0;
     }
 
@@ -226,7 +235,7 @@ int main(int argc, char** argv) {
     std::vector<Validator>     set;
     std::vector<PeerAddr>      addresses;
     try {
-        committeep = std::make_unique<Committee>(Committee::read(read_file(committee_path)));
+        committeep = std::make_unique<Committee>(Committee::read(read_file(committee_path), chain_id));
         // Possession is checked HERE, at the door, and not taken on trust: a
         // member whose proof does not bind its name to its key is refused.
         set       = committeep->validators();
@@ -242,11 +251,11 @@ int main(int argc, char** argv) {
     // where its own identity is listed, so two processes cannot be told they
     // are the same validator, and a validator cannot be handed a seat it holds
     // no key for.
-    const auto seat = committee.seat(me.node());
+    const auto seat = committee.seat(me.node(chain_id));
     if (!seat) {
         std::fprintf(stderr,
                      "%s: this validator (%s) is not in %s; add the line --publish prints\n",
-                     prog, hex(me.node()).c_str(), committee_path.c_str());
+                     prog, hex(me.node(chain_id)).c_str(), committee_path.c_str());
         return 2;
     }
     const long index = long(*seat);
@@ -265,7 +274,6 @@ int main(int argc, char** argv) {
     const long deadline_ms = arg(argc, argv, "--deadline-ms", 15000);
     const long rpc_port    = arg(argc, argv, "--rpc-port", 0);
     const long blocks      = arg(argc, argv, "--blocks", 0);  // 0 = until stopped
-    const auto chain_id    = std::uint64_t(arg(argc, argv, "--chain-id", long(kLocalChainId)));
 
     // Go's flag, spelled Go's way, so one runbook drives all three
     // implementations: luxd passes --import-chain-data through to the C-Chain's
@@ -310,7 +318,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<evm::Chain> chainp;
     try {
         hostp  = std::make_unique<Node2Host>(std::move(cfg));
-        chainp = std::make_unique<evm::Chain>(local_genesis(chain_id));
+        chainp = std::make_unique<evm::Chain>(local_genesis(eth));
     } catch (const std::exception& e) {
         std::fprintf(stderr, "node %ld: cannot start — %s\n", index, e.what());
         return 2;
@@ -319,8 +327,10 @@ int main(int argc, char** argv) {
     evm::Chain& chain = *chainp;
 
     const std::uint16_t port = host.listen_bind();
+    std::printf("node %ld: chain %s — the network its validators are named for\n", index,
+                hex(chain_id).c_str());
     std::printf("node %ld: validator %s, seat %ld of %ld in %s\n", index,
-                hex(me.node()).c_str(), index, n, committee_path.c_str());
+                hex(me.node(chain_id)).c_str(), index, n, committee_path.c_str());
     std::printf("node %ld: consensus 127.0.0.1:%u  chain C (eth chainId %llu)\n",
                 index, port, static_cast<unsigned long long>(chain.eth_chain_id()));
     std::printf("node %ld: genesis state root %s\n", index, hex(chain.state_root()).c_str());
