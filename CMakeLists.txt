@@ -75,6 +75,7 @@ find_checkout(_luxcpp "blst/bindings/blst.h"
   "${CMAKE_SOURCE_DIR}/../luxcpp"
   "${CMAKE_SOURCE_DIR}/..")
 
+
 set(CONSENSUS_DIR "${_consensus}"                    CACHE PATH "consensus checkout")
 set(CEVM_DIR       "${_cevm}"                          CACHE PATH "cevm checkout")
 set(LUXCPP_ROOT    "${_luxcpp}"                        CACHE PATH "luxcpp checkout root")
@@ -194,9 +195,13 @@ add_library(node STATIC
     src/node_host.cpp     # one Party driven over that mesh
     src/engine.cpp        # execute → decide → accept, for any VM
     src/evm.cpp           # the C-Chain, executed by cevm
+    src/import.cpp        # the C-chain's external format, read back
     src/rpc.cpp           # HTTP JSON-RPC
     src/eth.cpp           # the eth methods, mounted on an Rpc
     src/validators.cpp    # the set-root commitment a vote binds
+    src/committee.cpp     # the network description all three daemons read
+    src/plugin.cpp        # a chain in another process, over ZAP
+    src/signer.cpp        # this validator's own name and voting key
     src/staking.cpp        # a luxd peer's identity: P-256 cert + NodeID + BLS + ML-DSA
     src/peer_tls.cpp       # TLS 1.3 + X25519MLKEM768, over AWS-LC
     src/keccak.cpp         # SHAKE256/cSHAKE256 and the SP 800-185 encodings under them
@@ -258,20 +263,39 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #   boot_floor      a restarted validator does not re-sign a height it decided
 #   hostile_decode  what a stranger can send the two decoders that take his bytes
 #   set_root        the validator-set commitment, against Go's encoding
+#   committee       the network description: the parse, the refusals, the root,
+#                   and the possession proof that is checked rather than trusted
 #   chain_route     every spelling of a chain's path reaches that one chain
 #   archive_proxy   what a relayed answer's status is, when this node is a proxy
 #   block_reject    a block that is not accepted gives its transactions back
+#   import          the canonical RLP export, walked block by block, and the
+#                   refusal that follows a tip nobody here decided
 #   pq_handshake    the strict-PQ peer handshake: Go's own answers to the three
 #                   derivations, then a full exchange over a real socket pair
+#   pq_vector       the validator link held to a handshake the GO node produced:
+#                   its frames, its names, its session key (LP-10602)
+#   plugin          a REAL Go VM plugin, started the way the Go node starts one
+#                   and driven through a height over ZAP
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root chain_route archive_proxy block_reject pq_handshake)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root committee chain_route archive_proxy block_reject import pq_handshake pq_vector plugin)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
     target_compile_options(${_t}_test PRIVATE -Wall -Wextra)
     add_test(NAME ${_t} COMMAND ${_t}_test)
 endforeach()
+
+# The committee test reads REAL FILES — the same files the Rust node reads, so
+# "both accept this" is a fact about one artifact rather than about two string
+# literals that were typed twice.
+target_compile_definitions(committee_test PRIVATE
+  COMMITTEE_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/test/committee")
+
+# Same discipline for the link: the vector is a file, and it came off a wire
+# with a Go node at the other end of it.
+target_compile_definitions(pq_vector_test PRIVATE
+  PQ_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/test/pq")
 
 # Apply NODE_SANITIZE to node's own targets only (the consensus subdir scopes
 # its own; blst/bls stay clean). One place for the whole node surface.

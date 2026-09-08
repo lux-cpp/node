@@ -20,6 +20,86 @@ $ curl -s -X POST -H 'content-type: application/json' \
 {"id":1,"jsonrpc":"2.0","result":"0x7a69"}
 ```
 
+## The network is a file, not a convention
+
+`noded` used to take `--index I --n N --base-port P` and DERIVE its validator set
+from those three numbers. That set was a private convention: it could only ever
+agree with copies of itself that had been told the same three numbers, and an
+operator had no way to describe one network to more than one implementation. The
+flags are gone. What replaces them is the file the Rust node already reads:
+
+```
+noded --data DIR --publish                      # once per validator
+noded --committee FILE --peers a:p,b:p,... [--data DIR]
+```
+
+One line per validator, three hex fields, `#` starts a comment:
+
+```
+<identity>  the ML-DSA-65 public key it is NAMED by
+<key>       the 48-byte compressed BLS public key it votes with
+<proof>     its proof of possession over node ‖ key, CHECKED on load
+```
+
+**One node, one name — and the chain is in the PROOF.** The id is
+`ids.NodeIDScheme.DeriveMLDSA` at chain ZERO — `SHAKE256` over
+`left_encode`-framed `"NODE_ID_V1" ‖ 0 ‖ scheme ‖ key`, first 20 bytes — which
+is the value Go's `node.Node` gives itself (`MyNodeID = DeriveNodeID(ids.Empty)`)
+and the one the link handshake re-derives to check a peer. A node does not
+change its name when it joins another chain.
+
+What is scoped is the ENTITLEMENT: the possession proof is signed over
+`chain ‖ node ‖ key`, so a line published for one network authorises nothing on
+another. `--chain-id` decides which chain a file is good on. Put the chain in
+the name instead and a node has as many names as it has chains; leave it out of
+both and a committee line is a bearer credential on every network at once
+(LP-10603).
+
+Weight is 1 per validator. **File order is kept**, because `--peers` is
+positional against it — the third address belongs to the third line, and the
+entry at this node's own seat is where it listens. A node finds ITSELF by name:
+its seat is where its own identity sits, so two processes cannot be told they are
+the same validator, and no validator can be handed a seat it holds no key for.
+
+Refused, and by the same clauses the Rust reader refuses: a file with no
+validators, a line that is not three fields, a field that is not hex, a validator
+listed twice. Possession is refused at the door — `Committee::validators()` goes
+through `consensus::admit`, so a member whose proof does not bind its name to its
+key never reaches the gate.
+
+**The names and the root are the same in three languages.**
+`test/committee/four.txt` is four lines this daemon published, entitled on the
+local C-Chain (`evm::chain_id(31337)` = `c066f0c6…c51ede87`):
+
+```
+C++   Committee::read(...).root()      de34e8d1…dfa696e7
+Rust  lux_node::engine::Committee       de34e8d1…dfa696e7
+Go    luxfi/validators SetRoot          de34e8d1…dfa696e7
+```
+
+and the four names agree one for one in all three. Computed, not asserted: the
+Go values come from a program importing `luxfi/validators` and `luxfi/ids`
+unmodified, the Rust one from a path dependency on `lux-rs/node`. Go also checks
+every proof over `chain ‖ node ‖ key` with its own `bls.VerifyProofOfPossession`
+and answers "proof holds on this chain" for all four — and "PROOF DOES NOT HOLD"
+for the same file read as a committee of another network.
+
+Rust computes the same names and the same root and then refuses the set with
+`PopInvalid`: it still checks the node-bound `node ‖ key` proof, where the file
+now carries the chain-scoped one. That is the remaining half of the LP-10603
+port, in flight there.
+
+`test/committee/elsewhere.txt` is those same four validators publishing for a
+different chain: the same names, and not one of them admitted here.
+
+Two validators still cannot decide anything, which has nothing to do with the
+file: `WaveConfig::feasible(2)` sizes the committee at `kMinBFTCommittee` = 4 and
+asks for `two_thirds_count(4)` = 3 confirming votes, which 2 reachable validators
+can never cast; and `cert.cpp` refuses a Quasar certificate outright below 4
+seats. Run two processes on a two-line committee and they publish, seat
+themselves, agree on the set root, form the mesh — and report `height 1 NOT
+CERTIFIED before deadline`. Four is the floor.
+
 ## Layer decomposition (decomplected — each layer is independently testable)
 
 ```
@@ -28,6 +108,10 @@ $ curl -s -X POST -H 'content-type: application/json' \
   chain        evm::Chain        NEW  src/evm.cpp — the C-Chain: genesis, mempool,
                                        execution through cevm, the real MPT root.
                                        The ONLY unit that knows evmc/intx/StateDB.
+  export       import_chain_data NEW  src/import.cpp — the C-chain's EXTERNAL
+                                       format (RLP) read back: ids recomputed,
+                                       links walked, tx tries rebuilt. Knows the
+                                       Ethereum block, not consensus.
   vm seam      VM / Block        NEW  include/lux/node/vm.hpp — what a chain is,
                                        asked once. P, X, Q and Z plug in here.
   engine       Engine            NEW  src/engine.cpp — execute → decide → accept,
@@ -158,7 +242,7 @@ conan install ../../luxcpp/cevm -pr ../../luxcpp/cevm/.github/conan/manylinux-re
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=../../luxcpp/cevm/build-node/build/Release/generators/conan_toolchain.cmake
 cmake --build build -j
-ctest --test-dir build --output-on-failure    # 41: node, consensus, and cevm's parity gates
+ctest --test-dir build --output-on-failure    # 54: node, consensus, and cevm's parity gates
                                              # (evm-gethdiff skips without a geth to diff)
 ./scripts/chain.sh                            # 5 processes serving one C-Chain over JSON-RPC
 ./scripts/cluster.sh build/noded 19310 5      # 5 real PROCESSES, consensus only
@@ -181,6 +265,22 @@ differs (`consensus::Node` is `consensus::Party`, and its constructor no longer
 takes α). Use a worktree pinned to the commit you mean and pass
 `-DCONSENSUS_DIR`.
 
+- `plugin_test` — a REAL Go VM plugin, started the way the Go node starts one
+  and driven through initialize, set-state, get, parse. Skips with a notice when
+  no plugin path is given, which is the one test here that can pass by doing
+  nothing — run it with one.
+- `pq_vector_test` — the validator link (LP-10602) held to a handshake the GO
+  node produced: `test/pq/handshake.json` carries the RESP frame
+  `mesh/peer.RunPQHandshakeConn` wrote, the INIT frame it accepted, and the
+  session key it derived. Both transcript prefixes are rebuilt here and proven
+  by the signatures over them, the binding and the key are recomputed, and a
+  vector with one byte moved is refused. `--against host:port` regenerates it
+  against a live Go responder.
+- `committee_test` — the network description: the parse, the four refusals, the
+  seat, the root, and the possession proof. The fixtures are REAL FILES and half
+  of them were published by the Rust node, so "both read this" is a fact about
+  one artifact; the expected root is Go's, computed by a program importing
+  `luxfi/validators`, so the encoder is never compared to itself.
 - `frame_reader_test` — the reassembler alone: fragmentation, batching, the
   rejection latch, and the per-link frame cap.
 - `wire_vector_test` — the two formats node owns end to end, written as literal
@@ -233,6 +333,163 @@ asserted in a comment.
   error and three fields of exactly 32/48/96 bytes, zero trailing.
 - **The signed message and the floors** are consensus's, checked against the
   Go-generated corpus by `conformance_test`, which runs in this suite.
+- **The validator-set root** is `luxfi/validators SetRoot`, and the committee
+  file feeds it the same bytes the Go P-chain path would — the 20-byte node id,
+  weight big-endian, and the key UNCOMPRESSED.
+
+## A chain in another process
+
+The Go node does not link its chains in; it runs each as a separate program and
+speaks ZAP to it. Every chain that is not the C-Chain — P, X, Q, Z and the rest
+— exists as one of those programs today, so a host that can run them does not
+need a port of each. `plugin::Chain` is a `node::VM`, so the engine cannot tell
+which side of the boundary its chain is on.
+
+PROVEN AGAINST A REAL PLUGIN, the shipped EVM binary
+(`build/plugins/mgj786NP7uDwBCcq6YwThhaN8FLyybkCa4zBWTQbNgmK6k9A6`, v0.18.19).
+It came up under this host and answered:
+
+```
+last accepted 0xbb2e5a9273dc3c0562b7cdda58c8a75c5708ee8382d7de7e90f0f94e195fbaba  height 0
+580 bytes, parent 0x0000…0000
+state root    0x275cf305b6494e020a03167b7c3ca616ae5058aa56537b523a4deb754f4327f6
+```
+
+`plugin_test /path/to/plugin` (or `LUX_VM_PLUGIN=`) runs it. With no plugin it
+says so and passes.
+
+### The interop contract, as the Go node performs it
+
+Nobody had written this down; it is `vms/rpcchainvm/factory.go` and
+`runtime/subprocess/runtime_zap.go` read off the code, and every step below cost
+a failed run to find:
+
+1. The NODE binds a bootstrap listener — TCP on 127.0.0.1:0, or a unix socket
+   under a temp dir when `LUXD_VM_UNIX_SOCKET=1`.
+2. It execs the plugin with the parent environment plus `VM_TRANSPORT=zap`,
+   `VM_RUNTIME_ENGINE_ADDR=<that address>` and `LUX_VM_RUNTIME_ENGINE_ADDR=`
+   (the pre-rename key, for plugins built before it).
+3. The PLUGIN binds its own address and dials the bootstrap listener, writing
+   `[4-byte BE length][4-byte BE protocol][address as text]`, length counting
+   the version and the address.
+4. The node refuses a protocol that is not its own — 42 — and then **writes one
+   byte, 0x01**. Skip it and the plugin logs `failed to read handshake ack: EOF`
+   and exits, and the address it just reported answers nothing.
+5. The node dials that address. From there it is ZAP:
+   `[4-byte BE length][1-byte type][payload]`, every request and response
+   payload beginning with a 4-byte big-endian request id; a response is the
+   request's type with 0x80, an error adds 0x40.
+6. `MsgInitialize` (1) with `XChainID`, `CChainID` and `UTXOAssetID` at their
+   FULL 32 bytes even when the network has none — a plugin refuses a short one:
+   `initialize xChainID: invalid hash length: expected 32 bytes but got 0`.
+7. `MsgSetState` (2) to Bootstrapping and then Ready BEFORE building. Asked to
+   build while still bootstrapping, the EVM plugin dereferences nil and the call
+   comes back as `panic in handler`.
+
+Three findings came out of making that work:
+
+- **The shipped plugin cannot use a unix socket.** It infers the network from
+  the address and dials `tcp` on any of them:
+  `dial tcp: address /tmp/luxd-vm-*/vm.sock: missing port in address`. That is
+  why Go's socket path is opt-in, and this host matches Go rather than
+  preferring the better transport.
+- **`zap-cpp-core` could not read a Go plugin's error, and now can.** Go writes
+  the error body RAW after the request id (`api/zap/transport.go:507`); the C++
+  server wrote and the client read a length-prefixed string, self-consistently,
+  so every C++-to-C++ test passed and every error from a Go peer arrived as
+  `truncated error response` with the message gone. Fixed in both halves on
+  `lux-cpp/zap-cpp-core` branch `net/error-body-is-raw`, with a conformance case
+  that pins the bytes rather than a round trip — a round trip is exactly what
+  missed it. `plugin.cpp` uses `ZapClient` again; the workaround is gone. **This
+  node needs that branch**: the header is consumed from the working tree.
+- **The execution state root does not cross this boundary.** `BlockResponse`
+  carries id, parent, bytes, height and timestamp and no root, because Go's
+  proposervm answers `ids.Empty` for that axis. A plugin-hosted chain must
+  therefore be driven with `Binding::Transport`; `plugin::Remote::root()`
+  answers the empty id and says so rather than inventing one. The root above was
+  read out of the block's own bytes.
+
+## The link two validators run before a frame
+
+The mesh used to greet with four plaintext bytes: an index the dialer CLAIMED.
+Anyone who could reach the port could claim a seat, and the code said so — safety
+was argued from the vote gate downstream, never from the link. That is gone.
+
+A link is now LP-10602: ML-DSA-65 over a running transcript in each direction,
+ML-KEM-768 in the responder's, a session key from both, and the role in the FIPS
+204 context so a captured signature is not a signature in the other direction.
+The seat is where the committee says the PROVEN name sits, so an address that
+turns out to belong to someone else is refused rather than believed, and a
+validator nobody seated is refused even though its handshake completes.
+
+Held to Go, not to itself: a C++ initiator completed a handshake against
+`mesh/peer.RunPQHandshakeConn` with the C++ daemon's own keypair, both ends
+derived `6c7de15f…0c5ba4f5`, and each derived the other's name identically. That
+exchange is `test/pq/handshake.json`, made against the published libraries:
+`luxfi/node`'s `mesh/peer` as the responder (it resolves `luxfi/crypto v1.20.9`,
+though its handshake never calls it) and `luxfi/crypto v1.20.11` on this side.
+
+Three things about it worth knowing before touching it:
+
+- **`mldsa65_sign_ctx` takes the MESSAGE before the context** — and two builds of
+  libluxcrypto have shipped with those two the other way round from each other.
+  The published library is message-first (and `v1.20.9` has no `_ctx` pair at
+  all); `~/work/lux/crypto` was for a while a stale snapshot with no remote whose
+  pair is context-first. This file has been on both sides of it, and the note
+  further down — "the C ABI arguments were transposed" — was right the first
+  time: it is the snapshot that is the outlier.
+
+  **A swap does not look like a swap.** FIPS 204 caps a CONTEXT at 255 bytes and
+  says nothing about message length, so with the two exchanged everything up to
+  255 bytes still signs and verifies and everything longer returns -2 — which
+  reads as a message-size limit. Measured against the published build:
+
+  ```
+  message length     1  100  254  255  256  512  3199  6512  9615  16384
+  correct order      0    0    0    0    0    0     0     0     0      0
+  swapped            0    0    0    0   -2   -2    -2    -2    -2     -2
+  ```
+
+  It is emphatically NOT `LUX_GPU_MLDSA_MSG_LEN_CAP`. That constant lives in an
+  accelerator plugin which is not loaded here; `backend.Resolved()` never returns
+  GPU without one, so `batchVerifyGPU` returns `(false, nil)` at its first gate
+  and the `ErrInvalidArgument` hard-error path is unreachable. With the order
+  right, the published library signs and verifies 16 KiB without complaint.
+
+  **Nothing in Go can catch it**, which is why it survived: `mesh/peer`'s
+  handshake signs through `cloudflare/circl` directly and never calls the C ABI.
+  That ABI exists for C++, Rust, Python and TypeScript, so no Go test exercises
+  it. Only a C caller can guard the order, so `pq_handshake_test` round-trips a
+  6512-byte sign and verify through it — and says out loud that a 255-byte one
+  proves nothing. Fixed in `luxfi/crypto` v1.20.11.
+- **Signing is deterministic, and it had to be made so.** LP-10602 mandates it
+  and Go signs that way (`mldsa65.SignTo(..., randomized=false)`), but the C ABI
+  offered only `SignCtx(rand.Reader, ...)`, so two signatures over one message
+  differed and a published handshake could be checked and never reproduced.
+  `mldsa65_sign_ctx_det` is in `luxfi/crypto` v1.20.10, with its argument order
+  corrected to match its siblings in v1.20.11. The vector carries both secrets
+  and both signatures are RE-MADE and compared — the responder's included, which
+  is Go's own bytes.
+- **The link binds a peer's name at chain zero,** which is what Go does
+  (`peer.go verifyPQIdentityBinding`) and what a name is. The chain the link
+  carries scopes the session; the chain a committee line carries scopes the
+  entitlement; neither scopes the name.
+
+Two things found while pinning the set root, both in trees this repo only reads:
+
+- **Go's own root depends on how Go was built.** `SetRoot` hashes whatever bytes
+  the caller hands it, and the caller hands it
+  `crypto/bls.PublicKeyToUncompressedBytes`, which returns blst's 96 bytes under
+  `//go:build cgo` and the COMPRESSED 48 under `//go:build !cgo`. The same source
+  over the same four validators: `cd75055e…f40ba23f` with cgo, `87db179d…8b2ba615` without. Two
+  Go nodes built differently commit to different roots and would refuse each
+  other's votes. Measured by building one program both ways.
+- **A validator used to have two names.** The committee named it
+  `keccak256(mldsa_pub)[..20]`; the link handshake named the same key
+  `SHAKE256("NODE_ID_V1" ‖ 0 ‖ scheme ‖ key)[..20]`. It has one now, and it is
+  the second, which is `pq::derive_node_id` here and
+  `ids.NodeIDScheme.DeriveMLDSA` in Go. There is one derivation in this tree and
+  the committee calls it.
 
 ## What is real, and what is not (measured, not asserted)
 
@@ -249,6 +506,10 @@ REAL — observed on a running 5-process cluster, not inferred:
 | a transaction is real end to end | signed by `eth-account` (an independent implementation), sender RECOVERED here via secp256k1, balance moved exactly 1 ether, nonce 0→1, root changed `0x29e1beb5…` → `0xd117904d…` |
 | contract creation and storage work | a constructor's `SSTORE` is readable through `eth_getStorageAt` |
 | JSON-RPC is live | `eth_chainId` → `0x7a69`, `eth_blockNumber` advances off the real pipeline |
+| an RLP export imports and matches Go | the canonical `lux-testnet-96368.rlp`: 218 blocks, 219 senders recovered, every link walked, tip `0x722e2b39ae8973ab5d94b51451623352650b728e411ce0261c5efcd23aa381a5` and state root `0x4e19366fcc65d7ddd0b803bfbd7537f0c0ddc5d190c3ded40712408fcb137f35` — the same two values Go's import of the same bytes produced. `zoo-testnet` (84), `zoo-mainnet` (799) and `spc-mainnet` (10) import the same way |
+| …and at mainnet size | `lux-mainnet-96369.rlp`, 1.2 GB: 1,082,780 blocks and 1,229,884 senders recovered in ~4.5 min, peak RSS ~4.2 GB, tip `0x32dede1f…61f0`. The export is MAPPED, not read into a buffer — but every block it ingests is kept in memory, so an import is bounded by the same absence of persistence the rest of this node has |
+| an imported node refuses to validate | `import_test`: the engine proposes nothing, follows nothing, and never asks the chain to build, through either door; `luxd` prints NOT A CAUGHT-UP VALIDATOR and parks |
+| both doors are one reader | on a live `luxd`, `--import-chain-data` reads the canonical export to tip `0x722e2b39…81a5`, and `admin_importChain` given the same file on the same node answers `{"blocks":0,"skipped":218}` at the same tip — resume, across the two doors, off one head |
 
 | precompiles work from contract code | SHA-256, RIPEMD-160 and IDENTITY match Python's hashlib byte-for-byte, called from deployed bytecode on the live chain |
 | DELEGATECALL delegates | a proxy's storage takes the write; the implementation's own storage is untouched |
@@ -259,6 +520,13 @@ NOT REAL YET — named, not hidden:
   journal, so a block cannot be reverted once its root is computed. A height that
   fails to certify leaves the state ahead of the last accepted block, and `noded`
   STOPS rather than build on it. Fail-secure, and the next thing to close.
+- **An import does not derive state.** The blocks and the tip are real and
+  checked; the EVM state behind them is not, because an export carries no genesis
+  allocation to execute from. `eth_getBalance` after an import answers from the
+  configured genesis, not from the imported chain — which is the second reason
+  such a node must not validate, and why it parks instead.
+- **No recovery from an import.** Go rebuilds the missing outer index from
+  certified peer state (`enterOuterBackfill`); this node refuses and stops there.
 - **No persistence.** State and blocks are in memory; a restart is a new chain.
   `HostConfig::accepted` exists to be seeded from a durable store, and there is
   no durable store.
@@ -311,6 +579,105 @@ costs is interop: a signed message that binds the root is not the message Go
 signs for the same block, so a C++ and a Go validator cannot form one quorum
 until Go binds it too. Stated here because it is a protocol difference, not an
 implementation detail.
+
+## Reading a chain back (two doors, one reader)
+
+The C-chain speaks two encodings. **ZAP** is the serialization everything in this
+stack uses — votes, blocks on the wire, the frame. **RLP** is what the C-chain
+hands to Ethereum, and a chain's history leaves it as an *export*: a bare
+concatenation of RLP-encoded blocks with no envelope, no index and no length
+prefix. `luxd --import-chain-data PATH` reads one. The flag is spelled Go's way
+because it is the same flag: Go passes it into the C-Chain's config and the VM
+reads the export at startup, before the chain serves anything, and a second run
+of an unchanged flag is a no-op rather than a failure. One runbook, three
+implementations.
+
+A node is asked to read an export in **two** ways and there is **one** reader.
+`--import-chain-data PATH` at startup and the `admin_importChain` RPC while it
+runs are both calls to `import_chain_data`; `serve_admin` (`src/eth.cpp`) is nine
+lines and `noded`'s flag is shorter, and neither decodes anything. Go has that
+exact shape — `admin_api.go:84` and `vm.go:628` both call
+`importBlocksFromFile` — and it is worth keeping because the alternative is the
+usual one: the flag grows a reader, the RPC grows another, and a single binary
+ends up with two answers to what a block is.
+
+```
+$ curl -s -X POST -H 'content-type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"admin_importChain",
+             "params":["…/lux-testnet-96368.rlp"]}' \
+    http://127.0.0.1:41898/v1/chain/C/rpc
+{"blocks":218,"skipped":0,"transactions":219,"heightBefore":"0x0",
+ "heightAfter":"0xda","frontier":"0x0",
+ "tip":"0x722e2b39ae…81a5","stateRoot":"0x4e19366f…7f35"}
+```
+
+`frontier` rides along in the answer, so a caller polling the door that filled
+the chain is told in the same breath that the node has decided none of it.
+
+**The lock and the checkpoint.** `Rpc` holds THE chain lock for the whole of
+every method call, which is what Go spells `vmLock.Lock()` at the top of
+`ImportChain` — a read that arrives mid-height waits for it. Every 4096 blocks
+(Go's `defaultCommitInterval`) the reader stops and tells its door where it has
+got to. Go commits the state trie there and moves the accepted-block pointer in
+the same step "so there's no crash window where state is persisted but
+acceptedBlockDB is stale"; here the pointer is moved by `ingest`, and the reader
+READS IT BACK and refuses to go on unless it names the block just ingested — so
+a checkpoint can only ever report a height the chain already holds. Resume is
+the same fact from the other side: the head on entry is where the last run of
+*either* door stopped, the file is re-walked from the front with every check
+re-run, and only blocks above the head are ingested.
+
+**What is proven, and what is only carried.** Every hash compared here is one
+this node computed: a block's id is `keccak(rlp(header))` over the header's own
+bytes; block N's parentHash must equal the id computed for block N−1, walked over
+every block rather than sampled; the body's transactions rebuild the header's
+`transactionsRoot` as a Merkle-Patricia trie; the uncle list hashes to
+`ommersHash`; and every transaction is decoded and its sender RECOVERED with
+secp256k1 — which also refuses another chain's export, since a transaction binds
+its chain id.
+
+The `stateRoot` is the one thing NOT proven, and naming it is the point. An
+export carries blocks, not state: deriving these roots means executing every
+transaction from the genesis ALLOCATION, which an export does not contain (the
+canonical lux-testnet export's genesis alloc is not in `lux/state`). So the roots
+are read from the headers as claims, and this node ends up knowing a tip whose
+state it did not compute.
+
+### And therefore it is not a validator
+
+Reading an export moves the tip and produces **no certificate under it**. Go
+names the same state in `vms/proposervm/vm.go` — an inner chain restored without
+its outer index — and says what has to follow: such a chain "will NOT build
+blocks and MUST NOT be treated as a caught-up validator until the outer index is
+rebuilt from certified peer state." A node that imports and then proposes signs
+an ancestry it never verified, which is worse than one that cannot import at all.
+
+The rule is one predicate in one place. `VM::frontier()` is a VALUE — the highest
+height this node itself decided — and `Engine::may_sign()` compares it to the
+tip. It is asked at the top of `settle()`, the single door every signed message
+passes through, and again in front of `build()`/`parse()`, because building is
+executing and a refusal behind the execution would already have run a block
+against state this node never derived. `evm::Chain::ingest` moves the tip and
+deliberately does not touch the frontier; `BlockImpl::accept` — reached only on a
+verifying quorum certificate — is the only thing that does.
+
+`import_test` drives the engine over an imported chain and asserts that the chain
+was never even **asked** to build, with the un-imported chain as the control —
+and does it again over a chain filled through the RPC door, because the refusal
+is a property of the chain and not of the door that filled it.
+`noded` says the same thing out loud and parks: RPC keeps answering, so the
+imported history is readable and the state is visible rather than silent.
+
+```
+node 0: import tip 0x722e2b39ae…81a5 height 218 time 1746815479
+node 0: import state root 0x4e19366f…7f35 (carried from the header — an export holds blocks, not state)
+node 0: import 218 blocks ingested, 0 already held, 219 transactions recovered
+node 0: NOT A CAUGHT-UP VALIDATOR — tip is height 218, this node's own decisions stop at height 0
+```
+
+Recovery — rebuilding those heights from certified peer state — is **not here**.
+Go has `enterOuterBackfill`; this node has the refusal and no way out of it but a
+fresh start. Said plainly rather than hidden behind a tip that looks healthy.
 
 ## Scope (honest)
 

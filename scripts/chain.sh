@@ -12,6 +12,9 @@
 # node whose EVM diverged would show a different root here, and would already
 # have failed to certify.
 #
+# Every process is handed the SAME committee file and the SAME peer list, which
+# is how a real operator describes a network — see scripts/cluster.sh.
+#
 # Usage: scripts/chain.sh [noded] [consensus-base-port] [rpc-base-port] [n]
 set -euo pipefail
 
@@ -46,10 +49,17 @@ rpc() { # rpc <node-index> <method> [params-json]
   | sed -n 's/.*"result":"\?\([^,"}]*\)"\?.*/\1/p'
 }
 
+echo "== writing the network down: $N validators publish, once =="
+peers=""
+for i in $(seq 0 $((N - 1))); do
+  "$NODED" --data "$TMP/v$i" --publish >>"$TMP/committee.txt"
+  peers="${peers:+$peers,}127.0.0.1:$((BASE + i))"
+done
+
 echo "== booting $N noded processes (consensus $BASE.., rpc $RPC..) =="
 for i in $(seq 0 $((N - 1))); do
-  "$NODED" --index "$i" --n "$N" --base-port "$BASE" --rpc-port $((RPC + i)) \
-           --deadline-ms 8000 >"$TMP/node$i.log" 2>&1 &
+  "$NODED" --data "$TMP/v$i" --committee "$TMP/committee.txt" --peers "$peers" \
+           --rpc-port $((RPC + i)) --deadline-ms 8000 >"$TMP/node$i.log" 2>&1 &
   pids+=("$!")
 done
 
@@ -68,27 +78,40 @@ H1="$(rpc 0 eth_blockNumber)"
 if (( H1 > H0 )); then echo "  ok    eth_blockNumber $H0 -> $H1"; else echo "  FAIL  height did not advance ($H0 -> $H1)"; fail=1; fi
 
 echo "== every node executed the same block to the same root =="
-# A height every node has certainly accepted by now.
-HEX=$(printf '0x%x' $(( H0 > 2 ? H0 - 2 : 1 )))
-ROOT0=""
-for i in $(seq 0 $((N - 1))); do
-  R="$(curl -s --max-time 10 -X POST -H 'content-type: application/json' \
-        --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"$HEX\",false]}" \
-        "http://127.0.0.1:$((RPC + i))/v1/chain/C/rpc" \
-      | sed -n 's/.*"stateRoot":"\([^"]*\)".*/\1/p')"
-  [[ -z "$ROOT0" ]] && ROOT0="$R"
-  check "node $i state root at block $HEX" "$R" "$ROOT0"
+# THE FRONTIER, NOT A HISTORICAL HEIGHT. These nodes are frontier-resident light
+# nodes: a block below the tip is refused, not served, so asking every node for
+# height h-2 gets five refusals — and comparing five refusals to each other is a
+# check that passes when nothing works. Sample the tip from all five instead,
+# and only compare when they are at the same height; a root that is not 32 bytes
+# of hex fails, so an empty answer can never pass.
+root_at() { # root_at <node-index> -> "<number> <stateRoot>"
+  curl -s --max-time 10 -X POST -H 'content-type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}' \
+    "http://127.0.0.1:$((RPC + $1))/v1/chain/C/rpc" \
+  | sed -n 's/.*"number":"\([^"]*\)".*"stateRoot":"\([^"]*\)".*/\1 \2/p'
+}
+HEIGHT=""; ROOT0=""; SEEN=()
+for _ in $(seq 1 40); do
+  SEEN=(); HEIGHT=""; agreed=1
+  for i in $(seq 0 $((N - 1))); do
+    h=""; r=""
+    read -r h r <<<"$(root_at "$i")" || true
+    SEEN+=("$h $r")
+    [[ -z "$HEIGHT" ]] && HEIGHT="$h"
+    [[ "$h" == "$HEIGHT" ]] || agreed=0
+  done
+  [[ "$agreed" == 1 && -n "$HEIGHT" ]] && break
+  sleep 0.25
 done
-
-echo "== the genesis root is a real root, not a constant =="
-G="$(curl -s --max-time 10 -X POST -H 'content-type: application/json' \
-      --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x0",false]}' \
-      "http://127.0.0.1:$RPC/v1/chain/C/rpc" | sed -n 's/.*"stateRoot":"\([^"]*\)".*/\1/p')"
-if [[ "$G" =~ ^0x[0-9a-f]{64}$ && "$G" != "0x$(printf '0%.0s' {1..64})" ]]; then
-  echo "  ok    genesis state root $G"
+ROOT0="${SEEN[0]:-}"; ROOT0="${ROOT0#* }"
+if [[ "$ROOT0" =~ ^0x[0-9a-f]{64}$ && "$ROOT0" != "0x$(printf '0%.0s' {1..64})" ]]; then
+  echo "  ok    the tip at $HEIGHT carries a real state root $ROOT0"
 else
-  echo "  FAIL  genesis state root looks wrong: $G"; fail=1
+  echo "  FAIL  the tip carries no usable state root: '$ROOT0'"; fail=1
 fi
+for i in $(seq 0 $((N - 1))); do
+  check "node $i at $HEIGHT" "${SEEN[$i]}" "$HEIGHT $ROOT0"
+done
 # The funded genesis account, read out of the state the root commits to.
 check "the genesis account holds its allocation" \
   "$(rpc 0 eth_getBalance '["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","latest"]')" \

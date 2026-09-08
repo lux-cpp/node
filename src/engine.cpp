@@ -55,6 +55,12 @@ std::optional<Decided> Engine::settle(const std::shared_ptr<Block>& blk, int dea
                                       const std::function<void()>& after_submit) {
     if (!blk) return std::nullopt;
 
+    // THE GATE. Every signed message this node produces passes through here —
+    // proposed, followed or decided — so the refusal to act as a caught-up
+    // validator is stated once, at the one door it has to hold. Before submit,
+    // so nothing is registered and nothing is later abandoned.
+    if (!may_sign()) return std::nullopt;
+
     // An honest node does not vote for a block its own execution rejected. This
     // is where a peer's claimed root, having disagreed with ours, stops. It is
     // a DROP, not a rejection: the block never reached consensus, so it is
@@ -116,6 +122,12 @@ std::optional<Decided> Engine::decide(const std::shared_ptr<Block>& blk, int dea
 
 std::optional<Decided> Engine::propose(
     const std::function<void(std::span<const std::uint8_t>)>& publish, int deadline_ms) {
+    // Asked before build() rather than only in settle(), because building is
+    // EXECUTING: a chain whose tip arrived without a certificate would run a
+    // block against state it never derived and leave that behind, and the gate
+    // below would then refuse a block the chain has already paid for.
+    if (!may_sign()) return std::nullopt;
+
     std::shared_ptr<Block> blk;
     {
         const std::lock_guard<std::mutex> lock(guard_);
@@ -132,7 +144,10 @@ std::optional<Decided> Engine::advance(int deadline_ms) {
 
 std::optional<Decided> Engine::follow(std::span<const std::uint8_t> bytes, int deadline_ms) {
     // Parsing IS executing, so it is a call into the VM and takes the lock.
-    // Deciding, below it, does not.
+    // Deciding, below it, does not. And for the same reason as propose(), the
+    // gate is asked before the execution rather than after it.
+    if (!may_sign()) return std::nullopt;
+
     std::shared_ptr<Block> blk;
     {
         const std::lock_guard<std::mutex> lock(guard_);

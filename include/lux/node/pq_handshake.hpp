@@ -45,6 +45,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace lux::node::pq {
@@ -57,6 +58,13 @@ inline constexpr std::uint8_t kKEMSchemeMLKEM768 = 0x01;
 inline constexpr std::uint8_t kProfileStrictPQ    = 0x01;
 inline constexpr std::uint8_t kProtocolVersionV1  = 0x01;
 
+// THE ROLE IS PART OF THE SIGNED MESSAGE, and that is the whole of the replay
+// argument: without it a responder's signature is a well-formed initiator's
+// signature over the same bytes. The version is in there for the same reason,
+// one protocol version ahead.
+inline constexpr std::string_view kContextInitiator = "NODE_PQ_HANDSHAKE_V1/initiator";
+inline constexpr std::string_view kContextResponder = "NODE_PQ_HANDSHAKE_V1/responder";
+
 // This validator's post-quantum identity: an ML-DSA-65 keypair, persisted
 // (mode 0600) exactly like `staking::Identity`'s BLS key — regenerating it
 // would be a different validator on every restart, which a genesis or a
@@ -64,14 +72,22 @@ inline constexpr std::uint8_t kProtocolVersionV1  = 0x01;
 class Identity {
 public:
     static Identity open(const std::filesystem::path& dir);
+    // A fresh identity, kept nowhere. Go's NewLocalIdentity, and for its
+    // reason: a test needs a validator, not a directory.
+    static Identity make();
+    // An identity this process already holds — the one a node's own keystore
+    // loaded, handed to the link rather than read from disk a second time.
+    static Identity of(std::vector<std::uint8_t> public_key, std::vector<std::uint8_t> secret_key);
 
     [[nodiscard]] const std::vector<std::uint8_t>& public_key() const noexcept { return pk_; }
     [[nodiscard]] const std::vector<std::uint8_t>& secret_key() const noexcept { return sk_; }
-    [[nodiscard]] const std::array<std::uint8_t, 20>& node_id() const noexcept { return node_id_; }
+    // The name this identity answers to ON `chain`. There is no name without
+    // one: an id derived from the key alone is the same id on every network.
+    [[nodiscard]] std::array<std::uint8_t, 20> node_id(
+        const std::array<std::uint8_t, 32>& chain = {}) const;
 
 private:
-    std::vector<std::uint8_t>    pk_, sk_;
-    std::array<std::uint8_t, 20> node_id_{};
+    std::vector<std::uint8_t> pk_, sk_;
 };
 
 // SHAKE256("NODE_ID_V1" ‖ chain_id ‖ scheme ‖ pubkey), SP 800-185
@@ -126,6 +142,22 @@ inline constexpr std::uint32_t kFrameMax = 16u * 1024u;
                                                     const std::array<std::uint8_t, 32>& shared_secret,
                                                     const std::array<std::uint8_t, 48>& transcript);
 
+// `secret`'s ML-DSA-65 signature over `message` under the FIPS 204 context
+// `ctx`, DETERMINISTIC — the same key, message and context always give the same
+// bytes, which is what lets a handshake be published as a vector and reproduced
+// rather than merely checked (LP-10602). Empty on failure.
+[[nodiscard]] std::vector<std::uint8_t> sign(std::span<const std::uint8_t> secret,
+                                             std::string_view              ctx,
+                                             std::span<const std::uint8_t> message);
+
+// Whether `sig` is `public_key`'s ML-DSA-65 signature over `message` under the
+// FIPS 204 context `ctx`. The one verification in this protocol, and public
+// because holding an implementation to a published handshake IS a verification
+// — a conformance check with its own copy of it would be checking two things
+// at once and telling you neither.
+[[nodiscard]] bool verify(std::span<const std::uint8_t> public_key, std::string_view ctx,
+                          std::span<const std::uint8_t> message, std::span<const std::uint8_t> sig);
+
 // What a completed handshake proves and produces. `ok == false` means the
 // link must be dropped — there is no partial-trust state in this protocol.
 struct Outcome {
@@ -139,6 +171,11 @@ struct Outcome {
     // matters — two ends that derived different keys disagreed about the
     // transcript, which is what makes it worth returning and asserting on.
     std::array<std::uint8_t, 32>  aead_key{};
+    // The ML-KEM secret the key was derived FROM. Returned for one reason: a
+    // handshake whose secret cannot be inspected cannot be held to a published
+    // vector, because the key schedule's only unpublished input is this. It is
+    // session material and belongs nowhere but a test and the link itself.
+    std::array<std::uint8_t, 32>  shared_secret{};
 };
 
 // Runs the FULL initiator side over an already-open, already-TLS-upgraded
@@ -154,6 +191,18 @@ struct Outcome {
 // chain this validator will vote on, so the default is correct for that
 // link and callers should not pass a chain id "to be safe".
 Outcome run_initiator(const Identity& id,
+                      const std::function<void(std::span<const std::uint8_t>)>& write_frame,
+                      const std::function<std::vector<std::uint8_t>()>& read_frame,
+                      const std::array<std::uint8_t, 32>& chain_id = {});
+
+// The other half, and the reason there is one: a mesh both dials and accepts,
+// so a node that could only initiate could only ever talk to something else.
+// Reads INIT, refuses it on the same axes in the same order, encapsulates
+// against the initiator's KEM key, signs its own fields under the RESPONDER
+// context, writes RESP, and derives the same session key from the same
+// binding. Symmetric with `run_initiator` by construction: both call the same
+// three key-schedule functions on the same two byte strings.
+Outcome run_responder(const Identity& id,
                       const std::function<void(std::span<const std::uint8_t>)>& write_frame,
                       const std::function<std::vector<std::uint8_t>()>& read_frame,
                       const std::array<std::uint8_t, 32>& chain_id = {});

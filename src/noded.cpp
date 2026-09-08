@@ -4,13 +4,21 @@
 // noded — a running Lux node: a C-Chain executed by cevm, decided by BLS
 // quorum-certificate consensus over a real TCP mesh, and served over JSON-RPC.
 //
-//   noded --index I --n N --base-port P [--rpc-port R] [--stake S]
+//   noded --committee <file> --peers <a:p,b:p,...> [--data DIR] [--rpc-port R]
 //         [--deadline-ms D] [--blocks B] [--chain-id C]
+//   noded --data DIR --publish
 //
-// Node j listens for consensus on 127.0.0.1:(P+j) and serves RPC on --rpc-port
-// (0 = OS-assigned, printed at startup). The validator set is derived
-// deterministically from the index scheme below so every process agrees on it;
-// in production the set comes from genesis and the keys from KMS.
+// THE VALIDATOR SET IS READ, NOT DERIVED. A committee file names every
+// validator of this network by the ML-DSA-65 public key it published, the BLS
+// key it votes with, and its proof of possession — and it is the SAME file the
+// Rust node reads and the same commitment the Go node computes, so one
+// description drives all three. `--publish` prints this node's own line for it.
+//
+// This node finds ITSELF in that file, by name: its seat is where its own
+// identity sits, and the peer list is positional against the same order, so the
+// third address belongs to the third line. The entry at this node's own seat is
+// where it listens. RPC is served on --rpc-port (0 = OS-assigned, printed at
+// startup).
 //
 // WHAT ONE HEIGHT IS. One validator PROPOSES — height mod n, so the turn moves
 // and no node is load-bearing — and gossips the block's bytes. Every other
@@ -24,14 +32,14 @@
 // the height stalls instead of forking. That is why the root is in the signed
 // message and why a follower is handed bytes rather than a header.
 
+#include "lux/node/committee.hpp"
 #include "lux/node/engine.hpp"
 #include "lux/node/eth.hpp"
 #include "lux/node/evm.hpp"
+#include "lux/node/import.hpp"
+#include "lux/node/signer.hpp"
 #include "lux/node/node_host.hpp"
 #include "lux/node/rpc.hpp"
-#include "lux/node/validators.hpp"
-
-#include "bls_signature.hpp"
 
 #include <array>
 #include <atomic>
@@ -41,7 +49,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -66,21 +77,6 @@ std::string get_client_version(const char* prog) {
     return "lux-cpp/noded/v0.1.0";
 }
 
-struct Key {
-    std::array<std::uint8_t, 32> sk{};
-    PubKey                       pk{};
-};
-
-Key make_key(std::uint8_t tag) {
-    std::array<std::uint8_t, 32> seed{};
-    seed[0] = tag;
-    for (int i = 1; i < 32; ++i) seed[i] = std::uint8_t(0xA5 ^ (tag + i));
-    Key k;
-    if (cevm::crypto::bls::keygen(seed.data(), k.sk.data()) != 0) { std::puts("keygen failed"); std::exit(2); }
-    if (cevm::crypto::bls::sk_to_pk(k.sk.data(), k.pk.data()) != 0) { std::puts("sk_to_pk failed"); std::exit(2); }
-    return k;
-}
-
 long arg(int argc, char** argv, const char* flag, long dflt) {
     for (int i = 1; i + 1 < argc; ++i)
         if (std::strcmp(argv[i], flag) == 0) return std::strtol(argv[i + 1], nullptr, 10);
@@ -91,6 +87,48 @@ std::string arg_str(int argc, char** argv, const char* flag, std::string dflt) {
     for (int i = 1; i + 1 < argc; ++i)
         if (std::strcmp(argv[i], flag) == 0) return argv[i + 1];
     return dflt;
+}
+
+bool has_flag(int argc, char** argv, const char* flag) {
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], flag) == 0) return true;
+    return false;
+}
+
+// Every validator's mesh address, in committee order.
+//
+// A peer list is POSITIONS, not names: the names are already fixed by the
+// committee, so the third address belongs to the third line. Empty entries are
+// skipped BEFORE a position is taken, which is what the Rust node does with the
+// same string — a list is a list of addresses, not of commas.
+std::vector<PeerAddr> mesh_addresses(const std::string& list) {
+    std::vector<PeerAddr> out;
+    for (std::size_t at = 0; at <= list.size();) {
+        const std::size_t cut = std::min(list.find(',', at), list.size());
+        std::string       one = list.substr(at, cut - at);
+        at                    = cut + 1;
+        const auto space      = [](char c) { return c == ' ' || c == '\t'; };
+        while (!one.empty() && space(one.front())) one.erase(one.begin());
+        while (!one.empty() && space(one.back())) one.pop_back();
+        if (one.empty()) continue;
+
+        const std::size_t colon = one.rfind(':');
+        if (colon == std::string::npos || colon + 1 == one.size() || colon == 0)
+            throw std::runtime_error("--peers " + one + ": expected host:port");
+        const long port = std::strtol(one.c_str() + colon + 1, nullptr, 10);
+        if (port <= 0 || port > 65535)
+            throw std::runtime_error("--peers " + one + ": that is not a port");
+        out.push_back(PeerAddr{one.substr(0, colon), std::uint16_t(port)});
+    }
+    return out;
+}
+
+std::string read_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot read " + path);
+    std::ostringstream out;
+    out << f.rdbuf();
+    return out.str();
 }
 
 std::string hex(std::span<const std::uint8_t> b) {
@@ -143,20 +181,106 @@ int main(int argc, char** argv) {
     if (const char* slash = std::strrchr(prog, '/')) prog = slash + 1;
     const std::string client_version = get_client_version(prog);
 
-    const long index     = arg(argc, argv, "--index", -1);
-    const long n         = arg(argc, argv, "--n", -1);
-    const long base_port = arg(argc, argv, "--base-port", -1);
-    if (index < 0 || n <= 0 || base_port <= 0 || index >= n) {
+    // The keys first: everything else is named by them. A validator that has
+    // none makes them here, once, and keeps them.
+    // The flags before the keys, so a mistyped command line leaves no keystore
+    // behind: making a validator identity is a thing to do on purpose.
+    const bool        publish        = has_flag(argc, argv, "--publish");
+    const std::string data           = arg_str(argc, argv, "--data", ".lux");
+    const auto        eth            = std::uint64_t(arg(argc, argv, "--chain-id", long(kLocalChainId)));
+    const std::string committee_path = arg_str(argc, argv, "--committee", "");
+    const std::string peer_list      = arg_str(argc, argv, "--peers", "");
+    if (!publish && (committee_path.empty() || peer_list.empty())) {
         std::fprintf(stderr,
-                     "usage: %s --index I --n N --base-port P [--rpc-port R] [--stake S]\n"
-                     "             [--deadline-ms D] [--blocks B] [--chain-id C] [--archive-rpc URL] [--light]\n", prog);
+                     "usage: %s --committee FILE --peers a:p,b:p,... [--data DIR] [--rpc-port R]\n"
+                     "             [--deadline-ms D] [--blocks B] [--chain-id C] [--archive-rpc URL]\n"
+                     "             [--import-chain-data PATH]\n"
+                     "       %s --data DIR --publish [--chain-id C]\n"
+                     "\n"
+                     "--committee names the validators of this network, one published line each;\n"
+                     "--publish makes a line for it. --peers gives every validator's mesh address\n"
+                     "in committee order, and the entry at this node's own seat is where it listens.\n"
+                     "A validator is named for a chain, so --chain-id decides who the file names.\n",
+                     prog, prog);
         return 2;
     }
-    const long stake       = arg(argc, argv, "--stake", 20);
+
+    // THE CHAIN A COMMITTEE LINE IS GOOD ON. It is not in the name — a node
+    // answers to one name everywhere — it is what every proof in the file is
+    // signed over, so a line published for another network authorises nothing
+    // here. Needed before the file is read, and it is the same 32 bytes every
+    // vote carries.
+    const Id chain_id = evm::chain_id(eth);
+
+    // The keys: everything else is named by them.
+    std::unique_ptr<Signer> mep;
+    try {
+        mep = std::make_unique<Signer>(Signer::open(data));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s: %s\n", prog, e.what());
+        return 2;
+    }
+    const Signer& me = *mep;
+
+    // What this validator publishes so others can put it in their committee.
+    // Public halves only; the proof is over this validator's own name.
+    if (publish) {
+        std::printf("%s\n", me.publish(chain_id).c_str());
+        return 0;
+    }
+
+    // The network, as it was written down. A malformed committee is not a
+    // smaller committee — it is a network this node has not been told about, so
+    // it refuses rather than starting on part of one.
+    std::unique_ptr<Committee> committeep;
+    std::vector<Validator>     set;
+    std::vector<PeerAddr>      addresses;
+    try {
+        committeep = std::make_unique<Committee>(Committee::read(read_file(committee_path), chain_id));
+        // Possession is checked HERE, at the door, and not taken on trust: a
+        // member whose proof does not bind its name to its key is refused.
+        set       = committeep->validators();
+        addresses = mesh_addresses(peer_list);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s: %s: %s\n", prog, committee_path.c_str(), e.what());
+        return 2;
+    }
+    const Committee& committee = *committeep;
+    const long       n         = long(committee.size());
+
+    // WHERE THIS NODE SITS COMES FROM THE FILE, not from a flag. Its seat is
+    // where its own identity is listed, so two processes cannot be told they
+    // are the same validator, and a validator cannot be handed a seat it holds
+    // no key for.
+    const auto seat = committee.seat(me.node());
+    if (!seat) {
+        std::fprintf(stderr,
+                     "%s: this validator (%s) is not in %s; add the line --publish prints\n",
+                     prog, hex(me.node()).c_str(), committee_path.c_str());
+        return 2;
+    }
+    const long index = long(*seat);
+
+    if (addresses.size() > std::size_t(n)) {
+        std::fprintf(stderr, "%s: --peers has more addresses than the committee has validators\n",
+                     prog);
+        return 2;
+    }
+    if (addresses.size() <= std::size_t(index)) {
+        std::fprintf(stderr, "%s: --peers has no address for this validator's own seat (%ld)\n",
+                     prog, index);
+        return 2;
+    }
+
     const long deadline_ms = arg(argc, argv, "--deadline-ms", 15000);
     const long rpc_port    = arg(argc, argv, "--rpc-port", 0);
     const long blocks      = arg(argc, argv, "--blocks", 0);  // 0 = until stopped
-    const auto chain_id    = std::uint64_t(arg(argc, argv, "--chain-id", long(kLocalChainId)));
+
+    // Go's flag, spelled Go's way, so one runbook drives all three
+    // implementations: luxd passes --import-chain-data through to the C-Chain's
+    // config and the VM reads the export at startup, before the chain serves
+    // anything. Same name, same moment, same idempotence.
+    const std::string import_path = arg_str(argc, argv, "--import-chain-data", "");
 
     std::string archive_rpc = arg_str(argc, argv, "--archive-rpc", "");
     if (archive_rpc.empty()) {
@@ -167,40 +291,28 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    // Deterministic validator set shared by every process; this node's own key.
-    std::vector<Key> keys;
-    for (long i = 0; i < n; ++i) keys.push_back(make_key(std::uint8_t(0x80 + i)));
-    std::vector<Validator> set;
-    for (const auto& k : keys) set.push_back({k.pk, std::uint64_t(stake)});
-
-    // The commitment to that set, which every vote binds. Computed with Go's
-    // encoding (lux/node/validators.hpp), so a node in a mixed cluster signs the
-    // same message luxd does.
-    //
-    // The node id and the uncompressed key are placeholders HERE and only here:
-    // this daemon derives its validator set from an index scheme rather than
-    // from a P-chain, so it has no node ids or uncompressed keys to commit to.
-    // A node joining a live network reads the EFFECTIVE set from the P-chain
-    // (/v1/chain/P/ops/validators/at?height=0) — the weight the P-chain
-    // computed, not the one genesis declared, and the 96-byte uncompressed key,
-    // not the 48-byte compressed one the proof of possession signs. Until that
-    // read exists, this commits to the set it actually has.
-    std::vector<SetMember> members;
-    for (long i = 0; i < n; ++i) {
-        SetMember m;
-        m.node_id.fill(std::uint8_t(0x80 + i));
-        m.weight = std::uint64_t(stake);
-        m.pubkey.assign(keys[i].pk.begin(), keys[i].pk.end());
-        members.push_back(std::move(m));
-    }
-    const Id set_root = validator_set_root(members);
+    // The commitment to that set, which every vote binds. Go's encoding, over
+    // the names and the UNCOMPRESSED keys the committee file already carries —
+    // so a validator here signs the same message a Go one does, and the number
+    // is a function of the file rather than of anything this process invented.
+    const Id set_root = committee.root();
 
     HostConfig cfg;
     cfg.index      = std::uint32_t(index);
-    cfg.port       = std::uint16_t(base_port + index);
-    cfg.sk         = keys[index].sk;
-    cfg.pk         = keys[index].pk;
+    cfg.port       = addresses[std::size_t(index)].port;
+    cfg.sk         = me.secret();
+    cfg.pk         = me.key();
     cfg.validators = set;
+    // HOW THIS NODE GREETS. The same identity the committee names it by, the
+    // same chain that names it, and the committee itself as the answer to "who
+    // is this?" — so a peer's seat is what it signed for, not what it typed.
+    cfg.link.me    = me.identity();
+    cfg.link.chain = chain_id;
+    cfg.link.seat  = [&committee](const Node& who) -> std::optional<std::uint32_t> {
+        const auto at = committee.seat(who);
+        if (!at) return std::nullopt;
+        return static_cast<std::uint32_t>(*at);
+    };
     // The committee IS the validator set: this node samples nobody, so a round is
     // "can I still reach a supermajority of the set". feasible() sizes k, the
     // threshold and β from n in one place, so a 5-node and a 33-node cluster run
@@ -217,7 +329,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<evm::Chain> chainp;
     try {
         hostp  = std::make_unique<Node2Host>(std::move(cfg));
-        chainp = std::make_unique<evm::Chain>(local_genesis(chain_id));
+        chainp = std::make_unique<evm::Chain>(local_genesis(eth));
     } catch (const std::exception& e) {
         std::fprintf(stderr, "node %ld: cannot start — %s\n", index, e.what());
         return 2;
@@ -226,11 +338,47 @@ int main(int argc, char** argv) {
     evm::Chain& chain = *chainp;
 
     const std::uint16_t port = host.listen_bind();
+    std::printf("node %ld: chain %s — the network its validators are entitled on\n", index,
+                hex(chain_id).c_str());
+    std::printf("node %ld: validator %s, seat %ld of %ld in %s\n", index,
+                hex(me.node()).c_str(), index, n, committee_path.c_str());
     std::printf("node %ld: consensus 127.0.0.1:%u  chain C (eth chainId %llu)\n",
                 index, port, static_cast<unsigned long long>(chain.eth_chain_id()));
     std::printf("node %ld: genesis state root %s\n", index, hex(chain.state_root()).c_str());
     std::printf("node %ld: validator set root %s\n", index, hex(set_root).c_str());
     std::fflush(stdout);
+
+    // ── the export, read before anything else looks at the chain ────────────
+    if (!import_path.empty()) {
+        try {
+            // The flag door's checkpoint: say where the read has got to, every
+            // 4096 blocks. A mainnet export is a million blocks and takes
+            // minutes, and an operator watching a silent process cannot tell a
+            // slow read from a wedged one.
+            const auto mark = [index](const Id& tip, std::uint64_t height) {
+                std::printf("node %ld: import at height %llu, tip %s\n", index,
+                            static_cast<unsigned long long>(height), hex(tip).c_str());
+                std::fflush(stdout);
+            };
+            const Import in = import_chain_data(chain, import_path, mark);
+            std::printf("node %ld: import %s\n", index, import_path.c_str());
+            std::printf("node %ld: import genesis %s\n", index, hex(in.genesis).c_str());
+            std::printf("node %ld: import tip %s height %llu time %llu\n", index,
+                        hex(in.tip).c_str(), static_cast<unsigned long long>(in.height),
+                        static_cast<unsigned long long>(in.timestamp));
+            std::printf("node %ld: import state root %s (carried from the header — an export "
+                        "holds blocks, not state)\n", index, hex(in.root).c_str());
+            std::printf("node %ld: import %llu blocks ingested, %llu already held, %llu "
+                        "transactions recovered\n", index,
+                        static_cast<unsigned long long>(in.blocks),
+                        static_cast<unsigned long long>(in.skipped),
+                        static_cast<unsigned long long>(in.txs));
+            std::fflush(stdout);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "node %ld: import failed — %s\n", index, e.what());
+            return 2;
+        }
+    }
 
     // ── the RPC, up before consensus ────────────────────────────────────────
     // It must answer while the mesh is still forming, so that "is it listening"
@@ -247,6 +395,10 @@ int main(int argc, char** argv) {
         rpc.set_archive_rpc(archive_rpc);
     }
     serve_eth(rpc, chain, client_version);
+    // The second door onto the reader the flag above already used. Two ways in,
+    // one implementation — a node that grew a separate reader per entry point
+    // would have two answers to what a block is, inside one binary.
+    serve_admin(rpc, chain);
     const std::string_view prog_view(prog ? prog : "");
     const std::string public_api = (prog_view == "zood" || prog_view.find("zoo") != std::string_view::npos)
                                        ? "https://api.zoo.network"
@@ -276,8 +428,8 @@ int main(int argc, char** argv) {
 
     // ── the mesh ────────────────────────────────────────────────────────────
     std::map<std::uint32_t, PeerAddr> peers;
-    for (long j = 0; j < n; ++j)
-        if (j != index) peers[std::uint32_t(j)] = PeerAddr{"127.0.0.1", std::uint16_t(base_port + j)};
+    for (std::size_t j = 0; j < addresses.size(); ++j)
+        if (long(j) != index) peers[std::uint32_t(j)] = addresses[j];
 
     // A transaction from a peer goes through the SAME door as one from an RPC
     // caller: decoded, its sender recovered, or refused. A peer is trusted with
@@ -297,9 +449,14 @@ int main(int argc, char** argv) {
         inbox.push_back(raw);
     });
 
-    const std::size_t   reached     = host.connect_mesh(peers, int(deadline_ms));
-    const std::uint64_t total_stake = std::uint64_t(n) * std::uint64_t(stake);
-    const std::uint64_t reachable   = std::uint64_t(reached + 1) * std::uint64_t(stake);
+    const std::size_t reached = host.connect_mesh(peers, int(deadline_ms));
+    // ONE LINE, ONE VOTE. A committee carries weight 1 per validator, so the
+    // set's total is the number of validators and the reachable stake is the
+    // number this node can still see, itself included. The stake a P-chain
+    // computed is a different fact from a different source, and when this node
+    // reads one the two numbers below are what change.
+    const std::uint64_t total_stake = std::uint64_t(n);
+    const std::uint64_t reachable   = std::uint64_t(reached + 1);
     if (reachable <= two_thirds_stake_floor(total_stake)) {
         std::printf("node %ld: NO QUORUM REACHABLE (peers=%zu/%ld, stake %llu of %llu, floor %llu)\n",
                     index, reached, n - 1,
@@ -329,6 +486,35 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     };
+
+    // ── a tip nobody here decided ───────────────────────────────────────────
+    //
+    // Reading an export moves the tip and leaves every consensus frontier below
+    // it missing, so this node knows a height it cannot walk down from. It
+    // stays UP — the RPC answers, so the imported history is readable and the
+    // state is visible rather than silent — and it does not enter the height
+    // loop. The engine would refuse each height anyway; saying so once, plainly,
+    // is the difference between a refusal and a node that looks wedged.
+    if (engine.vm().frontier() < engine.vm().last_accepted_height()) {
+        std::printf("node %ld: NOT A CAUGHT-UP VALIDATOR — tip is height %llu, this node's own "
+                    "decisions stop at height %llu\n", index,
+                    static_cast<unsigned long long>(engine.vm().last_accepted_height()),
+                    static_cast<unsigned long long>(engine.vm().frontier()));
+        std::printf("node %ld: cause: an export was read; it writes blocks and no certificates, "
+                    "so nothing below the tip was decided here\n", index);
+        std::printf("node %ld: effect: this node will NOT build blocks and will NOT vote until "
+                    "those heights are rebuilt from certified peer state\n", index);
+        std::fflush(stdout);
+        while (!g_stop.load()) {
+            host.pump();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        std::printf("node %ld: stopping at height %llu\n", index,
+                    static_cast<unsigned long long>(engine.height()));
+        std::fflush(stdout);
+        rpc.stop();
+        return 0;
+    }
 
     // ── the chain, one height at a time ─────────────────────────────────────
     int rc = 0;

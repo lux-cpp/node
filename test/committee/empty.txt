@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: BSD-3-Clause-Eco
+# every validator of this network
+
+   
+# ...and that is all of them

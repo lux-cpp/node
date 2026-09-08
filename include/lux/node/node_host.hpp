@@ -47,12 +47,17 @@ namespace lux::node {
 // Fixed identity + consensus parameters for one node instance. Peer discovery is
 // out of scope: the peer set is supplied to connect_mesh, fixed for the run.
 struct HostConfig {
-    std::uint32_t                              index;       // this node's validator index
+    std::uint32_t                              index;       // this node's own seat
     std::uint16_t                              port;        // requested listen port (0 = OS-assigned)
     std::array<std::uint8_t, 32>               sk;          // this node's BLS secret key
     lux::consensus::PubKey                    pk;          // this node's BLS public key
     std::vector<lux::consensus::Validator>    validators;  // the full, agreed validator set
     lux::consensus::WaveConfig                wave;        // liveness/voting committee config
+    // HOW THE MESH GREETS. The identity this node proves on every link, the
+    // chain it proves it on, and how a proven name becomes a seat. Without it a
+    // link cannot say who is on the other end, so there is no default: a node
+    // that could not name its peers would be back to trusting an integer.
+    Link                                       link;
 
     // The height this node has already DECIDED, read from its own durable store
     // before it starts. consensus::Party::mark_finalized_through names the embedder

@@ -38,6 +38,7 @@
 // must not.
 
 #include "lux/node/node_host.hpp"
+#include "names.hpp"
 #include "lux/consensus/threshold.hpp"
 #include "bls_signature.hpp"
 
@@ -88,6 +89,9 @@ VotePosition make_pos(std::uint8_t tag, std::uint64_t h) {
 
 std::vector<Key>       g_keys;
 std::vector<Validator> g_set;
+// The names every host here greets with: a link proves who answered, so a
+// host without one could not form a mesh at all. Made once in main.
+std::unique_ptr<test::Names> g_names;
 
 // Run one height on a real kN-host mesh. `booted_at` is the durable decided
 // height host 0 comes up with; every other host is fresh. Returns the witness's
@@ -104,6 +108,7 @@ std::vector<PubKey> voters_at_height(std::uint64_t booted_at) {
         cfg.pk         = g_keys[i].pk;
         cfg.validators = g_set;
         cfg.wave       = WaveConfig{kN, two_thirds_count(kN), kBeta};
+        cfg.link       = g_names->link(i);
         cfg.accepted   = (i == 0) ? booted_at : 0;   // THE ONE VARIABLE
         hosts.push_back(std::make_unique<Node2Host>(std::move(cfg)));
         ports[i] = hosts[i]->listen_bind();
@@ -155,6 +160,7 @@ int main() {
         g_keys.push_back(make_key(std::uint8_t(0xB0 + i)));
         g_set.push_back({g_keys.back().pk, kStake});
     }
+    g_names = std::make_unique<test::Names>(kN);
 
     // The control. Host 0 booted having decided only up to the height BELOW the
     // one on offer, so that height is still open to it: it signs, both votes
