@@ -28,9 +28,13 @@
 #pragma once
 
 #include "lux/node/mesh_vote_transport.hpp"
+#include "lux/node/pq_handshake.hpp"
 
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
+#include <optional>
 #include <string>
 
 namespace lux::node {
@@ -38,6 +42,30 @@ namespace lux::node {
 struct PeerAddr {
     std::string   host;
     std::uint16_t port;
+};
+
+// HOW A MESH GREETS, and what a greeting is worth.
+//
+// It used to be four plaintext bytes: an index the dialer CLAIMED, checked only
+// against the slots the acceptor happened to be waiting on. Anyone who could
+// reach the port could claim a seat, and the comment here said so — safety was
+// argued from the vote gate downstream, never from the link.
+//
+// Now the link is the validator handshake (LP-10602): both ends sign a running
+// transcript with their ML-DSA-65 identity, and the seat is where the committee
+// says that identity's name sits (LP-10603). A stranger cannot take a seat,
+// because it cannot sign for the name the seat belongs to — and there is one
+// greeting on this wire rather than two.
+struct Link {
+    // The identity this node proves. Held by value: a mesh outlives whatever
+    // read the keys off disk.
+    pq::Identity                 me;
+    // The chain both the handshake and the committee derive names under. The
+    // same 32 bytes, or the name proved is not the name seated.
+    std::array<std::uint8_t, 32> chain{};
+    // Who a proven name is, in seats. Empty answer: not a validator here, and
+    // the link is dropped.
+    std::function<std::optional<std::uint32_t>(const std::array<std::uint8_t, 20>&)> seat;
 };
 
 // Every blocking operation on a peer socket is bounded by this window, so no
@@ -55,10 +83,12 @@ inline constexpr int kDialAttemptMs = 250;
 
 class Mesh {
 public:
-    // `index` is this node's validator index — it decides dial direction and is
-    // what the handshake claims. `tx` receives every connected socket and outlives
-    // this Mesh.
-    Mesh(std::uint32_t index, MeshVoteTransport& tx) noexcept : index_(index), tx_(tx) {}
+    // `index` is this node's own seat — it decides dial direction. `how` is the
+    // greeting, and it is what turns a claimed seat into a proven one; it
+    // outlives this Mesh. `tx` receives every connected socket and outlives it
+    // too.
+    Mesh(std::uint32_t index, MeshVoteTransport& tx, const Link& how) noexcept
+        : index_(index), tx_(tx), link_(how) {}
     ~Mesh();
 
     Mesh(const Mesh&) = delete;
@@ -81,18 +111,20 @@ public:
     std::uint16_t port()  const noexcept { return bound_port_; }
 
 private:
-    // Take one inbound peer off the listen backlog: accept() + its 4-byte BE index
-    // handshake, both bounded. Sets `peer_index` to the index the dialer claimed —
-    // a claim, not a proof, which connect() checks against the slots it is waiting
-    // on. Returns the connected fd, or -1.
+    // Take one inbound peer off the listen backlog: accept(), then answer its
+    // greeting as the responder. Sets `peer_index` to the seat the peer PROVED,
+    // not one it asserted. Returns the connected fd, or -1.
     int accept_one(std::uint32_t& peer_index);
     // One dial attempt (no retry — the sweep in connect() owns the retry policy):
-    // non-blocking connect bounded by `wait_ms`, then our 4-byte BE index
-    // handshake. Returns the connected fd, or -1.
-    int dial_once(const PeerAddr& a, int wait_ms);
+    // non-blocking connect bounded by `wait_ms`, then the greeting as the
+    // initiator. `expect` is the seat this address was supposed to belong to; an
+    // address that turns out to belong to someone else is refused rather than
+    // believed. Returns the connected fd, or -1.
+    int dial_once(const PeerAddr& a, std::uint32_t expect, int wait_ms);
 
     std::uint32_t      index_;
     MeshVoteTransport& tx_;
+    const Link&        link_;
     int                listen_fd_  = -1;
     std::uint16_t      bound_port_ = 0;
 };

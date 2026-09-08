@@ -51,6 +51,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -302,6 +303,16 @@ int main(int argc, char** argv) {
     cfg.sk         = me.secret();
     cfg.pk         = me.key();
     cfg.validators = set;
+    // HOW THIS NODE GREETS. The same identity the committee names it by, the
+    // same chain that names it, and the committee itself as the answer to "who
+    // is this?" — so a peer's seat is what it signed for, not what it typed.
+    cfg.link.me    = me.identity();
+    cfg.link.chain = chain_id;
+    cfg.link.seat  = [&committee](const Node& who) -> std::optional<std::uint32_t> {
+        const auto at = committee.seat(who);
+        if (!at) return std::nullopt;
+        return static_cast<std::uint32_t>(*at);
+    };
     // The committee IS the validator set: this node samples nobody, so a round is
     // "can I still reach a supermajority of the set". feasible() sizes k, the
     // threshold and β from n in one place, so a 5-node and a 33-node cluster run

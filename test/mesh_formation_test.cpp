@@ -20,6 +20,9 @@
 //   fifth was down.
 
 #include "lux/node/node_host.hpp"
+#include "names.hpp"
+
+#include <span>
 #include "bls_signature.hpp"
 
 #include <array>
@@ -69,6 +72,9 @@ Key make_key(std::uint8_t tag) {
 
 std::vector<Key> g_keys;
 std::vector<Validator> g_set;
+// The names every host here greets with: a link proves who answered, so a
+// host without one could not form a mesh at all. Made once in main.
+std::unique_ptr<test::Names> g_names;
 
 std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
     HostConfig cfg;
@@ -78,6 +84,7 @@ std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
     cfg.pk         = g_keys[index].pk;
     cfg.validators = g_set;
     cfg.wave       = WaveConfig{kN, 3, 4};
+    cfg.link       = g_names->link(index);
     return std::make_unique<Node2Host>(std::move(cfg));
 }
 
@@ -114,6 +121,7 @@ int main() {
 
     for (std::uint32_t i = 0; i < kN; ++i) g_keys.push_back(make_key(std::uint8_t(0xC0 + i)));
     for (const auto& k : g_keys) g_set.push_back({k.pk, kStake});
+    g_names = std::make_unique<test::Names>(kN);
 
     // [A] the inbound half of the phase is bounded. Host 1 waits on an inbound
     //     connection from host 0, which never runs.
@@ -207,29 +215,56 @@ int main() {
         std::size_t reached = 0;
         std::thread forming([&] { reached = h->connect_mesh(peers, kDeadlineMs); });
 
-        // Claim validator 0 twice, and a validator that is not in the set at all.
+        // A SEAT IS PROVED, NOT CLAIMED. The first two connections are the old
+        // greeting — four bytes naming a validator index — and the third is a
+        // real handshake by a real identity that is in no committee. None of
+        // them can sign for a seat, so none of them gets one; the first two used
+        // to be enough to take one.
         std::vector<int> conns;
-        for (std::uint32_t claim : {0u, 0u, 9u}) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
             const int c = ::socket(AF_INET, SOCK_STREAM, 0);
             sockaddr_in a{};
             a.sin_family = AF_INET;
             a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             a.sin_port = htons(port);
-            if (::connect(c, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0) {
-                const std::uint8_t hs[4] = {std::uint8_t(claim >> 24), std::uint8_t(claim >> 16),
-                                            std::uint8_t(claim >> 8), std::uint8_t(claim)};
-                (void)::send(c, hs, sizeof hs, 0);
-                conns.push_back(c);
-            } else {
+            if (::connect(c, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
                 ::close(c);
+                continue;
             }
+            if (attempt < 2) {
+                const std::uint8_t claim[4] = {0, 0, 0, 0};  // "I am validator 0"
+                (void)::send(c, claim, sizeof claim, 0);
+            } else {
+                const Link  outsider = g_names->stranger();
+                const auto  out      = pq::run_initiator(
+                    outsider.me,
+                    [c](std::span<const std::uint8_t> b) {
+                        const auto f = pq::frame(b);
+                        (void)::send(c, f.data(), f.size(), 0);
+                    },
+                    [c]() -> std::vector<std::uint8_t> {
+                        std::uint8_t head[4];
+                        if (::recv(c, head, sizeof head, MSG_WAITALL) != ssize_t(sizeof head)) return {};
+                        std::array<std::uint8_t, 4> h{head[0], head[1], head[2], head[3]};
+                        std::vector<std::uint8_t> body(pq::body_size(h));
+                        if (::recv(c, body.data(), body.size(), MSG_WAITALL) != ssize_t(body.size()))
+                            return {};
+                        return body;
+                    },
+                    outsider.chain);
+                // The handshake itself may well complete — a stranger has a
+                // perfectly good key. What it does not have is a seat.
+                std::printf("  [E] a validator nobody seated: handshake %s\n",
+                            out.ok ? "completed, and it was still refused" : out.error.c_str());
+            }
+            conns.push_back(c);
             std::this_thread::sleep_for(std::chrono::milliseconds(60));
         }
         forming.join();
         for (int c : conns) ::close(c);
 
-        check(reached == 1, "[E] three connections claiming {0, 0, 9} filled exactly one slot");
-        std::printf("  [E] claims {0,0,9} against slots {0,1}: %zu peer(s) admitted\n", reached);
+        check(reached == 0, "[E] two stale index claims and one unseated validator take no slot");
+        std::printf("  [E] against slots {0,1}: %zu peer(s) admitted\n", reached);
     }
 
     // [D] regression: a complete set still forms a complete mesh, fast.

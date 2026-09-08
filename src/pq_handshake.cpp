@@ -48,14 +48,18 @@ std::vector<std::uint8_t> sign_ctx(std::span<const std::uint8_t> secret, std::st
     return sig;
 }
 
-bool verify_ctx(std::span<const std::uint8_t> public_key, std::string_view ctx,
-                std::span<const std::uint8_t> message, std::span<const std::uint8_t> sig) {
+}  // namespace
+
+bool verify(std::span<const std::uint8_t> public_key, std::string_view ctx,
+            std::span<const std::uint8_t> message, std::span<const std::uint8_t> sig) {
     return mldsa65_verify_ctx(
                const_cast<char*>(reinterpret_cast<const char*>(public_key.data())), int(public_key.size()),
                const_cast<char*>(ctx.data()), int(ctx.size()),
                const_cast<char*>(reinterpret_cast<const char*>(message.data())), int(message.size()),
                const_cast<char*>(reinterpret_cast<const char*>(sig.data())), int(sig.size())) == 0;
 }
+
+namespace {
 
 void write_private(const std::filesystem::path& path, std::span<const std::uint8_t> data) {
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -211,24 +215,38 @@ Identity Identity::open(const std::filesystem::path& dir) {
         id.pk_ = read_all(pk_path);
         id.sk_ = read_all(sk_path);
     } else {
-        // Braces, not parentheses around a functional cast: `vector<T> v(size_t(f()))`
-        // declares a FUNCTION taking a `size_t(*)()` and returning vector<T>. The
-        // most vexing parse, and the reason this file had never been compiled.
-        std::vector<std::uint8_t> pk(static_cast<std::size_t>(mldsa65_pk_size()));
-        std::vector<std::uint8_t> sk(static_cast<std::size_t>(mldsa65_sk_size()));
-        int pk_len = int(pk.size()), sk_len = int(sk.size());
-        if (mldsa65_keypair(reinterpret_cast<char*>(pk.data()), &pk_len,
-                            reinterpret_cast<char*>(sk.data()), &sk_len) != 0)
-            throw std::runtime_error("pq: mldsa65_keypair failed");
-        pk.resize(std::size_t(pk_len));
-        sk.resize(std::size_t(sk_len));
-        write_private(pk_path, pk);
-        write_private(sk_path, sk);
-        id.pk_ = std::move(pk);
-        id.sk_ = std::move(sk);
+        id = make();
+        write_private(pk_path, id.pk_);
+        write_private(sk_path, id.sk_);
     }
-    id.node_id_ = derive_node_id(id.pk_);
     return id;
+}
+
+Identity Identity::make() {
+    // Sized from the library, and NOT written as `vector<uint8_t> pk(size_t(f()))`:
+    // that declares a FUNCTION taking a `size_t(*)()`. The most vexing parse, and
+    // the reason this file had never been compiled.
+    const auto                pk_size = static_cast<std::size_t>(mldsa65_pk_size());
+    const auto                sk_size = static_cast<std::size_t>(mldsa65_sk_size());
+    std::vector<std::uint8_t> pk(pk_size), sk(sk_size);
+    int                       pk_len = int(pk_size), sk_len = int(sk_size);
+    if (mldsa65_keypair(reinterpret_cast<char*>(pk.data()), &pk_len,
+                        reinterpret_cast<char*>(sk.data()), &sk_len) != 0)
+        throw std::runtime_error("pq: mldsa65_keypair failed");
+    pk.resize(std::size_t(pk_len));
+    sk.resize(std::size_t(sk_len));
+    return of(std::move(pk), std::move(sk));
+}
+
+Identity Identity::of(std::vector<std::uint8_t> public_key, std::vector<std::uint8_t> secret_key) {
+    Identity id;
+    id.pk_ = std::move(public_key);
+    id.sk_ = std::move(secret_key);
+    return id;
+}
+
+std::array<std::uint8_t, 20> Identity::node_id(const std::array<std::uint8_t, 32>& chain) const {
+    return derive_node_id(pk_, chain);
 }
 
 Outcome run_initiator(const Identity& id,
@@ -261,7 +279,8 @@ Outcome run_initiator(const Identity& id,
     init_prefix.push_back(kProfileStrictPQ);
     init_prefix.insert(init_prefix.end(), chain_id.begin(), chain_id.end());
     init_prefix.push_back(kKEMSchemeMLKEM768);
-    init_prefix.insert(init_prefix.end(), id.node_id().begin(), id.node_id().end());
+    const auto me = id.node_id(chain_id);
+    init_prefix.insert(init_prefix.end(), me.begin(), me.end());
     append_lp(init_prefix, id.public_key());
     append_lp(init_prefix, kem_pk);
 
@@ -344,7 +363,7 @@ Outcome run_initiator(const Identity& id,
     std::vector<std::uint8_t> resp_prefix = init_bytes;
     resp_prefix.insert(resp_prefix.end(), resp_fields.begin(), resp_fields.end());
 
-    if (!verify_ctx(resp_mldsa_pub, kContextResponder, resp_prefix, resp_sig)) {
+    if (!verify(resp_mldsa_pub, kContextResponder, resp_prefix, resp_sig)) {
         out.error = "responder signature failed";
         return out;
     }
@@ -376,10 +395,15 @@ Outcome run_initiator(const Identity& id,
     //    proved possession of — verifyPQIdentityBinding, the same predicate
     //    luxd applies to OUR init. A signature over a transcript naming a
     //    NodeID proves only that the signer chose to name it; this is what
-    //    ties the name to the key, and the chain id is `ids.Empty` here
-    //    because that is the domain a node's primary identity is derived
-    //    under.
-    const auto derived = derive_node_id(resp_mldsa_pub);
+    //    ties the name to the key.
+    //
+    //    ON THIS CHAIN, which is where this parts company with Go: `peer.go`
+    //    derives the binding under `ids.Empty` whatever chain the handshake
+    //    carries, so it proves a name that is the same name on every network.
+    //    A committee names a validator OF a chain (LP-10603), so a link that
+    //    proved the chainless name would prove something the seat is not.
+    //    Identical to Go for the primary link, where the chain IS empty.
+    const auto derived = derive_node_id(resp_mldsa_pub, chain_id);
     if (derived != resp_node_id) {
         out.error = "peer identity binding failed: claimed NodeID does not match its ML-DSA key";
         return out;
@@ -389,6 +413,126 @@ Outcome run_initiator(const Identity& id,
     out.peer_node_id   = resp_node_id;
     out.peer_mldsa_pub = resp_mldsa_pub;
     out.aead_key       = key;
+    out.shared_secret  = shared_secret;
+    return out;
+}
+
+Outcome run_responder(const Identity& id,
+                      const std::function<void(std::span<const std::uint8_t>)>& write_frame,
+                      const std::function<std::vector<std::uint8_t>()>& read_frame,
+                      const std::array<std::uint8_t, 32>& chain_id) {
+    Outcome out;
+
+    // 1. Read INIT. A stranger's bytes, so every failure below is an outcome.
+    const auto init_bytes = read_frame();
+
+    std::uint8_t                 version = 0, profile = 0, scheme = 0;
+    std::array<std::uint8_t, 32> chain{};
+    std::array<std::uint8_t, 20> peer_node_id{};
+    std::vector<std::uint8_t>    peer_mldsa_pub, peer_kem_pub, peer_sig;
+    std::size_t                  prefix_len = 0;
+    try {
+        Cursor r(init_bytes);
+        version = r.u8();
+        profile = r.u8();
+        r.fixed(chain);
+        scheme = r.u8();
+        r.fixed(peer_node_id);
+        peer_mldsa_pub = r.bytes();
+        peer_kem_pub   = r.bytes();
+        // Where the signature begins is where the signed prefix ends. Read off
+        // the cursor rather than recomputed from the field widths: two ways to
+        // say the same length is one way to have them disagree.
+        prefix_len = init_bytes.size() - r.remaining();
+        peer_sig   = r.bytes();
+        if (r.remaining() != 0) { out.error = "INIT has trailing bytes"; return out; }
+    } catch (const std::exception& e) {
+        out.error = e.what();
+        return out;
+    }
+
+    // 2. Every axis and every length BEFORE the verifier runs — validateRemoteInit,
+    //    in its order and for its reason: a stranger does not get to spend this
+    //    node's ML-DSA verifier on bytes that were never going to be admitted.
+    if (version != kProtocolVersionV1) { out.error = "INIT: unexpected ProtocolVersion"; return out; }
+    if (profile != kProfileStrictPQ) { out.error = "INIT: unexpected Profile"; return out; }
+    if (chain != chain_id) { out.error = "INIT: ChainID mismatch"; return out; }
+    if (scheme != kKEMSchemeMLKEM768) { out.error = "INIT: unexpected KEMScheme"; return out; }
+    if (peer_node_id == std::array<std::uint8_t, 20>{}) { out.error = "INIT: NodeID is zero"; return out; }
+    if (peer_mldsa_pub.size() != std::size_t(mldsa65_pk_size())) {
+        out.error = "INIT: ML-DSA public key is the wrong size";
+        return out;
+    }
+    if (peer_kem_pub.size() != std::size_t(mlkem768_pk_size())) {
+        out.error = "INIT: KEM public key is the wrong size";
+        return out;
+    }
+    if (peer_sig.size() != std::size_t(mldsa65_sig_size())) {
+        out.error = "INIT: signature is the wrong size";
+        return out;
+    }
+    if (!verify(peer_mldsa_pub, kContextInitiator,
+                    std::span<const std::uint8_t>(init_bytes.data(), prefix_len), peer_sig)) {
+        out.error = "initiator signature failed";
+        return out;
+    }
+    if (derive_node_id(peer_mldsa_pub, chain_id) != peer_node_id) {
+        out.error = "peer identity binding failed: claimed NodeID does not match its ML-DSA key";
+        return out;
+    }
+
+    // 3. Encapsulate against the initiator's KEM key. This side HOLDS the
+    //    secret rather than recovering it — the asymmetry the initiator's
+    //    decapsulate mirrors.
+    std::vector<std::uint8_t>    kem_ct(static_cast<std::size_t>(mlkem768_ct_size()));
+    std::array<std::uint8_t, 32> shared_secret{};
+    {
+        int ctl = int(kem_ct.size()), ssl = int(shared_secret.size());
+        if (mlkem768_encapsulate(const_cast<char*>(reinterpret_cast<const char*>(peer_kem_pub.data())),
+                                 int(peer_kem_pub.size()),
+                                 reinterpret_cast<char*>(kem_ct.data()), &ctl,
+                                 reinterpret_cast<char*>(shared_secret.data()), &ssl) != 0) {
+            out.error = "mlkem768_encapsulate failed";
+            return out;
+        }
+        kem_ct.resize(std::size_t(ctl));
+    }
+
+    // 4. This node's own fields, signed with the WHOLE INIT in front of them.
+    const auto            me = id.node_id(chain_id);
+    std::vector<std::uint8_t> fields;
+    fields.push_back(kProtocolVersionV1);
+    fields.push_back(kProfileStrictPQ);
+    fields.insert(fields.end(), chain_id.begin(), chain_id.end());
+    fields.push_back(kKEMSchemeMLKEM768);
+    fields.insert(fields.end(), me.begin(), me.end());
+    append_lp(fields, id.public_key());
+    append_lp(fields, kem_ct);
+
+    std::vector<std::uint8_t> signed_over = init_bytes;
+    signed_over.insert(signed_over.end(), fields.begin(), fields.end());
+
+    const std::vector<std::uint8_t> sig = sign_ctx(id.secret_key(), kContextResponder, signed_over);
+    if (sig.empty()) {
+        out.error = "mldsa65_sign_ctx (RESP) failed";
+        return out;
+    }
+
+    std::vector<std::uint8_t> resp_canonical = fields;
+    append_lp(resp_canonical, sig);
+    write_frame(resp_canonical);
+
+    // 5. The same binding, the same hash, the same key — read off the same two
+    //    byte strings the initiator reads them off.
+    const auto bound  = bind_transcript(init_bytes, resp_canonical, kProfileStrictPQ, chain_id,
+                                        peer_mldsa_pub, id.public_key());
+    const auto digest = transcript_hash(bound);
+
+    out.ok             = true;
+    out.peer_node_id   = peer_node_id;
+    out.peer_mldsa_pub = peer_mldsa_pub;
+    out.aead_key       = aead_key(kKEMSchemeMLKEM768, shared_secret, digest);
+    out.shared_secret  = shared_secret;
     return out;
 }
 

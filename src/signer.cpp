@@ -13,12 +13,6 @@
 #include <span>
 #include <stdexcept>
 
-// libluxcrypto's C ABI — the same ML-DSA-65 the Go and Rust nodes are named by,
-// declared by the header cgo generates beside the archive rather than by hand.
-// A transcription of a C-linkage declaration is a thing that can be wrong and
-// still link; this file does not have one.
-#include <libluxcrypto.h>
-
 namespace lux::node {
 namespace {
 
@@ -79,37 +73,13 @@ void fill(std::span<std::uint8_t> out) {
 
 Signer Signer::open(const std::filesystem::path& dir) {
     std::filesystem::create_directories(dir);
-    const auto pub_at      = dir / "identity.pub";
-    const auto identity_at = dir / "identity.key";
-    const auto vote_at     = dir / "consensus.key";
+    const auto vote_at = dir / "consensus.key";
 
     Signer k;
 
-    // The name. ML-DSA carries no cheap public-from-secret derivation through
-    // this ABI, so both halves are kept — the public one is not a secret and is
-    // written the same way only because it sits beside one.
-    if (std::filesystem::exists(pub_at) && std::filesystem::exists(identity_at)) {
-        k.identity_ = read_whole(pub_at);
-        k.signer_   = read_whole(identity_at);
-    } else {
-        // Sized from the library rather than from a literal, and NOT written
-        // as `vector<uint8_t> pk(std::size_t(mldsa65_pk_size()))` — that is a
-        // function declaration, not a vector.
-        const auto                pk_size = static_cast<std::size_t>(mldsa65_pk_size());
-        const auto                sk_size = static_cast<std::size_t>(mldsa65_sk_size());
-        std::vector<std::uint8_t> pk(pk_size), sk(sk_size);
-        int                       pk_len = static_cast<int>(pk_size);
-        int                       sk_len = static_cast<int>(sk_size);
-        if (mldsa65_keypair(reinterpret_cast<char*>(pk.data()), &pk_len,
-                            reinterpret_cast<char*>(sk.data()), &sk_len) != 0)
-            throw std::runtime_error("signer: cannot make an identity");
-        pk.resize(std::size_t(pk_len));
-        sk.resize(std::size_t(sk_len));
-        write_secret(pub_at, pk);
-        write_secret(identity_at, sk);
-        k.identity_ = std::move(pk);
-        k.signer_   = std::move(sk);
-    }
+    // The name, from the ONE place this tree keeps an ML-DSA keypair. A second
+    // keystore here would be a second identity for one validator.
+    k.identity_ = pq::Identity::open(dir);
     // The vote.
     if (std::filesystem::exists(vote_at)) {
         const auto raw = read_whole(vote_at);
@@ -130,10 +100,6 @@ Signer Signer::open(const std::filesystem::path& dir) {
     return k;
 }
 
-Node Signer::node(const std::array<std::uint8_t, 32>& chain) const {
-    return pq::derive_node_id(identity_, chain);
-}
-
 std::string Signer::publish(const std::array<std::uint8_t, 32>& chain) const {
     const Node me = node(chain);
 
@@ -149,7 +115,7 @@ std::string Signer::publish(const std::array<std::uint8_t, 32>& chain) const {
                                       proof.data()) != 0)
         throw std::runtime_error("signer: cannot prove possession of the consensus key");
 
-    return Committee::line(identity_, key_, proof);
+    return Committee::line(identity_.public_key(), key_, proof);
 }
 
 }  // namespace lux::node

@@ -10,7 +10,7 @@
 // formats this way (consensus engine/chain/cert_wire_vector_test.go); this is the
 // same discipline for the two things node owns end to end:
 //
-//   the peer handshake   [4-byte BE validator index]
+//   the greeting's frame [4-byte BE length][that many bytes]  (LP-10602)
 //   a vote frame         [4-byte BE length][1-byte msg_type][payload]
 //                        payload = three ZAP length-framed fields:
 //                          [4-byte BE 32][block_id  32]
@@ -25,6 +25,7 @@
 
 #include "lux/node/mesh_vote_transport.hpp"
 #include "lux/node/node_host.hpp"
+#include "names.hpp"
 #include "bls_signature.hpp"
 
 #include <array>
@@ -164,6 +165,8 @@ int main() {
         cfg.pk         = pk;
         cfg.validators = {{pk, 20}};
         cfg.wave       = WaveConfig{1, 1, 1};
+        const test::Names names(1);
+        cfg.link       = names.link(0);
         Node2Host host(std::move(cfg));
         host.listen_bind();
 
@@ -172,11 +175,24 @@ int main() {
             host.connect_mesh(peers, 2000);
         });
 
+        // The dialer no longer announces an index. It greets: a 4-byte
+        // big-endian length and that many bytes, and the bytes are a signed
+        // INIT (LP-10602 — pq_vector_test holds their contents to a handshake
+        // Go produced). What is pinned HERE is the framing: the length is big
+        // endian, it counts the body and nothing else, and there is no tag byte
+        // in front of it — the one difference from the vote frame below.
         const int conn = ::accept(srv, nullptr, nullptr);
-        const std::vector<std::uint8_t> got = read_n(conn, 4);
-        const std::vector<std::uint8_t> want{0x00, 0x00, 0x00, 0x05};  // index 5, big-endian
-        check(got == want, "the dialer announces its validator index as 4 big-endian bytes");
-        std::printf("  handshake: %s (validator index 5)\n", hex(got, 4).c_str());
+        const std::vector<std::uint8_t> head = read_n(conn, 4);
+        const std::uint32_t announced =
+            (std::uint32_t(head[0]) << 24) | (std::uint32_t(head[1]) << 16) |
+            (std::uint32_t(head[2]) << 8) | std::uint32_t(head[3]);
+        const std::vector<std::uint8_t> body = read_n(conn, announced);
+        check(body.size() == announced, "the greeting's length counts the body, big-endian");
+        // 1 + 1 + 32 + 1 + 20 + (4+1952) + (4+1184) + (4+3309) = 6512.
+        check(announced == 6512, "and an ML-KEM-768 INIT under ML-DSA-65 is 6512 bytes of it");
+        check(body[0] == 0x01 && body[1] == 0x01,
+              "which begins with the version and the profile, not a message tag");
+        std::printf("  greeting:  %s... %u bytes\n", hex(head, 4).c_str(), announced);
 
         dial.join();
         ::close(conn);

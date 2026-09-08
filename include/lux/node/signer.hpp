@@ -27,6 +27,7 @@
 
 #include "lux/consensus/quorum_cert_engine.hpp"  // PubKey
 #include "lux/node/committee.hpp"                // Node, and the naming rule
+#include "lux/node/pq_handshake.hpp"             // Identity — the ML-DSA half
 
 #include <array>
 #include <cstdint>
@@ -44,7 +45,14 @@ public:
     [[nodiscard]] static Signer open(const std::filesystem::path& dir);
 
     // The name this validator is known by on `chain`.
-    [[nodiscard]] Node node(const std::array<std::uint8_t, 32>& chain) const;
+    [[nodiscard]] Node node(const std::array<std::uint8_t, 32>& chain) const {
+        return identity_.node_id(chain);
+    }
+
+    // The identity a link proves. One ML-DSA keypair in this process: the name
+    // in the committee and the name on the wire are the same key, so they
+    // cannot be kept in step — they are the same fact.
+    [[nodiscard]] const pq::Identity& identity() const noexcept { return identity_; }
 
     [[nodiscard]] const std::array<std::uint8_t, 32>& secret() const noexcept { return secret_; }
     [[nodiscard]] const lux::consensus::PubKey&       key() const noexcept { return key_; }
@@ -56,8 +64,7 @@ public:
     [[nodiscard]] std::string publish(const std::array<std::uint8_t, 32>& chain) const;
 
 private:
-    std::vector<std::uint8_t>    identity_;  // ML-DSA-65 public key
-    std::vector<std::uint8_t>    signer_;    // ML-DSA-65 secret key
+    pq::Identity                 identity_;  // ML-DSA-65, the name
     std::array<std::uint8_t, 32> secret_{};  // BLS secret
     lux::consensus::PubKey       key_{};     // BLS public, compressed
 };

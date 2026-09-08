@@ -233,7 +233,7 @@ conan install ../../luxcpp/cevm -pr ../../luxcpp/cevm/.github/conan/manylinux-re
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=../../luxcpp/cevm/build-node/build/Release/generators/conan_toolchain.cmake
 cmake --build build -j
-ctest --test-dir build --output-on-failure    # 52: node, consensus, and cevm's parity gates
+ctest --test-dir build --output-on-failure    # 53: node, consensus, and cevm's parity gates
                                              # (evm-gethdiff skips without a geth to diff)
 ./scripts/chain.sh                            # 5 processes serving one C-Chain over JSON-RPC
 ./scripts/cluster.sh build/noded 19310 5      # 5 real PROCESSES, consensus only
@@ -256,6 +256,13 @@ differs (`consensus::Node` is `consensus::Party`, and its constructor no longer
 takes α). Use a worktree pinned to the commit you mean and pass
 `-DCONSENSUS_DIR`.
 
+- `pq_vector_test` — the validator link (LP-10602) held to a handshake the GO
+  node produced: `test/pq/handshake.json` carries the RESP frame
+  `mesh/peer.RunPQHandshakeConn` wrote, the INIT frame it accepted, and the
+  session key it derived. Both transcript prefixes are rebuilt here and proven
+  by the signatures over them, the binding and the key are recomputed, and a
+  vector with one byte moved is refused. `--against host:port` regenerates it
+  against a live Go responder.
 - `committee_test` — the network description: the parse, the four refusals, the
   seat, the root, and the possession proof. The fixtures are REAL FILES and half
   of them were published by the Rust node, so "both read this" is a fact about
@@ -317,7 +324,43 @@ asserted in a comment.
   file feeds it the same bytes the Go P-chain path would — the 20-byte node id,
   weight big-endian, and the key UNCOMPRESSED.
 
-Two things found while pinning that root, both in trees this repo only reads:
+## The link two validators run before a frame
+
+The mesh used to greet with four plaintext bytes: an index the dialer CLAIMED.
+Anyone who could reach the port could claim a seat, and the code said so — safety
+was argued from the vote gate downstream, never from the link. That is gone.
+
+A link is now LP-10602: ML-DSA-65 over a running transcript in each direction,
+ML-KEM-768 in the responder's, a session key from both, and the role in the FIPS
+204 context so a captured signature is not a signature in the other direction.
+The seat is where the committee says the PROVEN name sits, so an address that
+turns out to belong to someone else is refused rather than believed, and a
+validator nobody seated is refused even though its handshake completes.
+
+Held to Go, not to itself: a C++ initiator completed a handshake against
+`mesh/peer.RunPQHandshakeConn` with the C++ daemon's own keypair, both ends
+derived `6c7de15f…0c5ba4f5`, and each derived the other's name identically. That
+exchange is `test/pq/handshake.json`.
+
+Three things about it worth knowing before touching it:
+
+- **`mldsa65_sign_ctx` takes the CONTEXT before the message.** The C++ had the
+  transcription the other way round, which links cleanly under C linkage and
+  makes the library answer -2 to every signature. Both the library and the tests
+  now `#include <libluxcrypto.h>` instead of restating the ABI.
+- **This node cannot sign deterministically.** LP-10602 asks for it and Go does it
+  (`mldsa65.SignTo(..., randomized=false)`); the C ABI goes through
+  `priv.SignCtx(rand.Reader, ...)`, so two signatures over one message differ.
+  Measured. A vector's signatures are therefore VERIFIED here, not reproduced —
+  which still pins every byte of the transcript they cover. A deterministic entry
+  point in `luxfi/crypto`'s cabi would close it.
+- **Go binds the peer's name under `ids.Empty`,** whatever chain the handshake
+  carries (`peer.go verifyPQIdentityBinding`). This binds it under the handshake's
+  chain, because a committee names a validator OF a chain and a link that proved
+  the chainless name would prove something the seat is not. Identical to Go on the
+  primary link, where the chain is empty.
+
+Two things found while pinning the set root, both in trees this repo only reads:
 
 - **Go's own root depends on how Go was built.** `SetRoot` hashes whatever bytes
   the caller hands it, and the caller hands it

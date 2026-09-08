@@ -21,6 +21,7 @@
 // fails hard. Never flaky.
 
 #include "lux/node/node_host.hpp"
+#include "names.hpp"
 #include "bls_signature.hpp"
 
 #include <array>
@@ -80,6 +81,11 @@ int main() {
     std::vector<Validator> set;
     for (const auto& k : keys) set.push_back({k.pk, kStake});
 
+    // The names these five greet with. A link proves who is on the other end, so
+    // a host that had none could not form one; declared before `hosts` because
+    // every link borrows from it.
+    const test::Names names(kN);
+
     // ── construct hosts; bind ephemeral loopback listeners (all up before any dial) ──
     std::vector<std::unique_ptr<Node2Host>> hosts;
     std::vector<std::uint16_t> ports(kN);
@@ -91,6 +97,7 @@ int main() {
         cfg.pk         = keys[i].pk;
         cfg.validators = set;
         cfg.wave       = WaveConfig{kN, 4, 4};  // threshold int(5*0.8)=4: a 5-reachable round votes
+        cfg.link       = names.link(i);
         hosts.push_back(std::make_unique<Node2Host>(std::move(cfg)));
         ports[i] = hosts[i]->listen_bind();
         std::printf("  node %u  listening on 127.0.0.1:%u\n", i, ports[i]);

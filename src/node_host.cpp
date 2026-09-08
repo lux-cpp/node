@@ -12,7 +12,7 @@ Node2Host::Node2Host(HostConfig cfg)
       // set just below is safe.
       tx_(std::make_unique<MeshVoteTransport>(
           [this](const lux::consensus::SignedVote& v) { deliver(v); })),
-      mesh_(cfg_.index, *tx_),
+      mesh_(cfg_.index, *tx_, cfg_.link),
       node_(std::make_unique<lux::consensus::Party>(
           cfg_.index, cfg_.sk, cfg_.pk, cfg_.validators,
           cfg_.wave, *tx_)) {

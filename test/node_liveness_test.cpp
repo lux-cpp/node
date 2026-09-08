@@ -27,6 +27,7 @@
 // the test fails hard.
 
 #include "lux/node/node_host.hpp"
+#include "names.hpp"
 #include "bls_signature.hpp"
 
 #include <array>
@@ -73,6 +74,9 @@ VotePosition make_pos(std::uint8_t tag, std::uint64_t h) {
 
 // The shared validator set (all 5 validators, whether or not their host runs).
 std::vector<Validator> g_set;
+// The names every host here greets with: a link proves who answered, so a
+// host without one could not form a mesh at all. Made once in main.
+std::unique_ptr<test::Names> g_names;
 std::vector<Key> g_keys;
 
 std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
@@ -83,6 +87,7 @@ std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
     cfg.pk         = g_keys[index].pk;
     cfg.validators = g_set;
     cfg.wave       = WaveConfig{kN, 4, 4};
+    cfg.link       = g_names->link(index);
     return std::make_unique<Node2Host>(std::move(cfg));
 }
 
@@ -146,6 +151,7 @@ int main() {
 
     for (std::uint32_t i = 0; i < kN; ++i) g_keys.push_back(make_key(std::uint8_t(0xA0 + i)));
     for (const auto& k : g_keys) g_set.push_back({k.pk, kStake});
+    g_names = std::make_unique<test::Names>(kN);
 
     // ── [A] DOWN validator: 4 of 5 run, mesh among themselves, finalize on the wire ─
     {

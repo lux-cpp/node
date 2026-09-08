@@ -271,9 +271,11 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #                   refusal that follows a tip nobody here decided
 #   pq_handshake    the strict-PQ peer handshake: Go's own answers to the three
 #                   derivations, then a full exchange over a real socket pair
+#   pq_vector       the validator link held to a handshake the GO node produced:
+#                   its frames, its names, its session key (LP-10602)
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root committee chain_route archive_proxy block_reject import pq_handshake)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root committee chain_route archive_proxy block_reject import pq_handshake pq_vector)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
@@ -286,6 +288,11 @@ endforeach()
 # literals that were typed twice.
 target_compile_definitions(committee_test PRIVATE
   COMMITTEE_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/test/committee")
+
+# Same discipline for the link: the vector is a file, and it came off a wire
+# with a Go node at the other end of it.
+target_compile_definitions(pq_vector_test PRIVATE
+  PQ_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/test/pq")
 
 # Apply NODE_SANITIZE to node's own targets only (the consensus subdir scopes
 # its own; blst/bls stay clean). One place for the whole node surface.
