@@ -233,7 +233,7 @@ conan install ../../luxcpp/cevm -pr ../../luxcpp/cevm/.github/conan/manylinux-re
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=../../luxcpp/cevm/build-node/build/Release/generators/conan_toolchain.cmake
 cmake --build build -j
-ctest --test-dir build --output-on-failure    # 53: node, consensus, and cevm's parity gates
+ctest --test-dir build --output-on-failure    # 54: node, consensus, and cevm's parity gates
                                              # (evm-gethdiff skips without a geth to diff)
 ./scripts/chain.sh                            # 5 processes serving one C-Chain over JSON-RPC
 ./scripts/cluster.sh build/noded 19310 5      # 5 real PROCESSES, consensus only
@@ -256,6 +256,10 @@ differs (`consensus::Node` is `consensus::Party`, and its constructor no longer
 takes α). Use a worktree pinned to the commit you mean and pass
 `-DCONSENSUS_DIR`.
 
+- `plugin_test` — a REAL Go VM plugin, started the way the Go node starts one
+  and driven through initialize, set-state, get, parse. Skips with a notice when
+  no plugin path is given, which is the one test here that can pass by doing
+  nothing — run it with one.
 - `pq_vector_test` — the validator link (LP-10602) held to a handshake the GO
   node produced: `test/pq/handshake.json` carries the RESP frame
   `mesh/peer.RunPQHandshakeConn` wrote, the INIT frame it accepted, and the
@@ -323,6 +327,75 @@ asserted in a comment.
 - **The validator-set root** is `luxfi/validators SetRoot`, and the committee
   file feeds it the same bytes the Go P-chain path would — the 20-byte node id,
   weight big-endian, and the key UNCOMPRESSED.
+
+## A chain in another process
+
+The Go node does not link its chains in; it runs each as a separate program and
+speaks ZAP to it. Every chain that is not the C-Chain — P, X, Q, Z and the rest
+— exists as one of those programs today, so a host that can run them does not
+need a port of each. `plugin::Chain` is a `node::VM`, so the engine cannot tell
+which side of the boundary its chain is on.
+
+PROVEN AGAINST A REAL PLUGIN, the shipped EVM binary
+(`build/plugins/mgj786NP7uDwBCcq6YwThhaN8FLyybkCa4zBWTQbNgmK6k9A6`, v0.18.19).
+It came up under this host and answered:
+
+```
+last accepted 0xbb2e5a9273dc3c0562b7cdda58c8a75c5708ee8382d7de7e90f0f94e195fbaba  height 0
+580 bytes, parent 0x0000…0000
+state root    0x275cf305b6494e020a03167b7c3ca616ae5058aa56537b523a4deb754f4327f6
+```
+
+`plugin_test /path/to/plugin` (or `LUX_VM_PLUGIN=`) runs it. With no plugin it
+says so and passes.
+
+### The interop contract, as the Go node performs it
+
+Nobody had written this down; it is `vms/rpcchainvm/factory.go` and
+`runtime/subprocess/runtime_zap.go` read off the code, and every step below cost
+a failed run to find:
+
+1. The NODE binds a bootstrap listener — TCP on 127.0.0.1:0, or a unix socket
+   under a temp dir when `LUXD_VM_UNIX_SOCKET=1`.
+2. It execs the plugin with the parent environment plus `VM_TRANSPORT=zap`,
+   `VM_RUNTIME_ENGINE_ADDR=<that address>` and `LUX_VM_RUNTIME_ENGINE_ADDR=`
+   (the pre-rename key, for plugins built before it).
+3. The PLUGIN binds its own address and dials the bootstrap listener, writing
+   `[4-byte BE length][4-byte BE protocol][address as text]`, length counting
+   the version and the address.
+4. The node refuses a protocol that is not its own — 42 — and then **writes one
+   byte, 0x01**. Skip it and the plugin logs `failed to read handshake ack: EOF`
+   and exits, and the address it just reported answers nothing.
+5. The node dials that address. From there it is ZAP:
+   `[4-byte BE length][1-byte type][payload]`, every request and response
+   payload beginning with a 4-byte big-endian request id; a response is the
+   request's type with 0x80, an error adds 0x40.
+6. `MsgInitialize` (1) with `XChainID`, `CChainID` and `UTXOAssetID` at their
+   FULL 32 bytes even when the network has none — a plugin refuses a short one:
+   `initialize xChainID: invalid hash length: expected 32 bytes but got 0`.
+7. `MsgSetState` (2) to Bootstrapping and then Ready BEFORE building. Asked to
+   build while still bootstrapping, the EVM plugin dereferences nil and the call
+   comes back as `panic in handler`.
+
+Three findings came out of making that work:
+
+- **The shipped plugin cannot use a unix socket.** It infers the network from
+  the address and dials `tcp` on any of them:
+  `dial tcp: address /tmp/luxd-vm-*/vm.sock: missing port in address`. That is
+  why Go's socket path is opt-in, and this host matches Go rather than
+  preferring the better transport.
+- **`luxcpp/zap-cpp-core`'s client cannot read a Go plugin's error.** Go writes
+  the error body RAW after the request id (`api/zap/transport.go:507`); the C++
+  `ZapClient` reads it as a length-prefixed string and, failing that, drops the
+  payload — so every real error arrives as `truncated error response`. The codec
+  (frames, `Reader`, `Writer`) is used as it stands; the call/answer pairing is
+  nine lines in `plugin.cpp` until the SDK is fixed.
+- **The execution state root does not cross this boundary.** `BlockResponse`
+  carries id, parent, bytes, height and timestamp and no root, because Go's
+  proposervm answers `ids.Empty` for that axis. A plugin-hosted chain must
+  therefore be driven with `Binding::Transport`; `plugin::Remote::root()`
+  answers the empty id and says so rather than inventing one. The root above was
+  read out of the block's own bytes.
 
 ## The link two validators run before a frame
 

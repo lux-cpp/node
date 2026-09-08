@@ -200,6 +200,7 @@ add_library(node STATIC
     src/eth.cpp           # the eth methods, mounted on an Rpc
     src/validators.cpp    # the set-root commitment a vote binds
     src/committee.cpp     # the network description all three daemons read
+    src/plugin.cpp        # a chain in another process, over ZAP
     src/signer.cpp        # this validator's own name and voting key
     src/staking.cpp        # a luxd peer's identity: P-256 cert + NodeID + BLS + ML-DSA
     src/peer_tls.cpp       # TLS 1.3 + X25519MLKEM768, over AWS-LC
@@ -273,9 +274,11 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #                   derivations, then a full exchange over a real socket pair
 #   pq_vector       the validator link held to a handshake the GO node produced:
 #                   its frames, its names, its session key (LP-10602)
+#   plugin          a REAL Go VM plugin, started the way the Go node starts one
+#                   and driven through a height over ZAP
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root committee chain_route archive_proxy block_reject import pq_handshake pq_vector)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root committee chain_route archive_proxy block_reject import pq_handshake pq_vector plugin)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
