@@ -145,6 +145,8 @@ struct Responder {
     std::vector<std::uint8_t>    pk, sk;
     std::array<std::uint8_t, 32> aead{};
     bool                          init_signature_ok = false;
+    // Why this responder gave up, when it did. Empty means it did not.
+    std::string                   failed;
 
     // Knobs for the refusal cases. Each one changes exactly one byte of what
     // a correct responder would say.
@@ -189,9 +191,9 @@ struct Responder {
             init_signature_ok =
                 mldsa65_verify_ctx(reinterpret_cast<char*>(const_cast<std::uint8_t*>(init_mldsa_pub.data())),
                                    int(init_mldsa_pub.size()),
-                                   const_cast<char*>(kCtx.data()), int(kCtx.size()),
                                    reinterpret_cast<char*>(const_cast<std::uint8_t*>(init.data())),
                                    int(prefix_len),
+                                   const_cast<char*>(kCtx.data()), int(kCtx.size()),
                                    reinterpret_cast<char*>(const_cast<std::uint8_t*>(init_sig.data())),
                                    int(init_sig.size())) == 0;
         }
@@ -230,10 +232,16 @@ struct Responder {
             static constexpr std::string_view kCtx = "NODE_PQ_HANDSHAKE_V1/responder";
             int sig_len = int(sig.size());
             if (mldsa65_sign_ctx(reinterpret_cast<char*>(sk.data()), int(sk.size()),
-                                 const_cast<char*>(kCtx.data()), int(kCtx.size()),
                                  reinterpret_cast<char*>(signed_over.data()), int(signed_over.size()),
-                                 reinterpret_cast<char*>(sig.data()), &sig_len) != 0)
-                throw std::runtime_error("mldsa65_sign_ctx failed");
+                                 const_cast<char*>(kCtx.data()), int(kCtx.size()),
+                                 reinterpret_cast<char*>(sig.data()), &sig_len) != 0) {
+                // SAY SO. A responder that throws here closes its socket, and
+                // the initiator reports "recv failed or peer hung up" — which
+                // every refusal case below then passes on, for the wrong
+                // reason. This has masked a broken signer twice.
+                failed = "mldsa65_sign_ctx failed (the argument order, again?)";
+                throw std::runtime_error(failed);
+            }
             sig.resize(std::size_t(sig_len));
         }
         if (corrupt_signature) sig[0] ^= 0x01;
@@ -379,6 +387,51 @@ int main() {
     }
 
     // ── 3. Framing ──────────────────────────────────────────────────────
+    // ── the ABI itself ──────────────────────────────────────────────────────
+    //
+    // THE ONE THING NO COMPILER CHECKS. `mldsa65_sign_ctx_det` and
+    // `mldsa65_verify_ctx` take four (char*, int) pairs, so every permutation of
+    // secret, message and context compiles, links and runs. Two builds of
+    // libluxcrypto have shipped with the message and the context the other way
+    // round from each other, and this file has been on both sides of it.
+    //
+    // A SHORT MESSAGE CANNOT TELL THEM APART. FIPS 204 caps a context at 255
+    // bytes and says nothing about message length, so with the two swapped
+    // everything up to 255 bytes still signs and verifies; 256 and up return
+    // -2. Measured against the published library:
+    //
+    //   length     1  100  254  255  256  512  3199  6512  9615  16384
+    //   correct    0    0    0    0    0    0     0     0     0      0
+    //   swapped    0    0    0    0   -2   -2    -2    -2    -2     -2
+    //
+    // So this signs 6512 bytes — the length of a real INIT — and refuses to
+    // believe a shorter one would have told us anything.
+    std::printf("\nThe C ABI, round-tripped (the order nothing else checks):\n");
+    {
+        const auto id = pq::Identity::make();
+
+        std::vector<std::uint8_t> transcript(6512, 0xAB);
+        const auto sig = pq::sign(id.secret_key(), pq::kContextInitiator, transcript);
+        check(!sig.empty(), "a 6512-byte transcript signs — the length of a real INIT");
+        check(pq::verify(id.public_key(), pq::kContextInitiator, transcript, sig),
+              "and verifies under the context it was signed with");
+        check(!pq::verify(id.public_key(), pq::kContextResponder, transcript, sig),
+              "and not under the other role's context");
+
+        // Deterministic, which is what lets a handshake be published.
+        const auto again = pq::sign(id.secret_key(), pq::kContextInitiator, transcript);
+        check(again == sig, "signing it twice gives the same bytes");
+
+        // The boundary that hides a swap: 255 bytes proves nothing, 256 does.
+        const std::vector<std::uint8_t> under(255, 0xCD), over(256, 0xCD);
+        const auto                      su = pq::sign(id.secret_key(), pq::kContextInitiator, under);
+        const auto                      so = pq::sign(id.secret_key(), pq::kContextInitiator, over);
+        check(!su.empty() && pq::verify(id.public_key(), pq::kContextInitiator, under, su),
+              "255 bytes signs and verifies — as it would with the arguments swapped");
+        check(!so.empty() && pq::verify(id.public_key(), pq::kContextInitiator, over, so),
+              "256 bytes does too, which is the byte that says the order is right");
+    }
+
     std::printf("\nFraming (network/peer/pq_frame.go), 4-byte big-endian, 16 KiB:\n");
     {
         const std::vector<std::uint8_t> body{0xDE, 0xAD, 0xBE, 0xEF};
@@ -420,6 +473,8 @@ int main() {
         Responder  r;
         const auto out = exchange(id, r);
         check(out.ok, std::string("the handshake completes") + (out.ok ? "" : ": " + out.error));
+        check(r.failed.empty(), "the responder got through its own half: " +
+                                    (r.failed.empty() ? std::string("no complaint") : r.failed));
         check(r.init_signature_ok,
               "the responder verifies this node's INIT under NODE_PQ_HANDSHAKE_V1/initiator");
         check(out.peer_node_id == pq::derive_node_id(r.pk),

@@ -14,13 +14,21 @@
 
 // lux-crypto's C ABI, INCLUDED rather than transcribed.
 //
-// These have C linkage, so a hand-written declaration whose parameter order
-// disagrees with the definition links cleanly and the arguments arrive in the
-// wrong registers. That is not hypothetical: this file carried a transcription
-// with the message before the context, which is the opposite of what cgo
-// generates, and the library answered -2 to every signature it was asked for.
-// The header that ships beside the archive is the one statement of the ABI, so
-// it is the one this file reads.
+// These have C linkage, so a declaration whose parameter order disagrees with
+// the definition links cleanly and the arguments arrive in the wrong registers.
+// The four are (char*, int) pairs, so every permutation compiles. This file has
+// now been on both sides of that: it was written for the PUBLISHED order — the
+// message before the context — and then "corrected" to a local snapshot of the
+// library whose _ctx pair is in the other order, which is a copy nobody
+// publishes. The header that ships beside the archive is the one statement of
+// the ABI, so it is the one this file reads; and `round_trips` in
+// pq_handshake_test is what says the two agree, because nothing else can.
+//
+// The symptom of a swap is worth knowing, because it does not look like one: a
+// FIPS 204 context is capped at 255 bytes, so a transcript passed as the
+// context is refused only when it is LONGER than that. Everything shorter
+// signs and verifies. It reads as a message-size limit and is nothing of the
+// kind.
 //
 // The `_ctx` variants exist because the unqualified mldsa65_sign/verify
 // hardcode an EMPTY FIPS 204 context, and the same bytes signed under a
@@ -31,9 +39,9 @@ namespace lux::node::pq {
 
 namespace {
 
-// THE ARGUMENT ORDER, SAID ONCE. Secret, then context, then message — cgo's
-// order, and the only order the library answers to. Everything else in this
-// file asks for a signature by name.
+// THE ARGUMENT ORDER, SAID ONCE. Secret, then MESSAGE, then context — the
+// order the published library declares, for all three of sign, sign-det and
+// verify. Everything else in this file asks for a signature by name.
 //
 // AND IT IS THE DETERMINISTIC ENTRY POINT. FIPS 204 signing is hedged by
 // default and that is the right default in general — the per-signature
@@ -50,8 +58,8 @@ std::vector<std::uint8_t> sign(std::span<const std::uint8_t> secret, std::string
     int                       len = int(sig.size());
     const int                 rc  = mldsa65_sign_ctx_det(
         const_cast<char*>(reinterpret_cast<const char*>(secret.data())), int(secret.size()),
-        const_cast<char*>(ctx.data()), int(ctx.size()),
         const_cast<char*>(reinterpret_cast<const char*>(message.data())), int(message.size()),
+        const_cast<char*>(ctx.data()), int(ctx.size()),
         reinterpret_cast<char*>(sig.data()), &len);
     if (rc != 0) return {};
     sig.resize(std::size_t(len));
@@ -62,8 +70,8 @@ bool verify(std::span<const std::uint8_t> public_key, std::string_view ctx,
             std::span<const std::uint8_t> message, std::span<const std::uint8_t> sig) {
     return mldsa65_verify_ctx(
                const_cast<char*>(reinterpret_cast<const char*>(public_key.data())), int(public_key.size()),
-               const_cast<char*>(ctx.data()), int(ctx.size()),
                const_cast<char*>(reinterpret_cast<const char*>(message.data())), int(message.size()),
+               const_cast<char*>(ctx.data()), int(ctx.size()),
                const_cast<char*>(reinterpret_cast<const char*>(sig.data())), int(sig.size())) == 0;
 }
 
