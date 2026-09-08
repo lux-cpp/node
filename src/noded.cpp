@@ -71,11 +71,18 @@ constexpr std::uint64_t kLocalChainId = 31337;
 
 // What web3_clientVersion reports. luxfi/evm answers a bare version string
 // (plugin/evm/version.go), so this does too — with a name, because a client
-std::string get_client_version(const char* prog) {
-    if (std::strstr(prog, "zood")) return "zoo-cpp/zood/v0.1.0";
-    if (std::strstr(prog, "luxd")) return "lux-cpp/luxd/v0.1.0";
-    return "lux-cpp/noded/v0.1.0";
-}
+// The brand is a value the build supplies, not a match on the program name: a
+// binary that reads its own identity out of argv[0] answers to whatever it was
+// copied to, and a network's name is not a filename. Downstream networks set
+// these; unset, this is Lux.
+#ifndef LUX_NODE_BRAND
+#define LUX_NODE_BRAND "lux-cpp/luxd"
+#endif
+#ifndef LUX_NODE_ENDPOINT
+#define LUX_NODE_ENDPOINT "https://api.lux.network"
+#endif
+
+std::string get_client_version() { return LUX_NODE_BRAND "/v0.1.0"; }
 
 long arg(int argc, char** argv, const char* flag, long dflt) {
     for (int i = 1; i + 1 < argc; ++i)
@@ -179,7 +186,7 @@ void on_signal(int) { g_stop.store(true); }
 int main(int argc, char** argv) {
     const char* prog = (argc > 0 && argv[0]) ? argv[0] : "luxd";
     if (const char* slash = std::strrchr(prog, '/')) prog = slash + 1;
-    const std::string client_version = get_client_version(prog);
+    const std::string client_version = get_client_version();
 
     // The keys first: everything else is named by them. A validator that has
     // none makes them here, once, and keeps them.
@@ -399,10 +406,7 @@ int main(int argc, char** argv) {
     // one implementation — a node that grew a separate reader per entry point
     // would have two answers to what a block is, inside one binary.
     serve_admin(rpc, chain);
-    const std::string_view prog_view(prog ? prog : "");
-    const std::string public_api = (prog_view == "zood" || prog_view.find("zoo") != std::string_view::npos)
-                                       ? "https://api.zoo.network"
-                                       : "https://api.lux.network";
+    const std::string public_api = LUX_NODE_ENDPOINT;
     rpc.about(Rpc::Json{
         {"client", client_version},
         {"mode", "light"},

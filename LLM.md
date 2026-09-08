@@ -804,9 +804,9 @@ Three wires, one repository, three caps.
 Two things about the build were the same defect wearing another hat.
 `src/keccak.cpp` was in no target either, so the library had the handshake's
 symbols and not the SHAKE256 under them — nothing noticed until something
-linked. And `nm build/luxd` was the wrong place to look for the result: `luxd`,
-`zood` and `noded` are three names for `src/noded.cpp`, which has no peer path
-and reports zero `peer` symbols as well as zero `pq` ones. `lux-join` is the
+linked. And `nm build/luxd` was the wrong place to look for the result: `luxd`
+is `src/noded.cpp`, which has no peer path and reports zero `peer` symbols as
+well as zero `pq` ones. `lux-join` is the
 binary that carries this path; it went from 0 handshake symbols to 15.
 
 ## Whose message this node signs

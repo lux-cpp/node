@@ -236,11 +236,6 @@ add_executable(luxd src/noded.cpp)
 target_link_libraries(luxd PRIVATE node)
 target_compile_options(luxd PRIVATE -Wall -Wextra)
 
-# ── zood — Zoo L2 flavor (C++ version)
-add_executable(zood src/noded.cpp)
-target_link_libraries(zood PRIVATE node)
-target_compile_options(zood PRIVATE -Wall -Wextra)
-
 # ── noded — backwards-compatible alias
 add_executable(noded src/noded.cpp)
 target_link_libraries(noded PRIVATE node)
