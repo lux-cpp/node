@@ -29,8 +29,15 @@ FROM debian:bookworm-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build git ca-certificates go-md2man golang-go perl \
-        nlohmann-json3-dev \
+        nlohmann-json3-dev python3 python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# cevm resolves intx, blst and the rest through Conan. Without it CMake stops at
+# the guard in CMakeLists.txt rather than failing 200 lines deep inside cevm's
+# find_package — but stopping early is still stopping, and this image had no
+# Conan at all, so it had never built.
+RUN python3 -m venv /opt/conan && /opt/conan/bin/pip install --no-cache-dir 'conan>=2,<3'
+ENV PATH=/opt/conan/bin:$PATH
 
 WORKDIR /src
 COPY luxcpp luxcpp
@@ -46,7 +53,16 @@ RUN git clone --depth 1 --branch ${AWSLC_REF} https://github.com/aws/aws-lc.git 
 
 # The node. Release, and stripped at link time rather than after: a symbol that
 # is never emitted cannot be shipped by forgetting to remove it.
+# The profile cevm publishes for this, so the toolchain the node is configured
+# with is the one cevm's own CI uses.
+RUN conan profile detect --force && \
+    conan install /src/luxcpp/cevm \
+      -pr /src/luxcpp/cevm/.github/conan/manylinux-relax.profile \
+      -s build_type=Release -s compiler.cppstd=gnu20 \
+      --output-folder=/src/cevm-conan --build=missing
+
 RUN cmake -S lux-cpp/node -B /src/build -G Ninja \
+      -DCMAKE_TOOLCHAIN_FILE=/src/cevm-conan/build/Release/generators/conan_toolchain.cmake \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
         -DCMAKE_EXE_LINKER_FLAGS="-s" \
