@@ -25,6 +25,21 @@
 # checkout's.
 
 # ── builder ─────────────────────────────────────────────────────────────────
+# libluxcrypto.a — the ML-DSA-65 and ML-KEM-768 the post-quantum handshake signs
+# and encapsulates with. It is a Go c-archive, so it is built by Go, here, and
+# the C++ stage takes the two files rather than a toolchain it would otherwise
+# carry for one library.
+FROM golang:1.26.8 AS luxcrypto
+WORKDIR /src/lux/crypto
+COPY lux/crypto .
+RUN --mount=type=secret,id=gh_pat \
+    export GIT_CONFIG_GLOBAL=/tmp/gitcred && \
+    git config --global url."https://x-access-token:$(cat /run/secrets/gh_pat)@github.com/".insteadOf "https://github.com/" && \
+    go mod download github.com/luxfi/accel && \
+    make dist && \
+    test -s dist/libluxcrypto.a && \
+    rm -f /tmp/gitcred
+
 FROM debian:bookworm-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -47,6 +62,9 @@ COPY lux-cpp/node lux-cpp/node
 # looks for it by path and refuses to configure without it, so it has to be in
 # the image as well as in the context.
 COPY lux-gpu/gpu-kernels lux-gpu/gpu-kernels
+# Where the node looks for it: CMAKE_SOURCE_DIR/../../lux/crypto/dist, so it is
+# found the way every other reused tree is rather than named by a flag.
+COPY --from=luxcrypto /src/lux/crypto/dist /src/lux/crypto/dist
 
 # AWS-LC, once, into its own tree.
 ARG AWSLC_REF=v1.65.0

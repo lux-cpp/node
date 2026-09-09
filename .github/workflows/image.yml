@@ -71,6 +71,10 @@ jobs:
       # told where the tree is rather than staged under a name that has moved.
       - uses: actions/checkout@v4
         with: { repository: lux-gpu/gpu-kernels, path: ctx/lux-gpu/gpu-kernels, token: '${{ secrets.GH_PAT }}', submodules: recursive }
+      # The post-quantum crypto the handshake uses is a Go c-archive built from
+      # this tree; the node links the .a and will not configure without it.
+      - uses: actions/checkout@v4
+        with: { repository: luxfi/crypto, path: ctx/lux/crypto, token: '${{ secrets.GH_PAT }}', submodules: recursive }
 
       - uses: docker/login-action@v3
         with:
