@@ -53,7 +53,7 @@ jobs:
       - name: Build and push this architecture
         run: |
           set -euo pipefail
-          img=ghcr.io/luxfi/node-cpp
+          img=ghcr.io/lux-cpp/node
           docker build -f ctx/lux-cpp/node/Dockerfile -t "$img:${GITHUB_SHA::7}-${{ matrix.arch }}" ctx
           docker push "$img:${GITHUB_SHA::7}-${{ matrix.arch }}"
 
@@ -72,7 +72,7 @@ jobs:
       - name: One name, both architectures
         run: |
           set -euo pipefail
-          img=ghcr.io/luxfi/node-cpp
+          img=ghcr.io/lux-cpp/node
           docker buildx imagetools create -t "$img:${GITHUB_SHA::7}" -t "$img:main" \
             "$img:${GITHUB_SHA::7}-amd64" "$img:${GITHUB_SHA::7}-arm64"
           docker buildx imagetools inspect "$img:${GITHUB_SHA::7}" \
