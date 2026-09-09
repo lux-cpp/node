@@ -32,13 +32,17 @@ jobs:
           - arch: arm64
             pool: linux-arm64
     runs-on: ['${{ matrix.pool }}']
-    env:
-      # Each runner gets its own, because five services share this
-      # machine’s HOME and docker/login-action logs out when a job ends —
-      # taking the credential from whichever job is still pushing.
-      DOCKER_CONFIG: ${{ runner.temp }}/docker
     timeout-minutes: 120
     steps:
+      # One docker config per RUNNER: several runner services share this
+      # machine’s HOME, and docker/login-action logs out in its post step,
+      # so a job that finishes takes the credential from a job still
+      # pushing. Set here rather than in the job env, where the runner
+      # context does not exist and naming it is a syntax error.
+      - name: One docker config per runner
+        run: |
+          d="$RUNNER_TEMP/docker"; mkdir -p "$d"
+          echo "DOCKER_CONFIG=$d" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with: { path: ctx/lux-cpp/node, submodules: recursive }
       - uses: actions/checkout@v4
@@ -115,12 +119,16 @@ jobs:
   merge:
     needs: image
     runs-on: [linux-amd64]
-    env:
-      # Each runner gets its own, because five services share this
-      # machine’s HOME and docker/login-action logs out when a job ends —
-      # taking the credential from whichever job is still pushing.
-      DOCKER_CONFIG: ${{ runner.temp }}/docker
     steps:
+      # One docker config per RUNNER: several runner services share this
+      # machine’s HOME, and docker/login-action logs out in its post step,
+      # so a job that finishes takes the credential from a job still
+      # pushing. Set here rather than in the job env, where the runner
+      # context does not exist and naming it is a syntax error.
+      - name: One docker config per runner
+        run: |
+          d="$RUNNER_TEMP/docker"; mkdir -p "$d"
+          echo "DOCKER_CONFIG=$d" >> "$GITHUB_ENV"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
