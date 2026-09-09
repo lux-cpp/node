@@ -55,7 +55,14 @@ RUN git clone --depth 1 --branch ${AWSLC_REF} https://github.com/aws/aws-lc.git 
 # is never emitted cannot be shipped by forgetting to remove it.
 # The profile cevm publishes for this, so the toolchain the node is configured
 # with is the one cevm's own CI uses.
+# The lux packages are not on any Conan remote — they are the trees checked
+# out beside this one, so they are exported from source before anything asks
+# for them. Without this, `conan install` stops at
+# "Package 'lux-crypto/1.4.5' not resolved".
 RUN conan profile detect --force && \
+    for pkg in crypto blst zap-cpp-core sdk; do \
+        [ -f "/src/luxcpp/$pkg/conanfile.py" ] && conan export "/src/luxcpp/$pkg" || true; \
+    done && \
     conan install /src/luxcpp/cevm \
       -pr /src/luxcpp/cevm/.github/conan/manylinux-relax.profile \
       -s build_type=Release -s compiler.cppstd=gnu20 \
