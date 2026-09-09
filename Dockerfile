@@ -60,7 +60,7 @@ RUN git clone --depth 1 --branch ${AWSLC_REF} https://github.com/aws/aws-lc.git 
 # for them. Without this, `conan install` stops at
 # "Package 'lux-crypto/1.4.5' not resolved".
 RUN conan profile detect --force && \
-    for pkg in crypto blst zap-cpp-core sdk; do \
+    for pkg in crypto blst zap-cpp-core; do \
         [ -f "/src/luxcpp/$pkg/conanfile.py" ] && conan export "/src/luxcpp/$pkg" || true; \
     done && \
     conan install /src/luxcpp/cevm \
