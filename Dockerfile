@@ -98,6 +98,7 @@ RUN --mount=type=secret,id=gh_pat \
     conan install /src/luxcpp/cevm \
       -pr /src/luxcpp/cevm/.github/conan/manylinux-relax.profile \
       -s build_type=Release -s compiler.cppstd=gnu20 \
+      -c core.download:parallel=1 \
       --output-folder=/src/cevm-conan --build=missing && \
     rm -f /tmp/gitcred
 
