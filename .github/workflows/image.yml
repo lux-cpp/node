@@ -32,6 +32,11 @@ jobs:
           - arch: arm64
             pool: linux-arm64
     runs-on: ['${{ matrix.pool }}']
+    env:
+      # Each runner gets its own, because five services share this
+      # machine’s HOME and docker/login-action logs out when a job ends —
+      # taking the credential from whichever job is still pushing.
+      DOCKER_CONFIG: ${{ runner.temp }}/docker
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -110,6 +115,11 @@ jobs:
   merge:
     needs: image
     runs-on: [linux-amd64]
+    env:
+      # Each runner gets its own, because five services share this
+      # machine’s HOME and docker/login-action logs out when a job ends —
+      # taking the credential from whichever job is still pushing.
+      DOCKER_CONFIG: ${{ runner.temp }}/docker
     steps:
       - uses: docker/login-action@v3
         with:
