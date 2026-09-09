@@ -56,10 +56,10 @@ RUN cmake -S lux-cpp/node -B /src/build -G Ninja \
         -DZAP_DIR=/src/luxcpp/zap-cpp-core/include \
         -DAWSLC_SRC=/src/aws-lc \
         -DAWSLC_BUILD_DIR=/src/aws-lc-build && \
-    cmake --build /src/build --target zood luxd noded lux-join
+    cmake --build /src/build --target luxd noded lux-join
 
 RUN mkdir -p /out/bin /out/data && \
-    cp /src/build/zood /src/build/luxd /src/build/noded /src/build/lux-join /out/bin/ && \
+    cp /src/build/luxd /src/build/noded /src/build/lux-join /out/bin/ && \
     chown -R 65532:65532 /out
 
 # ── runtime ─────────────────────────────────────────────────────────────────
@@ -78,4 +78,4 @@ WORKDIR /data
 # RPC, and the base port the vote mesh listens on.
 EXPOSE 9730 9731
 
-ENTRYPOINT ["/usr/local/bin/zood"]
+ENTRYPOINT ["/usr/local/bin/luxd"]

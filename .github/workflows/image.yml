@@ -1,0 +1,79 @@
+name: image
+
+# The C++ node, as an image, for both architectures.
+#
+# This repository had no CI at all, so the C++ node has never been published —
+# which is why the fleet could only ever run the Go one, and why spark's arm64
+# cores carried no chain node.
+#
+# The Dockerfile builds from a context holding three checkouts side by side
+# (this node, the consensus engine, and the luxcpp root that carries blst,
+# cevm and zap-cpp-core), so the job assembles that context rather than the
+# Dockerfile cloning private repositories at build time.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            pool: linux-amd64
+          - arch: arm64
+            pool: linux-arm64
+    runs-on: ['${{ matrix.pool }}']
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ctx/lux-cpp/node }
+      - uses: actions/checkout@v4
+        with: { repository: lux-cpp/consensus, path: ctx/lux-cpp/consensus, token: '${{ secrets.GH_PAT }}' }
+      - uses: actions/checkout@v4
+        with: { repository: luxfi/luxcpp, path: ctx/luxcpp, token: '${{ secrets.GH_PAT }}' }
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # One job per architecture, each on a runner of that architecture, so the
+      # binary that ships for an arch was compiled by a native toolchain rather
+      # than emulated. A C++ node under QEMU takes hours and proves less.
+      - name: Build and push this architecture
+        run: |
+          set -euo pipefail
+          img=ghcr.io/luxfi/node-cpp
+          docker build -f ctx/lux-cpp/node/Dockerfile -t "$img:${GITHUB_SHA::7}-${{ matrix.arch }}" ctx
+          docker push "$img:${GITHUB_SHA::7}-${{ matrix.arch }}"
+
+  merge:
+    needs: image
+    runs-on: [linux-amd64]
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # A manifest list with one entry pulls fine on the arch that built it and
+      # fails everywhere else, so the release name is only ever written here,
+      # from both.
+      - name: One name, both architectures
+        run: |
+          set -euo pipefail
+          img=ghcr.io/luxfi/node-cpp
+          docker buildx imagetools create -t "$img:${GITHUB_SHA::7}" -t "$img:main" \
+            "$img:${GITHUB_SHA::7}-amd64" "$img:${GITHUB_SHA::7}-arm64"
+          docker buildx imagetools inspect "$img:${GITHUB_SHA::7}" \
+            --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}'
