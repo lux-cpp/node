@@ -81,6 +81,7 @@ RUN --mount=type=secret,id=gh_pat \
 
 RUN cmake -S lux-cpp/node -B /src/build -G Ninja \
       -DCMAKE_TOOLCHAIN_FILE=/src/cevm-conan/build/Release/generators/conan_toolchain.cmake \
+      -DLUX_CEVM_DEX_U256_DIR=/src/lux-gpu/gpu-kernels/tools/kat \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
         -DCMAKE_EXE_LINKER_FLAGS="-s" \

@@ -64,6 +64,13 @@ jobs:
         with: { repository: lux-cpp/blst, path: ctx/luxcpp/blst, token: '${{ secrets.GH_PAT }}', submodules: recursive }
       - uses: actions/checkout@v4
         with: { repository: lux-cpp/crypto, path: ctx/luxcpp/crypto, token: '${{ secrets.GH_PAT }}', submodules: recursive }
+      # The 0x100 precompile's 256-bit arithmetic. cevm refuses to configure
+      # without it and says why: the header is the ONE canonical copy and a
+      # forked one is a consensus split. It is named lux-private/gpu-kernels in
+      # cevm's default path; the repository moved to lux-gpu, so the build is
+      # told where the tree is rather than staged under a name that has moved.
+      - uses: actions/checkout@v4
+        with: { repository: lux-gpu/gpu-kernels, path: ctx/lux-gpu/gpu-kernels, token: '${{ secrets.GH_PAT }}', submodules: recursive }
 
       - uses: docker/login-action@v3
         with:
