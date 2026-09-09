@@ -56,6 +56,13 @@ jobs:
           img=ghcr.io/lux-cpp/node
           docker build -f ctx/lux-cpp/node/Dockerfile -t "$img:${GITHUB_SHA::7}-${{ matrix.arch }}" ctx
           docker push "$img:${GITHUB_SHA::7}-${{ matrix.arch }}"
+          # The builder stage as well, because a node that links this one has to
+          # compile against it: libnode.a, the headers, and the consensus, cevm
+          # and aws-lc trees it was built with. zooai/node builds zood on this
+          # rather than assembling the same three checkouts a second time.
+          docker build -f ctx/lux-cpp/node/Dockerfile --target builder \
+            -t "$img:${GITHUB_SHA::7}-dev-${{ matrix.arch }}" ctx
+          docker push "$img:${GITHUB_SHA::7}-dev-${{ matrix.arch }}"
 
   merge:
     needs: image
@@ -75,5 +82,7 @@ jobs:
           img=ghcr.io/lux-cpp/node
           docker buildx imagetools create -t "$img:${GITHUB_SHA::7}" -t "$img:main" \
             "$img:${GITHUB_SHA::7}-amd64" "$img:${GITHUB_SHA::7}-arm64"
+          docker buildx imagetools create -t "$img:${GITHUB_SHA::7}-dev" -t "$img:main-dev" \
+            "$img:${GITHUB_SHA::7}-dev-amd64" "$img:${GITHUB_SHA::7}-dev-arm64"
           docker buildx imagetools inspect "$img:${GITHUB_SHA::7}" \
             --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}'
