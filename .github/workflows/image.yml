@@ -43,7 +43,16 @@ jobs:
       # fetched an unrelated Next.js app, and the build failed with the four
       # things it actually needs absent.
       - uses: actions/checkout@v4
-        with: { repository: lux-cpp/cevm, path: ctx/luxcpp/cevm, token: '${{ secrets.GH_PAT }}' }
+        with:
+          repository: lux-cpp/cevm
+          path: ctx/luxcpp/cevm
+          token: '${{ secrets.GH_PAT }}'
+          # NAMED, because cevm's default branch is not the one this node is
+          # known to work against. Its default is blue/gethdiff-ci, main is a
+          # third line, and the tree that passes this node's 54 tests is this
+          # one. An unnamed checkout builds whichever branch happens to be
+          # default and says nothing about it.
+          ref: precompile/p256-one-price
       - uses: actions/checkout@v4
         with: { repository: lux-cpp/zap-cpp-core, path: ctx/luxcpp/zap-cpp-core, token: '${{ secrets.GH_PAT }}' }
       - uses: actions/checkout@v4
