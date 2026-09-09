@@ -92,13 +92,13 @@ RUN --mount=type=secret,id=gh_pat \
     export GIT_CONFIG_GLOBAL=/tmp/gitcred && \
     git config --global url."https://x-access-token:$(cat /run/secrets/gh_pat)@github.com/".insteadOf "https://github.com/" && \
     conan profile detect --force && \
+    printf 'core.download:parallel=1\n' >> "$(conan config home)/global.conf" && \
     for pkg in crypto blst zap-cpp-core; do \
         [ -f "/src/luxcpp/$pkg/conanfile.py" ] && conan export "/src/luxcpp/$pkg" || true; \
     done && \
     conan install /src/luxcpp/cevm \
       -pr /src/luxcpp/cevm/.github/conan/manylinux-relax.profile \
       -s build_type=Release -s compiler.cppstd=gnu20 \
-      -c core.download:parallel=1 \
       --output-folder=/src/cevm-conan --build=missing && \
     rm -f /tmp/gitcred
 
