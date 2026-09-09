@@ -81,6 +81,13 @@ constexpr std::uint64_t kLocalChainId = 31337;
 #ifndef LUX_NODE_ENDPOINT
 #define LUX_NODE_ENDPOINT "https://api.lux.network"
 #endif
+// The chain this daemon runs when the command line does not say. A downstream
+// network's daemon IS this daemon with its own number, so the number belongs
+// beside the name rather than in a wrapper that re-implements the node to pass
+// one flag. Unset, this is the local chain.
+#ifndef LUX_NODE_DEFAULT_CHAIN_ID
+#define LUX_NODE_DEFAULT_CHAIN_ID kLocalChainId
+#endif
 
 std::string get_client_version() { return LUX_NODE_BRAND "/v0.1.0"; }
 
@@ -194,7 +201,7 @@ int main(int argc, char** argv) {
     // behind: making a validator identity is a thing to do on purpose.
     const bool        publish        = has_flag(argc, argv, "--publish");
     const std::string data           = arg_str(argc, argv, "--data", ".lux");
-    const auto        eth            = std::uint64_t(arg(argc, argv, "--chain-id", long(kLocalChainId)));
+    const auto        eth            = std::uint64_t(arg(argc, argv, "--chain-id", long(LUX_NODE_DEFAULT_CHAIN_ID)));
     const std::string committee_path = arg_str(argc, argv, "--committee", "");
     const std::string peer_list      = arg_str(argc, argv, "--peers", "");
     if (!publish && (committee_path.empty() || peer_list.empty())) {
