@@ -58,10 +58,13 @@ WORKDIR /src
 COPY luxcpp luxcpp
 COPY lux-cpp/consensus lux-cpp/consensus
 COPY lux-cpp/node lux-cpp/node
-# The canonical 256-bit arithmetic the 0x100 precompile is built against. cevm
-# looks for it by path and refuses to configure without it, so it has to be in
-# the image as well as in the context.
-COPY lux-gpu/gpu-kernels lux-gpu/gpu-kernels
+# The licensed kernels tree, staged at the path cevm NAMES rather than the org
+# it now lives in. Two of cevm's CMakeLists reach for it by relative path —
+# ../../../../lux-private/gpu-kernels — for the 0x100 precompile's 256-bit
+# arithmetic (tools/kat) and for the aivm oracle the state library includes
+# (ops/aivm/tiny_llm). Putting it anywhere else satisfies neither, and only one
+# of the two takes a -D override.
+COPY lux-private/gpu-kernels lux-private/gpu-kernels
 # Where the node looks for it: CMAKE_SOURCE_DIR/../../lux/crypto/dist, so it is
 # found the way every other reused tree is rather than named by a flag.
 COPY --from=luxcrypto /src/lux/crypto/dist /src/lux/crypto/dist
@@ -104,7 +107,6 @@ RUN --mount=type=secret,id=gh_pat \
 
 RUN cmake -S lux-cpp/node -B /src/build -G Ninja \
       -DCMAKE_TOOLCHAIN_FILE=/src/cevm-conan/build/Release/generators/conan_toolchain.cmake \
-      -DLUX_CEVM_DEX_U256_DIR=/src/lux-gpu/gpu-kernels/tools/kat \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
         -DCMAKE_EXE_LINKER_FLAGS="-s" \
