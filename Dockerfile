@@ -43,6 +43,10 @@ WORKDIR /src
 COPY luxcpp luxcpp
 COPY lux-cpp/consensus lux-cpp/consensus
 COPY lux-cpp/node lux-cpp/node
+# The canonical 256-bit arithmetic the 0x100 precompile is built against. cevm
+# looks for it by path and refuses to configure without it, so it has to be in
+# the image as well as in the context.
+COPY lux-gpu/gpu-kernels lux-gpu/gpu-kernels
 
 # AWS-LC, once, into its own tree.
 ARG AWSLC_REF=v1.65.0
