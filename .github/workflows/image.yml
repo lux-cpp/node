@@ -75,8 +75,8 @@ jobs:
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.GHCR_USER }}
+          password: ${{ secrets.GHCR_TOKEN }}
 
       # One job per architecture, each on a runner of that architecture, so the
       # binary that ships for an arch was compiled by a native toolchain rather
@@ -110,8 +110,8 @@ jobs:
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.GHCR_USER }}
+          password: ${{ secrets.GHCR_TOKEN }}
       # A manifest list with one entry pulls fine on the arch that built it and
       # fails everywhere else, so the release name is only ever written here,
       # from both.
