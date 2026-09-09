@@ -70,16 +70,24 @@ jobs:
       # binary that ships for an arch was compiled by a native toolchain rather
       # than emulated. A C++ node under QEMU takes hours and proves less.
       - name: Build and push this architecture
+        # The same credential the checkouts used, because lux-crypto's deps are
+        # FetchContent clones of private forks and the configure step runs here.
+        # As a secret it is readable only by the command that mounts it, so it
+        # never lands in a layer or in `docker history`.
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
           img=ghcr.io/lux-cpp/node
-          docker build -f ctx/lux-cpp/node/Dockerfile -t "$img:${GITHUB_SHA::7}-${{ matrix.arch }}" ctx
+          docker build --secret id=gh_pat,env=GH_PAT \
+            -f ctx/lux-cpp/node/Dockerfile -t "$img:${GITHUB_SHA::7}-${{ matrix.arch }}" ctx
           docker push "$img:${GITHUB_SHA::7}-${{ matrix.arch }}"
           # The builder stage as well, because a node that links this one has to
           # compile against it: libnode.a, the headers, and the consensus, cevm
           # and aws-lc trees it was built with. zooai/node builds zood on this
           # rather than assembling the same three checkouts a second time.
-          docker build -f ctx/lux-cpp/node/Dockerfile --target builder \
+          docker build --secret id=gh_pat,env=GH_PAT \
+            -f ctx/lux-cpp/node/Dockerfile --target builder \
             -t "$img:${GITHUB_SHA::7}-dev-${{ matrix.arch }}" ctx
           docker push "$img:${GITHUB_SHA::7}-dev-${{ matrix.arch }}"
 

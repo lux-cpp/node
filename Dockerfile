@@ -59,14 +59,25 @@ RUN git clone --depth 1 --branch ${AWSLC_REF} https://github.com/aws/aws-lc.git 
 # out beside this one, so they are exported from source before anything asks
 # for them. Without this, `conan install` stops at
 # "Package 'lux-crypto/1.4.5' not resolved".
-RUN conan profile detect --force && \
+# lux-crypto's deps are FetchContent clones of private luxcpp forks (intx,
+# evmmax, pqclean, ed25519-donna, blake3-reference), so the configure step needs
+# the same credential the checkouts used. It arrives as a build secret and is
+# rewritten into a git URL prefix, which reaches every nested clone — including
+# ones added later — rather than being named dep by dep. The rewrite lives in a
+# file this one command owns, named by GIT_CONFIG_GLOBAL so only git reads it
+# (HOME would move Conan's cache with it) and removed before the layer closes.
+RUN --mount=type=secret,id=gh_pat \
+    export GIT_CONFIG_GLOBAL=/tmp/gitcred && \
+    git config --global url."https://x-access-token:$(cat /run/secrets/gh_pat)@github.com/".insteadOf "https://github.com/" && \
+    conan profile detect --force && \
     for pkg in crypto blst zap-cpp-core; do \
         [ -f "/src/luxcpp/$pkg/conanfile.py" ] && conan export "/src/luxcpp/$pkg" || true; \
     done && \
     conan install /src/luxcpp/cevm \
       -pr /src/luxcpp/cevm/.github/conan/manylinux-relax.profile \
       -s build_type=Release -s compiler.cppstd=gnu20 \
-      --output-folder=/src/cevm-conan --build=missing
+      --output-folder=/src/cevm-conan --build=missing && \
+    rm -f /tmp/gitcred
 
 RUN cmake -S lux-cpp/node -B /src/build -G Ninja \
       -DCMAKE_TOOLCHAIN_FILE=/src/cevm-conan/build/Release/generators/conan_toolchain.cmake \
