@@ -468,14 +468,17 @@ void Rpc::answer(int fd) {
     // is settled here — before the archive — because relaying another network's
     // chain would publish that network's answer as this node's own. Only a Lux
     // node owns `c`; a Zoo node asked for it does not have one to give.
-    if (alias.empty() || chain.health || !net_.owns(alias)) {
+    // A chain this node KEEPS is always answerable: its methods are registered
+    // here, whoever registered them. Ownership limits only what may be RELAYED.
+    const bool kept = methods_.find(alias) != methods_.end();
+    if (alias.empty() || chain.health || (!kept && !net_.owns(alias))) {
         write_all(fd, response(404, "Not Found",
                                R"({"jsonrpc":"2.0","id":null,)"
                                R"("error":{"code":-32601,"message":"no such chain"}})"));
         return;
     }
 
-    if (methods_.find(alias) == methods_.end()) {
+    if (!kept) {
         // A chain this node's network owns but this node does not keep. With an
         // archive configured it is still answerable, which is how a frontier-only
         // node serves P and X.
