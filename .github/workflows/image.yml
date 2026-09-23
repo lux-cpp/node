@@ -56,12 +56,10 @@ jobs:
           repository: lux-cpp/cevm
           path: ctx/luxcpp/cevm
           token: '${{ secrets.GH_PAT }}'
-          # NAMED, because cevm's default branch is not the one this node is
-          # known to work against. Its default is blue/gethdiff-ci, main is a
-          # third line, and the tree that passes this node's 54 tests is this
-          # one. An unnamed checkout builds whichever branch happens to be
-          # default and says nothing about it.
-          ref: precompile/p256-one-price
+          # NAMED, so the tree this node builds against is stated here rather
+          # than whatever the default happens to be. cevm's main carries the
+          # tree this node's 54 tests passed on, byte for byte.
+          ref: main
           # cevm carries evmc as a submodule and refuses to configure without
           # it — "Git submodules not initialized" from its own CMakeLists, which
           # is where this build stopped. checkout does not fetch them unless
