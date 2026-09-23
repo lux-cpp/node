@@ -207,7 +207,7 @@ int main(int argc, char** argv) {
     const std::string peer_list      = arg_str(argc, argv, "--peers", "");
     if (!publish && (committee_path.empty() || peer_list.empty())) {
         std::fprintf(stderr,
-                     "usage: %s --committee FILE --peers a:p,b:p,... [--data DIR] [--rpc-port R]\n"
+                     "usage: %s --committee FILE --peers a:p,b:p,... [--data DIR] [--rpc-port R] [--rpc-host H]\n"
                      "             [--deadline-ms D] [--blocks B] [--chain-id C] [--archive-rpc URL]\n"
                      "             [--import-chain-data PATH]\n"
                      "       %s --data DIR --publish [--chain-id C]\n"
@@ -294,6 +294,9 @@ int main(int argc, char** argv) {
 
     const long deadline_ms = arg(argc, argv, "--deadline-ms", 15000);
     const long rpc_port    = arg(argc, argv, "--rpc-port", 0);
+    // 127.0.0.1 serves this machine only; a node behind a door or an ingress
+    // runs with --rpc-host 0.0.0.0.
+    const std::string rpc_host = arg_str(argc, argv, "--rpc-host", "127.0.0.1");
     const long blocks      = arg(argc, argv, "--blocks", 0);  // 0 = until stopped
 
     // Go's flag, spelled Go's way, so one runbook drives all three
@@ -405,7 +408,7 @@ int main(int argc, char** argv) {
     // and "has it reached quorum" are separable questions.
     std::unique_ptr<Rpc> rpcp;
     try {
-        rpcp = std::make_unique<Rpc>(std::uint16_t(rpc_port));
+        rpcp = std::make_unique<Rpc>(std::uint16_t(rpc_port), rpc_host);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "node %ld: cannot serve RPC — %s\n", index, e.what());
         return 2;
@@ -438,7 +441,7 @@ int main(int argc, char** argv) {
     if (!archive_rpc.empty()) {
         std::printf("node %ld: archive RPC %s (proxying historical & P/X state)\n", index, archive_rpc.c_str());
     }
-    std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/%s\n", index, rpc.port(), self.c_str());
+    std::printf("node %ld: rpc http://%s:%u/v1/chain/%s\n", index, rpc_host.c_str(), rpc.port(), self.c_str());
     std::fflush(stdout);
 
     // ── the mesh ────────────────────────────────────────────────────────────

@@ -280,19 +280,21 @@ Proxied proxy_to_archive(const std::string& archive_url, const std::string& targ
 
 }  // namespace
 
-Rpc::Rpc(std::uint16_t port) {
+Rpc::Rpc(std::uint16_t port, const std::string& host) {
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port   = htons(port);
+    if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1)
+        throw std::runtime_error("rpc: host " + host + " is not an IPv4 address");
+
     fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd_ < 0) throw std::runtime_error("rpc: socket");
     const int one = 1;
     ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
-    sockaddr_in a{};
-    a.sin_family      = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port        = htons(port);
     if (::bind(fd_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
         ::close(fd_);
-        throw std::runtime_error("rpc: bind 127.0.0.1:" + std::to_string(port) + ": " +
+        throw std::runtime_error("rpc: bind " + host + ":" + std::to_string(port) + ": " +
                                  std::strerror(errno));
     }
     if (::listen(fd_, 64) != 0) {

@@ -26,6 +26,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 
 using namespace lux::node;
@@ -264,6 +265,27 @@ int main() {
         every_spelling(lone, "424242", true);
         every_spelling(lone, "c", false);
         check(lone.served(call(lone.port(), "POST", "/", kChainId)), "POST / is the node's own chain");
+    }
+
+    // ── the bind address ────────────────────────────────────────────────────
+    {
+        // A node behind a door or an ingress binds every interface; the chain is
+        // then reachable on loopback like any other address of the machine.
+        Rpc wide{0, "0.0.0.0"};
+        wide.method("c", "eth_chainId", [](const Rpc::Json&) { return std::string("0x7a69"); });
+        wide.network(network_of(31337));
+        wide.start();
+        check(call(wide.port(), "POST", "/v1/chain/c", kChainId).status == 200,
+              "an Rpc bound to 0.0.0.0 answers on 127.0.0.1");
+        // A host that is not an IPv4 address is refused where it is named, not
+        // turned into some address the operator did not ask for.
+        bool refused = false;
+        try {
+            Rpc bad{0, "rpc.example"};
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        check(refused, "a host that is not an IPv4 address is refused");
     }
 
     std::printf("%s\n", g_fail == 0 ? "PASS" : "FAIL");

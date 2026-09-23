@@ -59,9 +59,12 @@ public:
         int code;
     };
 
-    // Bind 127.0.0.1:port. A port of 0 is OS-assigned and readable from port()
-    // afterwards. Throws at the boundary if the socket cannot be bound.
-    explicit Rpc(std::uint16_t port);
+    // Bind host:port. `host` is an IPv4 address: 127.0.0.1 (the default) serves
+    // this machine only, 0.0.0.0 serves every interface, which is what a node
+    // behind a door or an ingress needs. A port of 0 is OS-assigned and readable
+    // from port() afterwards. Throws at the boundary if the host is not an IPv4
+    // address or the socket cannot be bound.
+    explicit Rpc(std::uint16_t port, const std::string& host = "127.0.0.1");
     ~Rpc();
 
     Rpc(const Rpc&) = delete;
