@@ -196,11 +196,14 @@ Json block_json(const evm::Chain& c, const node::Block& b, bool full) {
 }  // namespace
 
 void serve_eth(Rpc& rpc, evm::Chain& chain, const std::string& client) {
-    // Registered once, under the chain's own alias. Every spelling of the path
-    // that names this chain reaches it; the Rpc decides which those are.
-    const std::string alias = chain.alias();
-    auto              on    = [&](const char* name, Rpc::Method fn) {
-        rpc.method(alias, name, std::move(fn));
+    // The chain id names the network, and the network names the aliases this
+    // chain answers to: its canonical one and its own id in decimal. Both name
+    // ONE chain, so one method table is registered under each of them — and
+    // under nothing else, because the aliases a node answers to are its
+    // network's to give, not the caller's to choose.
+    const Network net = network_of(chain.eth_chain_id());
+    auto          on  = [&](const char* name, Rpc::Method fn) {
+        for (const auto& alias : net.served) rpc.method(alias, name, fn);
     };
 
     on("eth_chainId", [&chain](const Json&) { return quantity(chain.eth_chain_id()); });
@@ -284,11 +287,14 @@ void serve_eth(Rpc& rpc, evm::Chain& chain, const std::string& client) {
         return Json{{"pending", quantity(chain.pending())}, {"queued", "0x0"}};
     });
 
-    rpc.root(alias);
+    rpc.network(net);
 }
 
 void serve_admin(Rpc& rpc, evm::Chain& chain) {
-    rpc.method(chain.alias(), "admin_importChain", [&chain](const Json& p) -> Json {
+    // Under every name the chain answers to, as serve_eth does: an admin method
+    // reachable at /v1/chain/zoo but not /v1/chain/200200 would make the two
+    // names two different chains.
+    const Rpc::Method import_chain = [&chain](const Json& p) -> Json {
         const std::uint64_t before = chain.last_accepted_height();
         Import              in;
         try {
@@ -316,7 +322,8 @@ void serve_admin(Rpc& rpc, evm::Chain& chain) {
             // worked.
             {"frontier", quantity(chain.frontier())},
         };
-    });
+    };
+    for (const auto& alias : network_of(chain.eth_chain_id()).served) rpc.method(alias, "admin_importChain", import_chain);
 }
 
 }  // namespace lux::node

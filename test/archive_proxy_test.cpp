@@ -15,6 +15,7 @@
 // contract is not what proxy_to_archive returns — it is what the client sees on
 // the wire.
 
+#include "lux/node/network.hpp"
 #include "lux/node/rpc.hpp"
 
 #include <arpa/inet.h>
@@ -166,11 +167,17 @@ private:
 
 const char* kCall = R"({"jsonrpc":"2.0","id":1,"method":"platform.getHeight","params":[]})";
 
-// A node that keeps C and reaches X through `archive`.
+// A node on `chain_id`'s network that keeps its own chain and reaches the rest
+// of that network through `archive`. The default is Lux's localnet id, because
+// C, P and X are the Lux primary network's chains and only a Lux node has them.
 struct Frontier {
-    Rpc rpc{0};
-    explicit Frontier(const std::string& archive) {
-        rpc.method("C", "eth_chainId", [](const Rpc::Json&) { return std::string("0x7a69"); });
+    Rpc     rpc{0};
+    Network net;
+    explicit Frontier(const std::string& archive, std::uint64_t chain_id = 31337)
+        : net(network_of(chain_id)) {
+        for (const auto& alias : net.served)
+            rpc.method(alias, "eth_chainId", [](const Rpc::Json&) { return std::string("0x7a69"); });
+        rpc.network(net);
         rpc.set_archive_rpc(archive);
         rpc.start();
     }
@@ -248,6 +255,38 @@ int main() {
         const Reply r = call(node.port(), "/v1/chain/nope", kCall);
         check(r.status == 404, "an unknown chain is this node's own 404");
         check(archive.served() == 0, "…and the archive was never asked");
+    }
+
+    {
+        // THE ESCAPE HATCH, SHUT. A Zoo node with a live archive is asked for
+        // C, P and X — the Lux primary network's chains, which it does not own.
+        // Proxying them would let it hand a client a Lux answer over a Zoo URL
+        // and pass it off as its own, so the refusal has to come BEFORE the
+        // archive is consulted. `served() == 0` is the whole assertion: not that
+        // the reply was a 404, but that the question never left this node.
+        Archive  archive(200, "OK", R"({"jsonrpc":"2.0","id":1,"result":"0x2a"})", false);
+        Frontier node(archive.url(), 200200);
+        for (const char* path : {"/v1/chain/c", "/v1/chain/C/rpc", "/v1/bc/p", "/v1/chain/x"}) {
+            const Reply r = call(node.port(), path, kCall);
+            check(r.status == 404, std::string("a Zoo node 404s ") + path);
+        }
+        check(archive.served() == 0, "…and never asked the archive for another network's chain");
+    }
+
+    {
+        // The one relay a sovereign L1 has: its OWN chain's history. The archive
+        // is a node of the same network, and Go registers that network's EVM as
+        // C, so a method this frontier does not keep goes there rather than
+        // failing — under the node's own name and under its chain id alike.
+        Archive  archive(200, "OK", R"({"jsonrpc":"2.0","id":1,"result":"0x2a"})", false);
+        Frontier node(archive.url(), 200200);
+        const char* kHistory = R"({"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x0","0x1"]})";
+        for (const char* path : {"/v1/chain/zoo", "/v1/chain/200200/rpc"}) {
+            const Reply r = call(node.port(), path, kHistory);
+            check(r.status == 200 && r.body.find("0x2a") != std::string::npos,
+                  std::string("a Zoo node relays its own history via ") + path);
+        }
+        check(archive.served() == 2, "…to its own network's archive, once per question");
     }
 
     std::printf("\narchive_proxy: %d passed, %d failed\n", g_pass, g_fail);

@@ -1,15 +1,22 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// chain_route_test.cpp — every spelling of a chain's path reaches the chain.
+// chain_route_test.cpp — every spelling of a chain's path reaches the chain,
+// and no spelling of another network's chain reaches anything.
 //
-// This is tested over a REAL socket against a running Rpc rather than by
-// calling the parser, because the parser is not the contract: what a client
-// gets back from `POST /v1/chain/c` is. A client that lowercases its URL, or
-// that omits the `/rpc` a directory listing once told it to use, is not asking
-// for a favour — it is naming the same chain, and a node that answers one
-// spelling and 404s the other has two routes where it means to have one.
+// Two halves of one rule. A client that lowercases its URL, or omits the `/rpc`
+// a directory listing once told it to use, is not asking for a favour — it is
+// naming the same chain, and a node that answers one spelling and 404s the
+// other has two routes where it means to have one. But a client that asks a Zoo
+// node for `c` is naming a chain that node does not have: C-Chain is the Lux
+// primary network's EVM, and answering it with Zoo's chain id inside is how a
+// node comes to lie about which network it is on.
+//
+// Tested over a REAL socket against a running Rpc rather than by calling the
+// parser, because the parser is not the contract: what a client gets back from
+// `POST /v1/chain/c` is.
 
+#include "lux/node/network.hpp"
 #include "lux/node/rpc.hpp"
 
 #include <arpa/inet.h>
@@ -17,6 +24,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstdio>
 #include <string>
 
@@ -80,75 +88,184 @@ Reply call(std::uint16_t port, const char* verb, const std::string& path, const 
 
 const char* kChainId = R"({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]})";
 
-// The answer the one registered method gives, so a 200 that reached the WRONG
-// place cannot pass as a 200 that reached the right one.
-bool served(const Reply& r) {
-    return r.status == 200 && r.body.find("\"0x7a69\"") != std::string::npos;
+// A node on one network, wired the way serve_eth wires a real one: the method
+// table registered under every alias its own chain answers to, and the network
+// itself handed to the Rpc. Nothing here enumerates paths — the aliases come
+// from the chain id, which is the thing under test.
+struct Node {
+    Rpc         rpc{0};
+    Network     net;
+    std::string answer;
+
+    explicit Node(std::uint64_t chain_id) : net(network_of(chain_id)) {
+        answer = "0x" + [&] {
+            char b[32];
+            std::snprintf(b, sizeof(b), "%llx", static_cast<unsigned long long>(chain_id));
+            return std::string(b);
+        }();
+        // By value: a detached handler thread may still be answering while this
+        // Node is going away, and the method table outlives nothing it reads.
+        for (const auto& alias : net.served)
+            rpc.method(alias, "eth_chainId", [a = answer](const Rpc::Json&) { return a; });
+        rpc.network(net);
+        rpc.about(Rpc::Json{{"client", "lux-cpp/test"}});
+        rpc.start();
+    }
+    std::uint16_t port() { return rpc.port(); }
+
+    // A 200 that reached the WRONG chain must not pass as a 200 that reached the
+    // right one, so the chain's OWN id is what the answer has to carry.
+    bool served(const Reply& r) const {
+        return r.status == 200 && r.body.find("\"" + answer + "\"") != std::string::npos;
+    }
+};
+
+// Every spelling of one alias: both middle words, both cases, `/rpc` present and
+// absent. A node either answers all of them or none of them.
+void every_spelling(Node& node, const std::string& alias, bool owned) {
+    std::string upper = alias;
+    for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    for (const char* middle : {"chain", "bc"}) {
+        for (const std::string& word : {alias, upper}) {
+            for (const char* tail : {"", "/rpc"}) {
+                const std::string path = "/v1/" + std::string(middle) + "/" + word + tail;
+                const Reply       r    = call(node.port(), "POST", path, kChainId);
+                if (owned)
+                    check(node.served(r), "POST " + path);
+                else
+                    check(r.status == 404,
+                          "POST " + path + " refused (got " + std::to_string(r.status) + ")");
+            }
+        }
+    }
 }
 
 }  // namespace
 
 int main() {
-    Rpc rpc(0);
-    // Registered ONCE, under the alias, in its natural upper case.
-    rpc.method("C", "eth_chainId", [](const Rpc::Json&) { return std::string("0x7a69"); });
-    // A second chain whose alias is a word rather than a letter, so folding is
-    // tested on something longer than one character.
-    rpc.method("Zoo", "eth_chainId", [](const Rpc::Json&) { return std::string("0x7a69"); });
-    rpc.root("C");
-    rpc.about(Rpc::Json{{"client", "lux-cpp/test"}});
-    rpc.start();
-    const std::uint16_t port = rpc.port();
+    std::printf("chain_route_test — a node answers for its own network, and only that\n");
 
-    std::printf("chain_route_test — one chain, every spelling (port %u)\n", port);
+    // ── Zoo: the violation this test exists for ─────────────────────────────
+    {
+        Node zoo(200200);
+        std::printf("zoo node (chain id 200200, port %u)\n", zoo.port());
 
-    // The six paths the node is held to, plus the `bc` spelling of each.
-    for (const char* path : {"/v1/chain/C/rpc", "/v1/chain/c/rpc", "/v1/chain/C", "/v1/chain/c",
-                             "/v1/bc/C/rpc", "/v1/bc/c/rpc", "/v1/bc/C", "/v1/bc/c"}) {
-        check(served(call(port, "POST", path, kChainId)), std::string("POST ") + path);
-    }
-    // A word-shaped alias folds the same way a letter does — mixed case is not
-    // a further spelling to enumerate, it falls out of folding once.
-    for (const char* path : {"/v1/chain/zoo", "/v1/chain/ZOO", "/v1/chain/ZoO/rpc", "/v1/bc/Zoo"}) {
-        check(served(call(port, "POST", path, kChainId)), std::string("POST ") + path);
-    }
+        // Its own name, and its own number. The number is not a courtesy: it is
+        // the chain's identity, and a node that 404s its own id is unreachable
+        // by anything that knows only what chain it wants.
+        every_spelling(zoo, "zoo", true);
+        every_spelling(zoo, "200200", true);
 
-    // The bare root still forwards to the C-Chain.
-    check(served(call(port, "POST", "/", kChainId)), "POST /");
+        // THE BUG. `c` on a Zoo node used to answer 200200 — a Lux path serving
+        // a Zoo chain, which tells a client it is talking to the C-Chain. Only a
+        // Lux node has one. `hanzo` is the same refusal from the other side: a
+        // network's aliases are not a namespace anyone else may borrow.
+        every_spelling(zoo, "c", false);
+        every_spelling(zoo, "hanzo", false);
+        every_spelling(zoo, "36963", false);
 
-    // A query string names the same route.
-    check(served(call(port, "POST", "/v1/chain/c?trace=1", kChainId)), "POST /v1/chain/c?trace=1");
+        // P and X belong to the Lux primary network too, so they are not Zoo's
+        // to proxy either — and with no archive configured that distinction is
+        // exactly the one that could hide: both would be "not served here".
+        every_spelling(zoo, "p", false);
+        every_spelling(zoo, "x", false);
 
-    // Health, for the same chain, by either case.
-    for (const char* path : {"/v1/chain/C/health", "/v1/chain/c/health", "/v1/bc/c/health"}) {
-        const auto r = call(port, "GET", path, "");
-        check(r.status == 200 && r.body.find("\"healthy\":true") != std::string::npos,
-              std::string("GET ") + path);
-    }
+        // The bare root is this node's own chain, so ethers and viem pointed at
+        // the host with no path reach Zoo rather than nothing.
+        check(zoo.served(call(zoo.port(), "POST", "/", kChainId)), "POST / is the node's own chain");
 
-    // What must still be refused. Folding case is not opening a door: a chain
-    // this node does not serve is still absent, and a path that names no chain
-    // is still not a chain.
-    // The words AROUND the alias are literals, deliberately: only the alias is
-    // the caller's to spell, so `/v1/CHAIN/c` is a different path, not a
-    // different capitalisation of this one.
-    for (const char* path : {"/v1/chain/zzz", "/v1/chain/zzz/rpc", "/v1/chain", "/v1/chain/c/extra",
-                             "/v1/chain/c/rpc/../../admin", "/ext/bc/C/rpc", "/v1/bc//rpc",
-                             "/V1/chain/c", "/v1/CHAIN/c", "/v1/chain/c/RPC"}) {
-        const auto r = call(port, "POST", path, kChainId);
-        check(r.status == 404, std::string("POST ") + path + " refused (got " +
-                                   std::to_string(r.status) + ")");
-    }
+        // Health, for its own chain and by either case; and not for a chain it
+        // does not have.
+        for (const char* path : {"/v1/chain/zoo/health", "/v1/chain/ZOO/health", "/v1/bc/200200/health"}) {
+            const Reply r = call(zoo.port(), "GET", path, "");
+            check(r.status == 200 && r.body.find("\"healthy\":true") != std::string::npos,
+                  std::string("GET ") + path);
+        }
+        check(call(zoo.port(), "GET", "/v1/chain/c/health", "").status == 404,
+              "GET /v1/chain/c/health refused");
 
-    // P and X are the archive's, not this node's. Without one configured the
-    // refusal says so — and it says so for every spelling, which is the point.
-    for (const char* path : {"/v1/chain/P", "/v1/chain/p/rpc", "/v1/bc/x"}) {
-        const auto r = call(port, "POST", path, kChainId);
-        check(r.status == 200 && r.body.find("--archive-rpc") != std::string::npos,
-              std::string("POST ") + path + " names the archive");
+        // What it says about itself must match what it serves — an advertisement
+        // for a chain that 404s is a second, wrong answer to the same question.
+        const Reply about = call(zoo.port(), "GET", "/", "");
+        check(about.status == 200 && about.body.find("/v1/chain/zoo") != std::string::npos,
+              "GET / advertises zoo");
+        check(about.body.find("/v1/chain/p") == std::string::npos &&
+              about.body.find("\"c\"") == std::string::npos,
+              "…and advertises no chain of another network");
     }
 
-    rpc.stop();
+    // ── Lux: the network that does own C, P and X ───────────────────────────
+    {
+        Node lux(96369);
+        std::printf("lux node (chain id 96369, port %u)\n", lux.port());
+
+        every_spelling(lux, "c", true);
+        every_spelling(lux, "96369", true);
+
+        // Zoo's and Hanzo's chains are refused from this side too. The rule is
+        // ownership, not a deny-list with `c` privileged.
+        every_spelling(lux, "zoo", false);
+        every_spelling(lux, "hanzo", false);
+        every_spelling(lux, "200200", false);
+
+        // P and X ARE this network's, and a light node reaches them through an
+        // archive — so they are NOT a 404, and with none configured the answer
+        // says which piece is missing rather than pretending the chain is.
+        for (const char* path : {"/v1/chain/P", "/v1/chain/p/rpc", "/v1/bc/x"}) {
+            const Reply r = call(lux.port(), "POST", path, kChainId);
+            check(r.status == 200 && r.body.find("--archive-rpc") != std::string::npos,
+                  std::string("POST ") + path + " names the archive");
+        }
+
+        check(lux.served(call(lux.port(), "POST", "/", kChainId)), "POST / is the node's own chain");
+        check(lux.served(call(lux.port(), "POST", "/v1/chain/c?trace=1", kChainId)),
+              "POST /v1/chain/c?trace=1");
+    }
+
+    // ── Hanzo: its own EVM, and none of the Lux primary network's chains ────
+    {
+        Node hanzo(36963);
+        std::printf("hanzo node (chain id 36963, port %u)\n", hanzo.port());
+
+        every_spelling(hanzo, "hanzo", true);
+        every_spelling(hanzo, "36963", true);
+        every_spelling(hanzo, "c", false);
+        every_spelling(hanzo, "zoo", false);
+        every_spelling(hanzo, "p", false);
+        check(hanzo.served(call(hanzo.port(), "POST", "/", kChainId)), "POST / is the node's own chain");
+    }
+
+    // ── what is refused whatever the network ────────────────────────────────
+    {
+        Node lux(31337);  // the localnet id, which is still Lux
+        std::printf("lux localnet node (chain id 31337, port %u)\n", lux.port());
+        every_spelling(lux, "c", true);
+        every_spelling(lux, "31337", true);
+
+        // Folding case is not opening a door, and the words AROUND the alias are
+        // literals: only the alias is the caller's to spell, so `/v1/CHAIN/c` is
+        // a different path rather than a different capitalisation of this one.
+        for (const char* path : {"/v1/chain/zzz", "/v1/chain/zzz/rpc", "/v1/chain", "/v1/chain/c/extra",
+                                 "/v1/chain/c/rpc/../../admin", "/ext/bc/C/rpc", "/v1/bc//rpc",
+                                 "/V1/chain/c", "/v1/CHAIN/c", "/v1/chain/c/RPC"}) {
+            const Reply r = call(lux.port(), "POST", path, kChainId);
+            check(r.status == 404, std::string("POST ") + path + " refused (got " +
+                                       std::to_string(r.status) + ")");
+        }
+    }
+
+    // ── a chain id no network claims ────────────────────────────────────────
+    {
+        // It is still exactly one chain: it answers under its own number, under
+        // the root, and under nothing else. Inheriting `c` here — the old
+        // default — would give an unknown chain the C-Chain's name.
+        Node lone(424242);
+        std::printf("unclaimed chain id (424242, port %u)\n", lone.port());
+        every_spelling(lone, "424242", true);
+        every_spelling(lone, "c", false);
+        check(lone.served(call(lone.port(), "POST", "/", kChainId)), "POST / is the node's own chain");
+    }
+
     std::printf("%s\n", g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;
 }

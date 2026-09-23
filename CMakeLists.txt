@@ -196,6 +196,7 @@ add_library(node STATIC
     src/engine.cpp        # execute → decide → accept, for any VM
     src/evm.cpp           # the C-Chain, executed by cevm
     src/import.cpp        # the C-chain's external format, read back
+    src/network.cpp       # which chain aliases this node's network owns
     src/rpc.cpp           # HTTP JSON-RPC
     src/eth.cpp           # the eth methods, mounted on an Rpc
     src/validators.cpp    # the set-root commitment a vote binds

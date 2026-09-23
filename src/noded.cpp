@@ -37,6 +37,7 @@
 #include "lux/node/eth.hpp"
 #include "lux/node/evm.hpp"
 #include "lux/node/import.hpp"
+#include "lux/node/network.hpp"
 #include "lux/node/signer.hpp"
 #include "lux/node/node_host.hpp"
 #include "lux/node/rpc.hpp"
@@ -226,6 +227,11 @@ int main(int argc, char** argv) {
     // vote carries.
     const Id chain_id = evm::chain_id(eth);
 
+    // The chains this node answers for are its network's to name, and the chain
+    // id names the network (network.hpp). A Zoo node is `zoo`, never `c`.
+    const Network     net  = network_of(eth);
+    const std::string self = net.served.front();
+
     // The keys: everything else is named by them.
     std::unique_ptr<Signer> mep;
     try {
@@ -356,8 +362,8 @@ int main(int argc, char** argv) {
                 hex(chain_id).c_str());
     std::printf("node %ld: validator %s, seat %ld of %ld in %s\n", index,
                 hex(me.node()).c_str(), index, n, committee_path.c_str());
-    std::printf("node %ld: consensus 127.0.0.1:%u  chain C (eth chainId %llu)\n",
-                index, port, static_cast<unsigned long long>(chain.eth_chain_id()));
+    std::printf("node %ld: consensus 127.0.0.1:%u  chain %s (eth chainId %llu)\n",
+                index, port, self.c_str(), static_cast<unsigned long long>(chain.eth_chain_id()));
     std::printf("node %ld: genesis state root %s\n", index, hex(chain.state_root()).c_str());
     std::printf("node %ld: validator set root %s\n", index, hex(set_root).c_str());
     std::fflush(stdout);
@@ -420,11 +426,9 @@ int main(int argc, char** argv) {
         {"index", index},
         {"validators", n},
         {"endpoint", public_api},
-        {"chains", Rpc::Json::object({{"c", "/v1/chain/c"}, {"p", "/v1/chain/p"}, {"x", "/v1/chain/x"}})},
+        // The chains, and the rpc endpoint among them, are filled in by the Rpc
+        // from the network it was given, so they are listed in one place.
         {"endpoints", Rpc::Json::object({
-            {"rpc", "/v1/chain/c"},
-            {"p", "/v1/chain/p"},
-            {"x", "/v1/chain/x"},
             {"health", "/v1/health"},
             {"public", public_api}
         })}
@@ -434,7 +438,7 @@ int main(int argc, char** argv) {
     if (!archive_rpc.empty()) {
         std::printf("node %ld: archive RPC %s (proxying historical & P/X state)\n", index, archive_rpc.c_str());
     }
-    std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/c\n", index, rpc.port());
+    std::printf("node %ld: rpc http://127.0.0.1:%u/v1/chain/%s\n", index, rpc.port(), self.c_str());
     std::fflush(stdout);
 
     // ── the mesh ────────────────────────────────────────────────────────────
