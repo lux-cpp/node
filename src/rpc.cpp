@@ -341,6 +341,63 @@ void Rpc::method(std::string alias, std::string name, Method fn) {
     methods_[lower(std::move(alias))][std::move(name)] = std::move(fn);
 }
 
+std::vector<std::vector<std::uint8_t>> Rpc::take_sent() {
+    const std::lock_guard<std::mutex> lock(sent_mu_);
+    std::vector<std::vector<std::uint8_t>> out;
+    out.swap(sent_);
+    return out;
+}
+
+bool Rpc::submit(const std::string& alias, const std::vector<std::uint8_t>& raw) {
+    const auto relayed = relays_.find(lower(alias));
+    if (relayed == relays_.end()) return false;
+    static const char* d = "0123456789abcdef";
+    std::string        hexed = "0x";
+    for (auto b : raw) {
+        hexed += d[b >> 4];
+        hexed += d[b & 0xF];
+    }
+    const Json call{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "eth_sendRawTransaction"}, {"params", {hexed}}};
+    return proxy_to_archive("http://" + relayed->second.first, relayed->second.second, call.dump()).ok();
+}
+
+void Rpc::keep_sent(const std::string& body) {
+    Json req;
+    try {
+        req = Json::parse(body);
+    } catch (const std::exception&) {
+        return;
+    }
+    const auto one = [this](const Json& call) {
+        if (!call.is_object()) return;
+        const auto m = call.find("method");
+        const auto p = call.find("params");
+        if (m == call.end() || !m->is_string() || *m != "eth_sendRawTransaction" || p == call.end() ||
+            !p->is_array() || p->empty() || !(*p)[0].is_string())
+            return;
+        const std::string hexed = (*p)[0].get<std::string>();
+        if (hexed.size() < 4 || hexed.size() > 2 + 2 * kMaxRelayedTransaction || hexed.rfind("0x", 0) != 0) return;
+        std::vector<std::uint8_t> raw;
+        for (std::size_t i = 2; i + 1 < hexed.size(); i += 2) {
+            const auto v = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            const int hi = v(hexed[i]), lo = v(hexed[i + 1]);
+            if (hi < 0 || lo < 0) return;
+            raw.push_back(std::uint8_t(hi * 16 + lo));
+        }
+        const std::lock_guard<std::mutex> lock(sent_mu_);
+        if (sent_.size() < kMaxRelayQueue) sent_.push_back(std::move(raw));
+    };
+    if (req.is_array())
+        for (const auto& call : req) one(call);
+    else
+        one(req);
+}
+
 void Rpc::relay(std::string alias, std::string addr, std::string path) {
     relays_[lower(std::move(alias))] = {std::move(addr), std::move(path)};
 }
@@ -579,6 +636,7 @@ void Rpc::answer(int fd) {
 
         const Proxied proxied =
             proxy_to_archive("http://" + relayed->second.first, relayed->second.second, forward);
+        if (proxied.ok()) keep_sent(forward);
         if (proxied.empty()) {
             write_all(fd, response(502, "Bad Gateway",
                                    R"({"jsonrpc":"2.0","id":null,)"

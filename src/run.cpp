@@ -51,7 +51,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
+#include <set>
 #include <memory>
 #include <optional>
 #include <nlohmann/json.hpp>
@@ -550,6 +552,31 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
         }
     };
 
+    // ── transactions, relayed ───────────────────────────────────────────────
+    // What a client sent this node goes to every validator once, so the next
+    // window's proposer holds it whoever that is. What a peer relays is handed
+    // to this node's own chain, once: a transaction seen before is not handed
+    // over again, and each link's share of a pass is bounded, so a peer that
+    // streams transactions holds a fixed amount of this node.
+    std::map<std::uint32_t, std::vector<std::vector<std::uint8_t>>> relayed;
+    host.on(kTxMsgType, [&](std::uint32_t seat, const std::vector<std::uint8_t>& raw) {
+        auto& kept = relayed[seat];
+        if (raw.empty() || raw.size() > Rpc::kMaxRelayedTransaction || kept.size() >= 256) return;
+        kept.push_back(raw);
+    });
+    std::set<std::string>   seen;
+    std::deque<std::string> seen_order;
+    const auto first = [&](const std::vector<std::uint8_t>& raw) {
+        std::string key(raw.begin(), raw.end());
+        if (!seen.insert(key).second) return false;
+        seen_order.push_back(std::move(key));
+        if (seen_order.size() > 16384) {
+            seen.erase(seen_order.front());
+            seen_order.pop_front();
+        }
+        return true;
+    };
+
     // ── the chain, one pass at a time ───────────────────────────────────────
     //
     // A pass never waits on the network, so one thread drives it in a loop and
@@ -565,7 +592,13 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
             host.sweep(peers);
             met = std::chrono::steady_clock::now();
         }
+        for (auto& raw : rpc.take_sent())
+            if (first(raw)) host.gossip(kTxMsgType, raw);
         const Step pass = engine.step();
+        for (auto& [seat, raws] : relayed)
+            for (const auto& raw : raws)
+                if (first(raw)) (void)rpc.submit(self, raw);
+        relayed.clear();
         for (const auto& e : pass.events) {
             say(e);
             if (e.what == Event::What::Decided || e.what == Event::What::Caught)

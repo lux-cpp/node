@@ -107,7 +107,26 @@ public:
     // for the duration of every method call.
     std::mutex& guard() noexcept { return mu_; }
 
+    // THE TRANSACTIONS A CLIENT SENT HERE, for the mesh. Only the window's
+    // proposer builds, so a transaction left in the pool of the node a client
+    // happened to reach waits for that node's window; relayed, it is in every
+    // validator's pool and the next window's proposer builds it (lux-rs/node
+    // mesh.rs TRANSACTION). Each raw transaction the chain's own server took
+    // (eth_sendRawTransaction answered 200) is kept here, as bytes, until the
+    // driver takes them.
+    std::vector<std::vector<std::uint8_t>> take_sent();
+
+    // Hand `raw` — a transaction a peer relayed — to the chain `alias` runs in,
+    // as eth_sendRawTransaction. Its pool decides; a refusal is its own.
+    bool submit(const std::string& alias, const std::vector<std::uint8_t>& raw);
+
+    // The largest transaction relayed — go-ethereum's pool refuses above it —
+    // and how many wait for the driver at most.
+    static constexpr std::size_t kMaxRelayedTransaction = 128 * 1024;
+    static constexpr std::size_t kMaxRelayQueue         = 4096;
+
 private:
+    void keep_sent(const std::string& body);
     void serve();
     void answer(int fd);
     Json dispatch(const std::string& alias, const Json& request);
@@ -124,6 +143,8 @@ private:
     std::map<std::string, std::string>                         refused_; // method → why
     Json                                            about_;
     std::mutex                                      mu_;
+    std::mutex                                      sent_mu_;
+    std::vector<std::vector<std::uint8_t>>          sent_;
     std::thread                                     accepting_;
     bool                                            running_ = false;
 };
