@@ -34,9 +34,8 @@ ARG LUX_CPP_CONSENSUS=9928599fc95d92c54b759468a351af907ab29aed
 # cevm main, the tree lux-cpp/node's tests pass on and its own image builds
 # against. Not the integrate/fixes/fix-* branches: those are unmerged GPU-EVM
 # work, and this is the CPU build.
-ARG LUX_CPP_CEVM=1c7e94f0afc61cf39c7afb411360f9a0b460de9e
-# cevm's submodule names evmc 2b50c2f, which evmc's rewritten history no longer
-# reaches. This is the commit on its main with the same tree, 27c285d.
+ARG LUX_CPP_CEVM=37c8d5d243a644688a125e5658900ff461a2363b
+# The evmc commit cevm's submodule names, fetched where the submodule goes.
 ARG LUX_CPP_EVMC=7cb4b0ca30df7b036d1a582196af5e9a1455a47d
 # The tree lux-cpp/node's last green image built. The commit after it on main
 # adds bcc to CMake's algorithm list and not to the Conan recipe's exports, so
