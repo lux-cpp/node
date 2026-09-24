@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <sstream>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -27,19 +29,31 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++g_fail;
 }
 
-// run() on `specs` with `args`, publishing into a directory of its own.
-int publish(std::span<const Spec> specs, std::vector<std::string> args) {
-    char tmpl[] = "/tmp/lux-run-XXXXXX";
-    const char* dir = ::mkdtemp(tmpl);
-    if (dir == nullptr) return -1;
+// run() on `specs` with `args`, publishing into `dir`.
+int publish_into(const std::string& dir, std::span<const Spec> specs, std::vector<std::string> args) {
     args.insert(args.begin(), "run_test");
     args.insert(args.end(), {"--data", dir, "--publish"});
     std::vector<char*> argv;
     for (auto& a : args) argv.push_back(a.data());
     argv.push_back(nullptr);
-    const int rc = run(specs, int(args.size()), argv.data());
+    return run(specs, int(args.size()), argv.data());
+}
+
+// run() on `specs` with `args`, publishing into a directory of its own.
+int publish(std::span<const Spec> specs, std::vector<std::string> args) {
+    char tmpl[] = "/tmp/lux-run-XXXXXX";
+    const char* dir = ::mkdtemp(tmpl);
+    if (dir == nullptr) return -1;
+    const int rc = publish_into(dir, specs, std::move(args));
     std::filesystem::remove_all(dir);
     return rc;
+}
+
+std::string read_all(const std::string& path) {
+    std::ifstream in(path);
+    std::ostringstream out;
+    out << in.rdbuf();
+    return out.str();
 }
 
 }  // namespace
@@ -51,6 +65,21 @@ int main() {
                     R"({"config":{"chainId":31337},"alloc":{}})", "/nonexistent/vm"};
 
     check(publish(std::array{good}, {}) == 0, "a good spec publishes this validator's line");
+    {
+        // What a container with no shell hands on: the line, beside the keys,
+        // and the same line again, since the keys are reused.
+        char tmpl[] = "/tmp/lux-run-XXXXXX";
+        const std::string dir = ::mkdtemp(tmpl);
+        const int first = publish_into(dir, std::array{good}, {});
+        const std::string once = read_all(dir + "/published");
+        const int second = publish_into(dir, std::array{good}, {});
+        const std::string twice = read_all(dir + "/published");
+        check(first == 0 && second == 0 && !once.empty() && once.back() == '\n' &&
+                  once.find('\n') == once.size() - 1,
+              "--publish writes the one line to <data>/published");
+        check(once == twice, "and a second --publish, on the same keys, writes the same line");
+        std::filesystem::remove_all(dir);
+    }
 
     Spec other  = good;
     other.chain = 31338;

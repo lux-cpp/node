@@ -7,7 +7,7 @@
 //   <daemon> [--network NAME] --committee <file> --peers <a:p,b:p,...>
 //            [--data DIR] [--rpc-port R] [--rpc-host H] [--deadline-ms D]
 //            [--blocks B] [--import-chain-data PATH] [--archive-rpc URL] [--vm PATH]
-//   <daemon> [--network NAME] --data DIR --publish
+//   <daemon> [--network NAME] --data DIR --publish      (also writes DIR/published)
 //
 // THE VALIDATOR SET IS READ, NOT DERIVED. A committee file names every
 // validator of this network by the ML-DSA-65 public key it published, the BLS
@@ -224,8 +224,20 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
 
     // What this validator publishes so others can put it in their committee.
     // Public halves only; the proof is over this validator's own name.
+    // Written beside the keys as well as printed, so a container with no shell
+    // can hand it on: a committee of one line is a committee of this validator,
+    // which is what an archive runs as. The keys are reused when present, so a
+    // second --publish writes the same line.
     if (publish) {
-        std::printf("%s\n", me.publish(chain_id).c_str());
+        const std::string line = me.publish(chain_id);
+        const std::string at   = data + "/published";
+        std::ofstream     out(at, std::ios::trunc);
+        out << line << "\n";
+        if (!out) {
+            std::fprintf(stderr, "%s: cannot write %s\n", prog, at.c_str());
+            return 2;
+        }
+        std::printf("%s\n", line.c_str());
         return 0;
     }
 
