@@ -260,13 +260,15 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #                   derivations, then a full exchange over a real socket pair
 #   pq_vector       the validator link held to a handshake the GO node produced:
 #                   its frames, its names, its session key (LP-10602)
+#   engine          reject after give-up, drop after a failed verify, and a
+#                   chain that refuses to build or parse does not stop the node
 #   run             what a node refuses before it starts: a spec whose genesis
 #                   names another chain, a network no spec has
 #   plugin          cevm's EVM plugin, started the way the Go node starts one
 #                   and driven through a height over ZAP
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root committee chain_route archive_proxy pq_handshake pq_vector run)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root committee chain_route archive_proxy pq_handshake pq_vector run engine)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)

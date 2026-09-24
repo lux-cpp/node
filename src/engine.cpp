@@ -128,10 +128,17 @@ std::optional<Decided> Engine::propose(
     // below would then refuse a block the chain has already paid for.
     if (!may_sign()) return std::nullopt;
 
+    // A chain that will not build — nothing pending, or a refusal from a VM in
+    // another process — proposes nothing this height. Go's engine logs a
+    // BuildBlock error and waits for the next height; it never stops the node.
     std::shared_ptr<Block> blk;
     {
         const std::lock_guard<std::mutex> lock(guard_);
-        blk = vm_->build();
+        try {
+            blk = vm_->build();
+        } catch (const std::exception&) {
+            blk = nullptr;
+        }
     }
     if (!blk) return std::nullopt;
     // Registered by settle(), published immediately after — in that order.
@@ -148,10 +155,17 @@ std::optional<Decided> Engine::follow(std::span<const std::uint8_t> bytes, int d
     // gate is asked before the execution rather than after it.
     if (!may_sign()) return std::nullopt;
 
+    // Bytes the chain refuses are a block this node does not vote for. They
+    // arrive from a peer, so a refusal that ended the node would be a halt any
+    // peer could send.
     std::shared_ptr<Block> blk;
     {
         const std::lock_guard<std::mutex> lock(guard_);
-        blk = vm_->parse(bytes);
+        try {
+            blk = vm_->parse(bytes);
+        } catch (const std::exception&) {
+            blk = nullptr;
+        }
     }
     return settle(blk, deadline_ms, nullptr);
 }
