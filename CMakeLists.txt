@@ -280,6 +280,9 @@ foreach(_t ${NODE_TESTS})
     target_link_libraries(${_t}_test PRIVATE node)
     target_compile_options(${_t}_test PRIVATE -Wall -Wextra)
     add_test(NAME ${_t} COMMAND ${_t}_test)
+    # cevm is a subdirectory and registers its own tests, which this build does
+    # not compile; the label is what says which tests are this repository's.
+    set_tests_properties(${_t} PROPERTIES LABELS node)
 endforeach()
 
 # The committee test reads REAL FILES — the same files the Rust node reads, so

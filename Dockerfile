@@ -263,10 +263,14 @@ RUN cmake -S /src/lux-cpp/node -B /src/build -G Ninja \
       -DBLST_ISA=portable
 
 # ── test ────────────────────────────────────────────────────────────────────
-# Every registered test. A failure fails the build, so an image of a tree whose
-# tests fail cannot be made from this file.
+# This repository's tests and the consensus engine's. A failure fails the build,
+# so an image of a tree whose tests fail cannot be made from this file. cevm's
+# tests are cevm's: they are registered here because it is a subdirectory, and
+# built and run by its own build.
 FROM builder AS test
-RUN cmake --build /src/build && ctest --test-dir /src/build --output-on-failure
+RUN cmake --build /src/build && \
+    ctest --test-dir /src/build -L node --output-on-failure && \
+    ctest --test-dir /src/build/consensus-build --output-on-failure
 
 # ── binaries ────────────────────────────────────────────────────────────────
 # Then two checks before anything ships: the binaries need no library the
