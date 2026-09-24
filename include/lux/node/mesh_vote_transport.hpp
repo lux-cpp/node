@@ -59,23 +59,13 @@ namespace lux::node {
 // page of headroom leaves room for the codec to grow without a negotiation.
 inline constexpr std::uint32_t kMaxVoteFrame = 4096;
 
-// ZAP msg type for a gossiped chain transaction. The link now carries two kinds
-// of thing, because a chain needs both: a vote is what a validator concluded, a
-// transaction is what a user asked for. Without the second, a transaction handed
-// to ONE node is in ONE node's block, every other validator builds a different
-// block, and the height never certifies — the correct failure, but a useless
-// one.
-inline constexpr std::uint8_t kTxMsgType = 0x12;
-
-// ZAP msg type for a proposed block — Go's block-ingestion `Put`. ONE validator
-// proposes each height and the rest execute what they receive, which is what
-// makes a height deterministic without every node first having to hold an
-// identical mempool. It is also the honest division of labour: a follower that
-// re-derives the block from its own pending set is guessing at the proposer's,
-// whereas a follower handed the bytes runs exactly what was proposed and
-// disagrees loudly (a different root, hence a different signed message) if its
-// execution differs.
-inline constexpr std::uint8_t kBlockMsgType = 0x13;
+// ZAP msg type for a relayed chain transaction: 58, the id lux-rs/node relays
+// one under (mesh.rs TRANSACTION) — undefined in Go's warp band, beside the
+// proposal (59) and the statement (62). A vote is what a validator concluded,
+// a transaction is what a user asked for; only the window's proposer builds, so
+// a transaction handed to ONE node is relayed to every validator, once, by the
+// node it was sent to, and not again by the ones that receive it.
+inline constexpr std::uint8_t kTxMsgType = 58;
 
 // What one frame on this link may carry. A vote is 188 bytes and a statement
 // 370; the large ones are a proposed block and an answer to a peer that is

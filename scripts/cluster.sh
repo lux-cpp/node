@@ -2,92 +2,108 @@
 # Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause-Eco
 #
-# cluster.sh — boot noded PROCESSES (not threads) into a loopback TCP mesh and
-# assert that every process that should finalize does. The real multi-process
-# companion to node_cluster_test (which runs in one binary).
+# cluster.sh — N luxd validators as PROCESSES on the local chain (31337), each
+# running its EVM as the cevm plugin, fed one transaction at a time, and held to
+# one thing: every validator that is up accepts the same block at every height.
 #
-# The optional DOWN index holds one validator back while every running process is
-# still configured with the full set — the case a threads-in-one-binary test
-# cannot reach, and the one where a mesh that demands every peer deadlocks a
-# cluster whose remaining stake clears the ⅔ floor.
+# The optional DOWN seat is configured in every committee and never started. Its
+# windows lapse and the next window's proposer builds (the windower,
+# engine.hpp), so a held-down seat costs its windows and nothing more; the
+# "slot" each block was built in is printed, and a slot above 0 is a height
+# whose first window was somebody else's.
 #
-# A node with an absent validator waits out the mesh window before starting
-# consensus — it cannot tell "not started yet" from "not coming". Loopback
-# processes are up in milliseconds, so the window here is 5 s, not the daemon's
-# 15 s default.
+# Transactions go to the validators in turn and are relayed across the mesh, so
+# whichever validator holds the window holds the transaction. They are
+# test/local/txs.txt: transfers signed by the first Anvil/Hardhat account, the
+# key luxd's local spec funds (src/luxd.cpp). A Cancun block that would owe a
+# block gas cost is not built, so they are sent a block interval apart.
 #
-# THE PROPOSER IS ROUND-ROBIN AND THERE IS NO FAILOVER: height h is led by
-# validator h mod n and by nobody else, so the height a held-down validator
-# leads is a height this cluster does not decide. Hold down a validator whose
-# turn falls beyond this run (i >= BLOCKS, or i == 0) — measured, not assumed:
-# `cluster.sh build/noded PORT 5 1` stops every node at height 1, which is the
-# height validator 1 leads.
-#
-# Every process is handed the SAME committee file and the SAME peer list — the
-# description a real operator writes. Each validator's keys are made once, here,
-# and each publishes the line the file is assembled from; nothing is derived
-# from an index.
-#
-# Usage: scripts/cluster.sh [noded] [base-port] [n] [down-index]
-set -euo pipefail
+# Usage: scripts/cluster.sh LUXD CEVM [down] [n] [mesh-port] [rpc-port]
+set -uo pipefail
 
-NODED="${1:-build/noded}"
-BASE_PORT="${2:-19310}"
-N="${3:-5}"
-DOWN="${4:--1}"
-BLOCKS=3
-
-if [[ ! -x "$NODED" ]]; then
-  echo "noded not found/executable at: $NODED" >&2
-  echo "build first:  cmake -S . -B build && cmake --build build -j" >&2
-  exit 2
-fi
+LUXD="${1:?luxd}"
+CEVM="${2:?cevm}"
+DOWN="${3:--1}"
+N="${4:-5}"
+BASE="${5:-19310}"
+RPC="${6:-19410}"
+TXS="$(cd "$(dirname "$0")/.." && pwd)/test/local/txs.txt"
+FROM=0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
 
 TMP="$(mktemp -d)"
-trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$TMP"' EXIT
+pids=()
+cleanup() {
+  for p in "${pids[@]:-}"; do kill -TERM "$p" 2>/dev/null || true; done
+  for p in "${pids[@]:-}"; do wait "$p" 2>/dev/null || true; done
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 
-running=()
-for i in $(seq 0 $((N - 1))); do
-  [[ "$i" == "$DOWN" ]] && continue
-  running+=("$i")
-done
-want="${#running[@]}"
+fail=0
+ok()   { echo "  ok    $1"; }
+bad()  { echo "  FAIL  $1"; fail=1; }
+call() { # call <seat> <method> <params-json> -> the raw answer
+  curl -s --max-time 5 -X POST -H 'content-type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":${3:-[]}}" \
+    "http://127.0.0.1:$((RPC + $1))/v1/chain/c/rpc"
+}
+field() { sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p"; }
 
-# The network, written down once: every validator publishes a line, and the
-# peer list is positional against it. The held-down validator is IN the
-# committee — that is the case being tested.
+live=()
+for i in $(seq 0 $((N - 1))); do [[ "$i" == "$DOWN" ]] || live+=("$i"); done
+
 peers=""
 for i in $(seq 0 $((N - 1))); do
-  "$NODED" --data "$TMP/v$i" --publish >>"$TMP/committee.txt"
-  peers="${peers:+$peers,}127.0.0.1:$((BASE_PORT + i))"
+  "$LUXD" --data "$TMP/v$i" --publish >>"$TMP/committee.txt"
+  peers="${peers:+$peers,}127.0.0.1:$((BASE + i))"
 done
-
-echo "== launching $want of $N noded processes, base port $BASE_PORT${DOWN:+, validator $DOWN held down} =="
-pids=()
-for i in "${running[@]}"; do
-  "$NODED" --data "$TMP/v$i" --committee "$TMP/committee.txt" --peers "$peers" \
-      --blocks "$BLOCKS" --deadline-ms 5000 >"$TMP/node$i.log" 2>&1 &
+for i in "${live[@]}"; do
+  "$LUXD" --data "$TMP/v$i" --committee "$TMP/committee.txt" --peers "$peers" --vm "$CEVM" \
+          --rpc-port $((RPC + i)) --deadline-ms 3000 >"$TMP/node$i.log" 2>&1 &
   pids+=("$!")
 done
+if (( DOWN >= 0 )); then echo "== ${#live[@]} of $N validators up, seat $DOWN held down"; else echo "== $N validators up"; fi
+for _ in $(seq 1 60); do grep -q "window" "$TMP/node${live[0]}.log" 2>/dev/null && break; sleep 0.5; done
 
-rc=0
-for p in "${pids[@]}"; do
-  if ! wait "$p"; then rc=1; fi
+sent=0
+while read -r tx; do
+  seat="${live[$((sent % ${#live[@]}))]}"
+  answer="$(call "$seat" eth_sendRawTransaction "[\"$tx\"]")"
+  echo "$answer" | grep -q '"result"' || bad "transaction $sent to seat $seat: $answer"
+  sent=$((sent + 1))
+  sleep 2.5
+done <"$TXS"
+
+want=$(printf '0x%x' "$sent")
+for _ in $(seq 1 60); do
+  done_all=1
+  for i in "${live[@]}"; do
+    [[ "$(call "$i" eth_getTransactionCount "[\"$FROM\",\"latest\"]" | field result)" == "$want" ]] || done_all=0
+  done
+  [[ "$done_all" == 1 ]] && break
+  sleep 1
 done
 
-echo "== per-node output =="
-final=0
-for i in "${running[@]}"; do
-  cat "$TMP/node$i.log"
-  # Every running validator carried the last height to a certificate: a decided
-  # block is the only thing that prints this line.
-  if grep -q "block $BLOCKS .*voters" "$TMP/node$i.log"; then final=$((final + 1)); fi
+height=$(( $(call "${live[0]}" eth_blockNumber | field result) ))
+(( height >= 1 )) && ok "the chain is at height $height after $sent transactions" || bad "no block was built"
+for i in "${live[@]}"; do
+  n="$(call "$i" eth_getTransactionCount "[\"$FROM\",\"latest\"]" | field result)"
+  [[ "$n" == "$want" ]] && ok "seat $i executed all $sent transactions" || bad "seat $i nonce $n, want $want"
 done
+for h in $(seq 1 "$height"); do
+  hx=$(printf '0x%x' "$h")
+  first=""
+  for i in "${live[@]}"; do
+    hash="$(call "$i" eth_getBlockByNumber "[\"$hx\",false]" | field hash)"
+    [[ -z "$first" ]] && first="$hash"
+    [[ -n "$hash" && "$hash" == "$first" ]] || bad "height $h: seat $i has '$hash', seat ${live[0]} has '$first'"
+  done
+done
+(( fail == 0 )) && ok "every validator that is up accepted the same block at heights 1..$height"
 
-echo "--------------------------------------------------------------"
-if [[ "$final" -eq "$want" && "$rc" -eq 0 ]]; then
-  echo "==== noded CLUSTER (processes): PASS — $final/$want decided height $BLOCKS over real TCP ===="
-  exit 0
-fi
-echo "==== noded CLUSTER (processes): FAIL — $final/$want finalized ===="
-exit 1
+echo "== who built each block (a slot is a window at the height; each is one proposer's)"
+grep -h " led " "$TMP"/node*.log | sort -t' ' -k4,4n -u | sed 's/^/  /'
+
+echo
+if (( fail )); then echo "FAIL"; for i in "${live[@]}"; do echo "--- node $i"; tail -15 "$TMP/node$i.log"; done; exit 1; fi
+echo "PASS — ${#live[@]} of $N validators, one chain"
