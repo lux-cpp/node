@@ -34,7 +34,7 @@ ARG LUX_CPP_CONSENSUS=9928599fc95d92c54b759468a351af907ab29aed
 # cevm main, the tree lux-cpp/node's tests pass on and its own image builds
 # against. Not the integrate/fixes/fix-* branches: those are unmerged GPU-EVM
 # work, and this is the CPU build.
-ARG LUX_CPP_CEVM=223db480c97fc812e6875f3f0fb367617f66b067
+ARG LUX_CPP_CEVM=1e8e42c34c4634de31bc731d008917342328f2f1
 # The evmc commit cevm's submodule names, fetched where the submodule goes.
 ARG LUX_CPP_EVMC=7cb4b0ca30df7b036d1a582196af5e9a1455a47d
 # The tree lux-cpp/node's last green image built. The commit after it on main
