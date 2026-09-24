@@ -16,6 +16,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 
 extern char** environ;
@@ -213,6 +214,17 @@ std::unique_ptr<Chain> Chain::start(const std::filesystem::path& path, const Sta
 
     const std::string exe = path.string();
     char* const       argv[] = {const_cast<char*>(exe.c_str()), nullptr};
+
+    // The chain's directory exists before the chain does, as Go's chain
+    // manager makes it: a plugin keeps its state there from Initialize on.
+    if (!with.data_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(with.data_dir, ec);
+        if (ec) {
+            ::close(door.fd);
+            throw std::runtime_error("plugin: cannot make " + with.data_dir + ": " + ec.message());
+        }
+    }
 
     const ::pid_t pid = ::fork();
     if (pid < 0) { ::close(door.fd); throw std::runtime_error("plugin: fork failed"); }
