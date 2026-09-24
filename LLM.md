@@ -188,6 +188,14 @@ second time and disagreeing with it — four validators holding 80 of 100 stake,
 over the ⅔ floor of 66, would all refuse to start because the fifth was down.
 `noded` reads the returned count against `two_thirds_stake_floor`.
 
+The mesh listens on `--mesh-host` (default 127.0.0.1, like `--rpc-host`); a
+validator whose peers are other pods runs with `--mesh-host 0.0.0.0`. Its own
+`--peers` entry is the address the others dial — in a cluster a Service
+address the pod does not hold — so it is not what the pod binds. A host that is
+not an IPv4 address is refused before anything starts. `mesh_formation_test`
+[F] meets two 0.0.0.0-bound hosts over the machine's outward address, and shows
+a 127.0.0.1-bound one is not there.
+
 Per pair, the lower index dials and the higher index accepts → exactly one
 connection per pair. A dialer writes a 4-byte BE index handshake (ZAP `Writer`,
 the same encoder the frames use); the acceptor consumes it so the frame stream

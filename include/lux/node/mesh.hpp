@@ -94,10 +94,13 @@ public:
     Mesh(const Mesh&) = delete;
     Mesh& operator=(const Mesh&) = delete;
 
-    // Bind 127.0.0.1:port and listen. Returns the port actually bound (which
-    // resolves a requested 0). Throws std::runtime_error at the boundary on
-    // failure. Must precede connect().
-    std::uint16_t listen_bind(std::uint16_t port);
+    // Bind host:port and listen. `host` is an IPv4 address: 127.0.0.1 serves
+    // this machine only, 0.0.0.0 every interface — what a validator in a pod
+    // binds, since its peers dial it from other pods. Returns the port actually
+    // bound (which resolves a requested 0). Throws std::runtime_error at the
+    // boundary on failure, a host that is not an IPv4 address among them. Must
+    // precede connect().
+    std::uint16_t listen_bind(const std::string& host, std::uint16_t port);
 
     // Reach as many of `peers` as possible within ONE deadline that covers the
     // whole phase — accepting, dialing, and the index handshake alike. The lower-
