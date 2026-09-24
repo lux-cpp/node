@@ -1,32 +1,38 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// engine_test.cpp — what the engine asks of a chain, and what it does with a
-// chain that says no.
+// engine_test.cpp — one validator against a peer the test scripts.
 //
-// Go is the reference. engine/chain/engine.go rejects the losing block after a
-// clean accept, exactly once, and DROPS a block that fails Verify instead ("built
-// block failed verification — dropping"): it never entered consensus and took
-// nothing. A BuildBlock error is logged and the height waits; it never stops the
-// node. A chain in another process says no by refusing a call, and a refusal of
-// a peer's bytes that ended the node would be a halt any peer could send.
+// live_test proves validators converge; this proves what one of them refuses,
+// each against a control that shows the refusal is the thing being tested:
+//
+//   - a proposal signed for a window that is not its signer's is never parsed —
+//     the chain is not shown a byte of it — while the same signer's proposal in
+//     its own window is parsed, executed and relayed;
+//   - a block the chain refuses is never signed;
+//   - a node whose tip came off an export builds nothing in its own windows and
+//     signs nothing but its anchor, where the same node without the gate builds;
+//   - a chain that refuses to build does not stop the node.
 
-#include "lux/consensus/threshold.hpp"
+#include "fake_chain.hpp"
 #include "lux/node/engine.hpp"
-#include "lux/node/node_host.hpp"
-#include "bls_signature.hpp"
+#include "lux/node/host.hpp"
+#include "lux/node/journal.hpp"
+#include "lux/node/signer.hpp"
 
-#include <array>
-#include <cstdint>
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <functional>
 #include <memory>
-#include <mutex>
-#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <unistd.h>
+
 using namespace lux::node;
-using namespace lux::consensus;
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -36,193 +42,231 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++g_fail;
 }
 
-// The engine's contract is about WHICH call it makes and when, so the VM under
-// it is a tally rather than a chain: a real one would prove the C-Chain's
-// bookkeeping a second time and say nothing more about the engine.
+constexpr auto          kWindow = 300ms;
+constexpr std::uint64_t kTip    = 799;
 
-struct Tally {
-    int accepted = 0;
-    int rejected = 0;
-};
-
-class CountingBlock final : public Block {
-public:
-    CountingBlock(Tally* t, bool verifies) : t_(t), verifies_(verifies) {
-        id_.fill(0x7c);
-        root_.fill(0x5e);
-        bytes_ = {0x7c};
-    }
-    Id                            id() const override { return id_; }
-    Id                            parent() const override { return kEmptyId; }
-    std::uint64_t                 height() const override { return 1; }
-    std::span<const std::uint8_t> bytes() const override { return bytes_; }
-    Id                            root() const override { return root_; }
-    bool                          verify() override { return verifies_; }
-    void                          accept() override { ++t_->accepted; }
-    void                          reject() override { ++t_->rejected; }
-
-private:
-    Tally*                    t_;
-    bool                      verifies_;
-    Id                        id_{}, root_{};
-    std::vector<std::uint8_t> bytes_;
-};
-
-class CountingVM final : public VM {
-public:
-    CountingVM(Tally* t, bool verifies) : t_(t), verifies_(verifies) {}
-    Id          chain_id() const override { Id c{}; c.fill(0xc1); return c; }
-    std::string alias() const override { return "T"; }
-    std::shared_ptr<Block> build() override { return std::make_shared<CountingBlock>(t_, verifies_); }
-    std::shared_ptr<Block> parse(std::span<const std::uint8_t>) override {
-        return std::make_shared<CountingBlock>(t_, verifies_);
-    }
-    std::shared_ptr<Block> get(const Id&) const override { return nullptr; }
-    void                   prefer(const Id&) override {}
-    Id                     last_accepted() const override { return kEmptyId; }
-    std::uint64_t          last_accepted_height() const override { return 0; }
-    // Nothing was ever handed to this chain from outside, so its own decisions
-    // reach its tip and the engine's gate has nothing to hold.
-    std::uint64_t          frontier() const override { return 0; }
-
-private:
-    Tally* t_;
-    bool   verifies_;
-};
-
-// One host out of a four-validator set — the committee floor — with nobody
-// else up. A single key can never carry a two-thirds certificate over four, so
-// this height CANNOT be decided: whether the wait ends at the deadline or at a
-// certificate that will not verify, the engine gives the block up, and giving
-// up is the thing under test.
-constexpr std::uint32_t kN = 4;
-
-std::unique_ptr<Node2Host> lone_host() {
-    HostConfig cfg;
-    std::vector<Validator> set;
-    for (std::uint8_t i = 0; i < kN; ++i) {
-        std::array<std::uint8_t, 32> seed{};
-        seed[0] = std::uint8_t(0x5A + i);
-        for (int j = 1; j < 32; ++j) seed[j] = std::uint8_t(0x3C ^ (i + j));
-        std::array<std::uint8_t, 32> sk{};
-        PubKey                       pk{};
-        if (cevm::crypto::bls::keygen(seed.data(), sk.data()) != 0) { std::puts("keygen"); std::exit(2); }
-        if (cevm::crypto::bls::sk_to_pk(sk.data(), pk.data()) != 0) { std::puts("sk_to_pk"); std::exit(2); }
-        set.push_back({pk, 25});
-        if (i == 0) { cfg.sk = sk; cfg.pk = pk; }
-    }
-    cfg.index      = 0;
-    cfg.port       = 0;
-    cfg.validators = set;
-    cfg.wave       = WaveConfig{kN, two_thirds_count(kN), 2};
-    cfg.accepted   = 0;
-    auto h = std::make_unique<Node2Host>(std::move(cfg));
-    h->listen_bind();
-    return h;
+Id filled(std::uint8_t b) {
+    Id id{};
+    id.fill(b);
+    return id;
 }
 
-// A chain in another process that refuses every build and every parse, the way
-// a plugin with an empty pool, or one handed bytes it cannot read, answers.
-class RefusingVM final : public VM {
+// A chain that says no to building, in the way a chain in another process does:
+// the call fails.
+class Refusing final : public VM {
 public:
-    Id          chain_id() const override { Id c{}; c.fill(0xc2); return c; }
-    std::string alias() const override { return "T"; }
-    std::shared_ptr<Block> build() override { throw std::runtime_error("build: no pending transactions"); }
-    std::shared_ptr<Block> parse(std::span<const std::uint8_t>) override {
-        throw std::runtime_error("parse: not a block");
+    explicit Refusing(std::shared_ptr<test::Store> s) : inner_(std::move(s)) {}
+    Id                     chain_id() const override { return {}; }
+    std::string            alias() const override { return "test"; }
+    std::shared_ptr<Block> build() override {
+        ++calls;
+        throw std::runtime_error("build: the chain is not ready");
     }
-    std::shared_ptr<Block> get(const Id&) const override { return nullptr; }
+    std::shared_ptr<Block> parse(std::span<const std::uint8_t> b) override { return inner_.parse(b); }
+    std::shared_ptr<Block> get(const Id& id) const override { return inner_.get(id); }
     void                   prefer(const Id&) override {}
-    Id                     last_accepted() const override { return kEmptyId; }
-    std::uint64_t          last_accepted_height() const override { return 0; }
-    std::uint64_t          frontier() const override { return 0; }
+    Id                     last_accepted() const override { return inner_.last_accepted(); }
+    std::uint64_t          last_accepted_height() const override { return inner_.last_accepted_height(); }
+    int                    calls = 0;
+
+private:
+    test::FakeChain inner_;
 };
 
-// A committee of one: this node is the whole validator set, as an archive's is.
-std::unique_ptr<Node2Host> alone_host() {
-    HostConfig                   cfg;
-    std::array<std::uint8_t, 32> seed{};
-    seed.fill(0x4b);
-    std::array<std::uint8_t, 32> sk{};
-    PubKey                       pk{};
-    if (cevm::crypto::bls::keygen(seed.data(), sk.data()) != 0) { std::puts("keygen"); std::exit(2); }
-    if (cevm::crypto::bls::sk_to_pk(sk.data(), pk.data()) != 0) { std::puts("sk_to_pk"); std::exit(2); }
-    cfg.sk         = sk;
-    cfg.pk         = pk;
-    cfg.index      = 0;
-    cfg.port       = 0;
-    cfg.validators = {{pk, 1}};
-    cfg.wave       = WaveConfig::feasible(1);
-    cfg.accepted   = 0;
-    auto h = std::make_unique<Node2Host>(std::move(cfg));
-    h->listen_bind();
-    return h;
-}
+// A validator under test (seat 0) and a scripted peer (seat 1) in a committee
+// of four, the two linked over a real loopback socket.
+struct Rig {
+    std::filesystem::path                 root;
+    Id                                    chain = filled(0x2c);
+    std::vector<std::unique_ptr<Signer>>  signers;
+    Committee                             committee;
+    std::shared_ptr<test::Store>          store;
+    std::unique_ptr<Host>                 host, peer;
+    std::mutex                            guard;
+    std::unique_ptr<Engine>               engine;
+    VM*                                   vm = nullptr;
+
+    Rig(const std::string& name, bool gate, std::function<std::unique_ptr<VM>(std::shared_ptr<test::Store>)> make = {}) {
+        root = std::filesystem::temp_directory_path() / ("node-engine-" + std::to_string(::getpid()) + "-" + name);
+        std::filesystem::remove_all(root);
+        std::string text;
+        for (int i = 0; i < 4; ++i) {
+            signers.push_back(std::make_unique<Signer>(Signer::open(root / ("v" + std::to_string(i)))));
+            text += signers.back()->publish(chain) + "\n";
+        }
+        committee = Committee::read(text, chain);
+        store     = test::Store::imported(filled(0x79), kTip, 1747000000);
+        if (gate) close_gate(root / "v0");
+
+        auto link = [this](std::uint32_t i) {
+            Link l;
+            l.me    = signers[i]->identity();
+            l.chain = chain;
+            l.seat  = [this](const Node& who) -> std::optional<std::uint32_t> {
+                const auto at = committee.seat(who);
+                if (!at) return std::nullopt;
+                return std::uint32_t(*at);
+            };
+            return l;
+        };
+        HostConfig a;
+        a.index = 0;
+        a.link  = link(0);
+        host    = std::make_unique<Host>(std::move(a));
+        HostConfig b;
+        b.index = 1;
+        b.link  = link(1);
+        peer    = std::make_unique<Host>(std::move(b));
+        const auto pa = host->listen_bind();
+        const auto pb = peer->listen_bind();
+        std::thread t([&] { peer->connect_mesh({{0, {"127.0.0.1", pa}}}, 2000); });
+        host->connect_mesh({{1, {"127.0.0.1", pb}}}, 2000);
+        t.join();
+
+        EngineConfig ec;
+        ec.committee = committee;
+        ec.self      = signers[0]->node();
+        ec.sk        = signers[0]->secret();
+        ec.identity  = signers[0]->identity();
+        ec.chain     = chain;
+        ec.binding   = Binding::Transport;
+        ec.window    = kWindow;
+        ec.data      = root / "v0";
+        auto chainp  = make ? make(store) : std::make_unique<test::FakeChain>(store);
+        vm           = chainp.get();
+        engine       = std::make_unique<Engine>(std::move(chainp), *host, guard, std::move(ec));
+    }
+    ~Rig() {
+        engine.reset();
+        host.reset();
+        peer.reset();
+        std::filesystem::remove_all(root);
+    }
+
+    // Drive the engine for `d`, draining what reaches the peer.
+    std::vector<Event> run(std::chrono::milliseconds d) {
+        std::vector<Event> events;
+        const auto         end = std::chrono::steady_clock::now() + d;
+        while (std::chrono::steady_clock::now() < end) {
+            auto s = engine->step();
+            events.insert(events.end(), s.events.begin(), s.events.end());
+            peer->pump();
+            std::this_thread::sleep_for(1ms);
+        }
+        return events;
+    }
+
+    // A proposal the peer (seat 1) signs at `slot`, of a block on `parent`.
+    Proposal proposal(std::uint64_t slot, const Id& parent, std::uint64_t nonce) {
+        std::vector<std::uint8_t> b{'F', 'A', 'K', 'E'};
+        b.insert(b.end(), parent.begin(), parent.end());
+        for (std::uint64_t v : {kTip + 1, std::uint64_t(1747000100), nonce})
+            for (int s = 56; s >= 0; s -= 8) b.push_back(std::uint8_t(v >> s));
+        Proposal p;
+        p.height = kTip + 1;
+        p.slot   = slot;
+        p.block  = b;
+        const auto header = proposal_header(chain, committee.root(), store->tip, p.height, slot,
+                                            signers[1]->identity().public_key(), b);
+        p.signature = pq::sign(signers[1]->identity().secret_key(), kProposalContext, header);
+        return p;
+    }
+
+    // The first slot at the next height whose proposer is (or is not) seat `i`.
+    std::uint64_t slot_of(std::uint32_t i, bool is) const {
+        for (std::uint64_t s = 0;; ++s)
+            if ((engine->proposer(kTip + 1, s) == committee.members()[i].node) == is) return s;
+    }
+};
 
 }  // namespace
 
 int main() {
-    std::printf("node — the engine and the chain under it\n\n");
+    std::printf("============= node — the engine, one validator at a time =============\n\n");
 
-    std::printf("a block the engine gives up on is rejected, and one it never voted for is not\n");
+    // [1] Whose window a proposal is in decides whether it is looked at.
     {
-        auto       host = lone_host();
-        std::mutex guard;
-        Tally      t;
-        Engine     engine(std::make_unique<CountingVM>(&t, /*verifies=*/true), *host, guard);
-
-        const auto d = engine.advance(/*deadline_ms=*/150);
-        check(!d.has_value(), "one key out of four certifies nothing, so the height is given up");
-        check(t.rejected == 1, "and the block it gave up on was rejected — exactly once");
-        check(t.accepted == 0, "never accepted");
-    }
-    {
-        auto       host = lone_host();
-        std::mutex guard;
-        Tally      t;
-        Engine     engine(std::make_unique<CountingVM>(&t, /*verifies=*/false), *host, guard);
-
-        const auto d = engine.advance(/*deadline_ms=*/150);
-        check(!d.has_value(), "a block this node's own execution refuses is not proposed");
-        check(t.rejected == 0, "and it is dropped, not rejected: it never entered consensus");
-        check(t.accepted == 0, "and certainly not accepted");
+        Rig        r("windows", false);
+        const auto theirs = r.slot_of(1, true);
+        const auto others = r.slot_of(1, false);
+        // The engine under test takes its own windows too; its store has
+        // nothing to build, so the only block at the height is the peer's.
+        r.store->pending = false;
+        r.run(50ms);
+        r.peer->gossip(kProposalMsgType, encode(r.proposal(others, r.store->tip, 1)));
+        r.run(3 * kWindow);
+        check(r.store->parses == 0, "[1] a proposal signed for a window that is not its signer's is never parsed");
+        r.peer->gossip(kProposalMsgType, encode(r.proposal(theirs, r.store->tip, 2)));
+        r.run(3 * kWindow);
+        check(r.store->parses == 1 && r.store->verifies >= 1,
+              "[1] the signer's own window: parsed and executed");
     }
 
-    // An archive runs as a committee of itself, and its key is thrown away with
-    // its pod. That is safe only because one key certifies nothing: finality is
-    // asked at the Quasar tier, which refuses any set below four seats. (The
-    // Nova tier floors at one signer, so a set of one WOULD certify itself
-    // there — this pins that the node never asks it.)
-    std::printf("\na committee of one certifies nothing\n");
+    // [2] A block the chain refuses is never signed.
     {
-        auto       host = alone_host();
-        std::mutex guard;
-        Tally      t;
-        Engine     engine(std::make_unique<CountingVM>(&t, /*verifies=*/true), *host, guard);
-
-        const auto d = engine.advance(/*deadline_ms=*/150);
-        check(!d.has_value(), "a block its only validator votes for is not decided");
-        check(t.accepted == 0, "nor accepted");
-        check(t.rejected == 1, "and is given back when the height is given up");
+        Rig r("refused", false);
+        r.store->pending = false;
+        const auto theirs = r.slot_of(1, true);
+        r.run(50ms);
+        // On a parent that is not the tip: the chain refuses it.
+        r.peer->gossip(kProposalMsgType, encode(r.proposal(theirs, filled(0x13), 3)));
+        const auto events = r.run(4 * kWindow);
+        bool       said   = false;
+        for (const auto& e : events) said = said || e.text.find("proposer") != std::string::npos;
+        check(r.store->parses == 1, "[2] a correctly signed proposal is parsed");
+        check(said, "[2] and the refusal is said once");
+        r.engine.reset();
+        auto j = Journal::open(r.root / "v0" / "votes");
+        check(j.size() == 0, "[2] and nothing was signed for it");
+        // control: the same proposal on the tip is signed.
+        Rig c("refused-control", false);
+        c.store->pending = false;
+        const auto s = c.slot_of(1, true);
+        c.run(50ms);
+        c.peer->gossip(kProposalMsgType, encode(c.proposal(s, c.store->tip, 4)));
+        c.run(4 * kWindow);
+        c.engine.reset();
+        auto k = Journal::open(c.root / "v0" / "votes");
+        check(k.size() == 1, "[2] control: the same block on the tip is signed, once");
     }
 
-    std::printf("\na chain that says no\n");
+    // [3] A gated node builds nothing in its own windows and signs only its
+    // anchor; the same node ungated builds.
     {
-        auto       host = lone_host();
-        std::mutex guard;
-        Engine     engine(std::make_unique<RefusingVM>(), *host, guard);
+        Rig        g("gated", true);
+        const auto mine = g.slot_of(0, true);
+        g.run(kWindow * std::int64_t(mine + 3));
+        check(g.store->builds == 0, "[3] a gated node builds nothing, its own window included");
+        check(!g.engine->caught_up(), "[3] and says it is not caught up");
+        g.engine.reset();
+        auto j      = Journal::open(g.root / "v0" / "votes");
+        const auto a = j.standing(Slot{g.chain, kTip, 0});
+        check(j.size() == 1 && a && read(*a) && read(*a)->kind == Kind::Anchor && read(*a)->block == g.store->tip,
+              "[3] its journal holds one statement: the anchor on its imported tip");
 
-        bool published = false;
-        const auto d = engine.propose([&](std::span<const std::uint8_t>) { published = true; },
-                                      /*deadline_ms=*/50);
-        check(!d.has_value(), "a refused build proposes nothing this height, and the node goes on");
-        check(!published, "and publishes nothing");
-
-        const std::vector<std::uint8_t> junk{0xde, 0xad};
-        check(!engine.follow(junk, /*deadline_ms=*/50).has_value(),
-              "a peer's bytes the chain refuses are not voted for, and the node goes on");
+        Rig        c("gated-control", false);
+        const auto m = c.slot_of(0, true);
+        c.run(kWindow * std::int64_t(m + 3));
+        check(c.store->builds >= 1, "[3] control: ungated, the same node builds in its window");
     }
 
-    std::printf("\n%s\n", g_fail ? "FAIL" : "PASS");
-    return g_fail ? 1 : 0;
+    // [4] A chain that refuses to build does not stop the node.
+    {
+        Refusing* refusing = nullptr;
+        Rig       r("refusing", false, [&](std::shared_ptr<test::Store> s) {
+            auto v   = std::make_unique<Refusing>(std::move(s));
+            refusing = v.get();
+            return v;
+        });
+        const auto mine   = r.slot_of(0, true);
+        const auto events = r.run(kWindow * std::int64_t(mine + 3));
+        bool       said   = false;
+        for (const auto& e : events) said = said || e.text.find("building") != std::string::npos;
+        check(refusing->calls >= 1 && said, "[4] the refusal reached the engine, which said so and went on");
+    }
+
+    std::printf("----------------------------------------------------------------------\n");
+    if (g_fail) { std::printf("==== node ENGINE: FAIL (%d) ====\n", g_fail); return 1; }
+    std::printf("==== node ENGINE: PASS — what one validator refuses, against a control ====\n");
+    return 0;
 }

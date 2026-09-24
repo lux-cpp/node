@@ -6,8 +6,8 @@
 //
 //   <daemon> [--network NAME] --committee <file> --peers <a:p,b:p,...>
 //            [--data DIR] [--rpc-port R] [--rpc-host H] [--mesh-host H]
-//            [--deadline-ms D] [--blocks B] [--import-chain-data PATH]
-//            [--archive-rpc URL] [--vm PATH]
+//            [--deadline-ms D] [--produce MS] [--blocks B]
+//            [--import-chain-data PATH] [--archive-rpc URL] [--vm PATH]
 //   <daemon> [--network NAME] --data DIR --publish      (also writes DIR/published)
 //
 // THE VALIDATOR SET IS READ, NOT DERIVED. A committee file names every
@@ -24,16 +24,18 @@
 // THE EVM IS A PLUGIN, started the way the Go node starts one and spoken to
 // over the same ZAP protocol (plugin.hpp). The chain's genesis, its history,
 // its state and its JSON-RPC are the plugin's; this node decides its blocks and
-// relays its RPC. One height: the proposer — height mod n — asks the plugin to
-// build and gossips the bytes; every other validator hands those bytes to ITS
-// plugin to parse and verify; the quorum certificate then decides the block
-// and each plugin is told to accept it.
+// relays its RPC. A height is decided by the engine (engine.hpp), on Go's rule
+// as lux-rs/node runs it: the windower names one proposer a window, the next
+// window's proposer builds when the one before went silent, every validator
+// signs one block a height — the lowest live one that can still reach α — and
+// α signatures are the certificate each plugin is told to accept on.
 
 #include "lux/consensus/threshold.hpp"
 #include "lux/node/committee.hpp"
 #include "lux/node/engine.hpp"
+#include "lux/node/host.hpp"
+#include "lux/node/ledger.hpp"
 #include "lux/node/network.hpp"
-#include "lux/node/node_host.hpp"
 #include "lux/node/plugin.hpp"
 #include "lux/node/rpc.hpp"
 #include "lux/node/signer.hpp"
@@ -193,13 +195,14 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: %s [--network NAME] --committee FILE --peers a:p,b:p,... [--data DIR]\n"
                      "             [--rpc-port R] [--rpc-host H] [--mesh-host H] [--deadline-ms D]\n"
-                     "             [--blocks B] [--archive-rpc URL] [--import-chain-data PATH] [--vm PATH]\n"
+                     "             [--produce MS] [--blocks B] [--archive-rpc URL]\n"
+                     "             [--import-chain-data PATH] [--vm PATH]\n"
                      "       %s [--network NAME] --data DIR --publish\n"
                      "\n"
                      "--committee names the validators of this network, one published line each;\n"
                      "--publish makes a line for it. --peers gives every validator's mesh address\n"
-                     "in committee order, and the entry at this node's own seat is where it listens;\n"
-                     "--mesh-host is the address it binds (127.0.0.1; 0.0.0.0 in a pod).\n"
+                     "in committee order, and the entry at this node's own seat is where it listens.\n"
+                     "--produce sets a proposer's window to five of these (default 200 ms).\n"
                      "A validator is named for a chain, so --network decides who the file names.\n",
                      prog, prog);
         return 2;
@@ -290,23 +293,25 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
     }
 
     const long deadline_ms = arg(argc, argv, "--deadline-ms", 15000);
+    // A proposer's window, five --produce periods — lux-rs/node's flag and its
+    // default, so one runbook sets both: 200 ms, a one-second window, a
+    // 200 ms settle. Every validator of a network runs the same one.
+    const long produce_ms = arg(argc, argv, "--produce", 200);
+    if (produce_ms < 1) {
+        std::fprintf(stderr, "%s: --produce is at least 1 ms\n", prog);
+        return 2;
+    }
     const long rpc_port    = arg(argc, argv, "--rpc-port", 0);
     // 127.0.0.1 serves this machine only; a node behind a door or an ingress
     // runs with --rpc-host 0.0.0.0.
     const std::string rpc_host = arg_str(argc, argv, "--rpc-host", "127.0.0.1");
-    // The same for the validator mesh: 127.0.0.1 is this machine only, and a
-    // validator whose peers are other pods runs with --mesh-host 0.0.0.0. Its
-    // own --peers entry is the address the OTHERS dial — in a cluster a Service
-    // address the pod does not hold — so it is not what the pod binds.
-    const std::string mesh_host = arg_str(argc, argv, "--mesh-host", "127.0.0.1");
-    {
-        in_addr parsed{};
-        if (::inet_pton(AF_INET, mesh_host.c_str(), &parsed) != 1) {
-            std::fprintf(stderr, "%s: --mesh-host %s: expected an IPv4 address (0.0.0.0 binds every interface)\n",
-                         prog, mesh_host.c_str());
-            return 2;
-        }
-    }
+    // Where the mesh listens: the address this seat's own --peers entry names
+    // when that is an IPv4 address, every interface when it is a name — a name
+    // is a cluster's (zood-0.zood), and the pod does not hold it as an address.
+    in_addr    literal{};
+    const auto own     = addresses[std::size_t(index)].host;
+    const std::string mesh_host =
+        arg_str(argc, argv, "--mesh-host", ::inet_pton(AF_INET, own.c_str(), &literal) == 1 ? own : "0.0.0.0");
     const long blocks      = arg(argc, argv, "--blocks", 0);  // 0 = until stopped
 
     // Go's flag, spelled Go's way, so one runbook drives all three
@@ -331,12 +336,9 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
     const Id set_root = committee.root();
 
     HostConfig cfg;
-    cfg.index      = std::uint32_t(index);
-    cfg.host       = mesh_host;
-    cfg.port       = addresses[std::size_t(index)].port;
-    cfg.sk         = me.secret();
-    cfg.pk         = me.key();
-    cfg.validators = set;
+    cfg.index = std::uint32_t(index);
+    cfg.host  = mesh_host;
+    cfg.port  = addresses[std::size_t(index)].port;
     // HOW THIS NODE GREETS. The same identity the committee names it by, the
     // same chain that names it, and the committee itself as the answer to "who
     // is this?" — so a peer's seat is what it signed for, not what it typed.
@@ -347,18 +349,24 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
         if (!at) return std::nullopt;
         return static_cast<std::uint32_t>(*at);
     };
-    // The committee IS the validator set: this node samples nobody, so a round is
-    // "can I still reach a supermajority of the set". feasible() sizes k, the
-    // threshold and β from n in one place, so a 5-node and a 33-node cluster run
-    // the same rule rather than a literal — and it is the SAME count the stake
-    // floor uses, which it has to be: 0.8·n is not the strict-⅔ rule, and at n=4
-    // it asks for 4 of 4 while the floor it just cleared asks for 3. A daemon
-    // whose stated fault tolerance is defeated by its own threshold reports the
-    // mesh up and then never decides a round.
-    cfg.wave = WaveConfig::feasible(std::uint32_t(n));
 
-    // consensus throws at its boundary on a set/wave combination that cannot
-    // reach a decision. A daemon says so and exits; it does not abort.
+    // AN IMPORT CLOSES THE GATE, BEFORE THE CHAIN READS A BLOCK. An export
+    // carries blocks and no certificates; once it is read, this node's tip is
+    // one nothing decided. The gate is written first and synced, so a crash
+    // mid-import still leaves it standing, and only a certificate on the tip —
+    // the anchor, or a block α validators certified on it — lifts it
+    // (ledger.hpp). A second run of an unchanged flag closes it again and the
+    // engine lifts it at once from the ledger, which already holds the tip.
+    if (!import_path.empty()) {
+        try {
+            std::filesystem::create_directories(data);
+            close_gate(data);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "%s: %s\n", prog, e.what());
+            return 2;
+        }
+    }
+
     // THE CHAIN, in its own process. What it is told is what Go tells it: the
     // network, its id, the validator running it, its genesis, and a config that
     // carries --import-chain-data through, so the plugin reads the export before
@@ -379,11 +387,11 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
     // for a node run anywhere else.
     const std::string vm = arg_str(argc, argv, "--vm", spec->vm);
 
-    std::unique_ptr<Node2Host>     hostp;
+    std::unique_ptr<Host>          hostp;
     std::unique_ptr<plugin::Chain> chainp;
     std::vector<plugin::Handler>   handlers;
     try {
-        hostp  = std::make_unique<Node2Host>(std::move(cfg));
+        hostp  = std::make_unique<Host>(std::move(cfg));
         chainp = plugin::Chain::start(vm, with);
         chainp->enter(plugin::Phase::Bootstrapping);
         chainp->enter(plugin::Phase::Ready);
@@ -392,7 +400,7 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
         std::fprintf(stderr, "node %ld: cannot start — %s\n", index, e.what());
         return 2;
     }
-    Node2Host&     host  = *hostp;
+    Host&          host  = *hostp;
     plugin::Chain& chain = *chainp;
 
     std::uint16_t port = 0;
@@ -406,8 +414,9 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
                 hex(chain_id).c_str());
     std::printf("node %ld: validator %s, seat %ld of %ld in %s\n", index,
                 hex(me.node()).c_str(), index, n, committee_path.c_str());
-    std::printf("node %ld: consensus %s:%u  chain %s (eth chainId %llu, network %u)\n", index,
-                mesh_host.c_str(), port, self.c_str(), static_cast<unsigned long long>(eth), spec->network);
+    std::printf("node %ld: consensus %s:%u  chain %s (eth chainId %llu, network %u)\n",
+                index, mesh_host.c_str(), port, self.c_str(), static_cast<unsigned long long>(eth),
+                spec->network);
     std::printf("node %ld: vm %s %s, tip %s at height %llu\n", index, vm.c_str(),
                 chain.version().c_str(), hex(chain.last_accepted()).c_str(),
                 static_cast<unsigned long long>(chain.last_accepted_height()));
@@ -468,150 +477,110 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
     std::printf("node %ld: rpc http://%s:%u/v1/chain/%s\n", index, rpc_host.c_str(), rpc.port(), self.c_str());
     std::fflush(stdout);
 
+    // THE ENGINE, and whose message it signs: Transport, as luxd votes — a
+    // plugin's block does not hand its host the root it executed to, so the
+    // vote binds the block and the plugin's own verify is what refuses a block
+    // that does not execute.
+    std::unique_ptr<Engine> enginep;
+    try {
+        EngineConfig ec;
+        ec.committee = committee;
+        ec.self      = me.node();
+        ec.sk        = me.secret();
+        ec.identity  = me.identity();
+        ec.chain     = chain_id;
+        ec.binding   = Binding::Transport;
+        ec.window    = std::chrono::milliseconds(produce_ms * 5);
+        ec.data      = data;
+        enginep      = std::make_unique<Engine>(std::move(chainp), host, rpc.guard(), std::move(ec));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "node %ld: cannot start the engine — %s\n", index, e.what());
+        rpc.stop();
+        return 2;
+    }
+    Engine& engine = *enginep;
+
     // ── the mesh ────────────────────────────────────────────────────────────
     std::map<std::uint32_t, PeerAddr> peers;
     for (std::size_t j = 0; j < addresses.size(); ++j)
         if (long(j) != index) peers[std::uint32_t(j)] = addresses[j];
 
-    // Proposed blocks arrive here and wait to be executed. Only the bytes are
-    // kept — parsing is execution, and it happens on the driver's thread where
-    // the chain is single-threaded, never on the pump.
-    std::vector<std::vector<std::uint8_t>> inbox;
-    std::mutex                             inbox_mu;
-    host.on(kBlockMsgType, [&](const std::vector<std::uint8_t>& raw) {
-        const std::lock_guard<std::mutex> lock(inbox_mu);
-        inbox.push_back(raw);
-    });
-
-    const std::size_t reached = host.connect_mesh(peers, int(deadline_ms));
-    // ONE LINE, ONE VOTE. A committee carries weight 1 per validator, so the
-    // set's total is the number of validators and the reachable stake is the
-    // number this node can still see, itself included. The stake a P-chain
-    // computed is a different fact from a different source, and when this node
-    // reads one the two numbers below are what change.
+    // THE MESH IS NOT THE QUORUM, AND IT IS NOT FORMED ONCE. The rendezvous
+    // waits one deadline for the validators that are up; whoever is missing is
+    // met by the sweep in the loop below whenever they come, so a validator that
+    // starts before its peers does not exit, and one that restarts is met again.
+    // ONE LINE, ONE VOTE: the reachable stake is the number of validators this
+    // node can see, itself included.
+    const std::size_t   reached     = host.connect_mesh(peers, int(deadline_ms));
     const std::uint64_t total_stake = std::uint64_t(n);
     const std::uint64_t reachable   = std::uint64_t(reached + 1);
-    if (reachable <= two_thirds_stake_floor(total_stake)) {
-        std::printf("node %ld: NO QUORUM REACHABLE (peers=%zu/%ld, stake %llu of %llu, floor %llu)\n",
-                    index, reached, n - 1,
-                    static_cast<unsigned long long>(reachable),
-                    static_cast<unsigned long long>(total_stake),
-                    static_cast<unsigned long long>(two_thirds_stake_floor(total_stake)));
-        rpc.stop();
-        return 1;
-    }
-    std::printf("node %ld: mesh up (%zu of %ld peers, reachable stake %llu > floor %llu)\n",
-                index, reached, n - 1,
+    std::printf("node %ld: mesh %s (%zu of %ld peers, reachable stake %llu, floor %llu)\n", index,
+                reachable > two_thirds_stake_floor(total_stake) ? "up" : "waiting for a quorum", reached, n - 1,
                 static_cast<unsigned long long>(reachable),
                 static_cast<unsigned long long>(two_thirds_stake_floor(total_stake)));
     std::fflush(stdout);
 
-    // Transport, as luxd votes: a plugin's block does not hand its host the
-    // root it executed to, so the vote binds the block and the plugin's own
-    // verify is what refuses a block that does not execute.
-    Engine engine(std::move(chainp), host, rpc.guard(), Binding::Transport, set_root);
+    const auto window = std::chrono::milliseconds(produce_ms * 5);
+    std::printf("node %ld: window %ld ms a proposer, quorum %u of %ld\n", index, long(produce_ms * 5),
+                engine.quorum(), n);
+    std::fflush(stdout);
 
-    // Pump the mesh for `ms`, so gossip lands and inbound blocks arrive. The one
-    // place this daemon waits.
-    auto settle = [&](int ms) {
-        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
-        while (!g_stop.load() && std::chrono::steady_clock::now() < until) {
-            host.pump();
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const auto hex_of = [](const Id& id) { return hex(id); };
+    auto say = [&](const Event& e) {
+        switch (e.what) {
+            case Event::What::Decided:
+                std::printf("node %ld: block %llu %s %s  slot %llu  signers %zu\n", index,
+                            static_cast<unsigned long long>(e.height), e.built ? "led " : "flwd",
+                            hex_of(e.block).c_str(), static_cast<unsigned long long>(e.slot.value_or(0)),
+                            e.signers);
+                break;
+            case Event::What::Anchored:
+                std::printf("node %ld: ANCHORED the imported tip at height %llu %s  signers %zu\n", index,
+                            static_cast<unsigned long long>(e.height), hex_of(e.block).c_str(), e.signers);
+                break;
+            case Event::What::Waiting:
+                std::printf("node %ld: height %llu slot %llu: %s\n", index,
+                            static_cast<unsigned long long>(e.height),
+                            static_cast<unsigned long long>(e.slot.value_or(0)), e.text.c_str());
+                break;
+            case Event::What::Caught:
+            case Event::What::Refused:
+                std::printf("node %ld: %s\n", index, e.text.c_str());
+                break;
         }
     };
 
-    // ── a tip nobody here decided ───────────────────────────────────────────
+    // ── the chain, one pass at a time ───────────────────────────────────────
     //
-    // Reading an export moves the tip and leaves every consensus frontier below
-    // it missing, so this node knows a height it cannot walk down from. It
-    // stays UP — the RPC answers, so the imported history is readable and the
-    // state is visible rather than silent — and it does not enter the height
-    // loop. The engine would refuse each height anyway; saying so once, plainly,
-    // is the difference between a refusal and a node that looks wedged.
-    if (engine.vm().frontier() < engine.vm().last_accepted_height()) {
-        std::printf("node %ld: NOT A CAUGHT-UP VALIDATOR — tip is height %llu, this node's own "
-                    "decisions stop at height %llu\n", index,
-                    static_cast<unsigned long long>(engine.vm().last_accepted_height()),
-                    static_cast<unsigned long long>(engine.vm().frontier()));
-        std::printf("node %ld: cause: an export was read; it writes blocks and no certificates, "
-                    "so nothing below the tip was decided here\n", index);
-        std::printf("node %ld: effect: this node will NOT build blocks and will NOT vote until "
-                    "those heights are rebuilt from certified peer state\n", index);
-        std::fflush(stdout);
-        while (!g_stop.load()) {
-            host.pump();
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // A pass never waits on the network, so one thread drives it in a loop and
+    // nothing a peer sends — or does not send — holds it. Every other window it
+    // meets the validators again: the mesh is not formed once, and a validator
+    // that restarted is met again rather than left dialing a backlog nobody
+    // reads.
+    int  rc      = 0;
+    long decided = 0;
+    auto met     = std::chrono::steady_clock::now();
+    while (!g_stop.load() && (blocks == 0 || decided < blocks)) {
+        if (std::chrono::steady_clock::now() - met >= window * 2) {
+            host.sweep(peers);
+            met = std::chrono::steady_clock::now();
         }
-        std::printf("node %ld: stopping at height %llu\n", index,
-                    static_cast<unsigned long long>(engine.height()));
-        std::fflush(stdout);
-        rpc.stop();
-        return 0;
-    }
-
-    // ── the chain, one height at a time ─────────────────────────────────────
-    int rc = 0;
-    for (long produced = 0; !g_stop.load() && (blocks == 0 || produced < blocks); ++produced) {
-        const std::uint64_t height   = engine.height() + 1;
-        const bool          proposer = (height % std::uint64_t(n)) == std::uint64_t(index);
-
-        settle(blocks == 0 ? 1000 : 60);
-        // Asked to stop while waiting: leave BEFORE proposing. Entering a height
-        // here would run its full deadline against peers that are also leaving
-        // and then report a height as uncertified because the daemon was shutting
-        // down — a shutdown that ends in a false alarm and a non-zero exit.
-        if (g_stop.load()) break;
-
-        std::optional<Decided> d;
-        if (proposer) {
-            // Build (which executes), publish the bytes, then let the followers
-            // parse and submit before voting starts — a vote for a block a peer
-            // has not registered is dropped by its gate, and the proposer does
-            // not re-broadcast.
-            d = engine.propose(
-                [&](std::span<const std::uint8_t> b) {
-                    host.gossip(kBlockMsgType, std::vector<std::uint8_t>(b.begin(), b.end()));
-                },
-                int(deadline_ms));
-        } else {
-            // Wait for the leader's block, then run it. There is no fallback to
-            // building one locally: two nodes proposing at one height is exactly
-            // the sibling the equivocation rule exists to refuse.
-            std::vector<std::uint8_t> raw;
-            const auto until = std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(deadline_ms);
-            while (!g_stop.load() && std::chrono::steady_clock::now() < until) {
-                host.pump();
-                {
-                    const std::lock_guard<std::mutex> lock(inbox_mu);
-                    if (!inbox.empty()) { raw = std::move(inbox.front()); inbox.erase(inbox.begin()); }
-                }
-                if (!raw.empty()) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
-            if (!raw.empty()) d = engine.follow(raw, int(deadline_ms));
+        const Step pass = engine.step();
+        for (const auto& e : pass.events) {
+            say(e);
+            if (e.what == Event::What::Decided || e.what == Event::What::Caught)
+                decided += e.what == Event::What::Decided ? 1 : long(e.signers);
         }
-        if (!d) {
-            if (blocks != 0) {
-                std::printf("node %ld: height %llu NOT CERTIFIED before deadline — stopping\n",
-                            index, static_cast<unsigned long long>(height));
-                rc = 1;
-                break;
-            }
-            std::printf("node %ld: height %llu timeout — retrying\n",
-                        index, static_cast<unsigned long long>(height));
-            settle(500);
-            continue;
+        if (!pass.events.empty()) std::fflush(stdout);
+        // A journal that could not undo a failed write signs nothing more; a
+        // restart is what reopens it whole, so the daemon exits non-zero.
+        if (engine.broken()) {
+            std::printf("node %ld: the signing journal could not undo a failed write; restart to reopen it\n",
+                        index);
+            rc = 1;
+            break;
         }
-        std::printf("node %ld: block %llu %s %s  voters %zu  stake %llu\n",
-                    index,
-                    static_cast<unsigned long long>(d->block->height()),
-                    proposer ? "led " : "flwd",
-                    hex(d->block->id()).c_str(),
-                    d->cert.voters.size(),
-                    static_cast<unsigned long long>(d->cert.voted_stake));
-        std::fflush(stdout);
+        if (pass.quiet && pass.events.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     std::printf("node %ld: stopping at height %llu\n", index,

@@ -23,10 +23,10 @@
 // is `github.com/luxfi/api/zap` verbatim (HeaderSize 5, big-endian length), which
 // is what makes a C++ frame parse on a Go node.
 
+#include "lux/node/host.hpp"
 #include "lux/node/mesh_vote_transport.hpp"
-#include "lux/node/node_host.hpp"
+#include "lux/node/statement.hpp"
 #include "names.hpp"
-#include "bls_signature.hpp"
 
 #include <array>
 #include <cstdint>
@@ -108,7 +108,7 @@ int main() {
         if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) { std::puts("socketpair"); return 2; }
 
         MeshVoteTransport tx([](const SignedVote&) {});
-        tx.add_peer(fds[0]);
+        tx.add_peer(fds[0], 1);
 
         SignedVote v;
         v.block_id.fill(0x11);
@@ -137,6 +137,38 @@ int main() {
         ::close(fds[1]);
     }
 
+    // ── the statement frame: what a validator signs, as the engine sends it ───
+    // lux-rs/node's vote frame, byte for byte: msg type 62 and three ZAP
+    // length-prefixed fields — the 226-byte message, the 20-byte node id, the
+    // 96-byte signature. 354 bytes of payload, 359 on the wire.
+    {
+        int fds[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) { std::puts("socketpair"); return 2; }
+        MeshVoteTransport tx([](const SignedVote&) {});
+        tx.add_peer(fds[0], 1);
+
+        Statement st;
+        st.message.fill(0x44);
+        st.node.fill(0x55);
+        st.sig.fill(0x66);
+        tx.gossip(kStatementMsgType, encode(st));
+
+        std::vector<std::uint8_t> want;
+        append(want, {0x00, 0x00, 0x01, 0x62});  // length 354, big-endian
+        append(want, {0x3E});                    // msg_type = 62
+        append(want, {0x00, 0x00, 0x00, 0xE2});  // field length 226
+        repeat(want, 0x44, 226);                 // the signed message
+        append(want, {0x00, 0x00, 0x00, 0x14});  // field length 20
+        repeat(want, 0x55, 20);                  // the signer's node id
+        append(want, {0x00, 0x00, 0x00, 0x60});  // field length 96
+        repeat(want, 0x66, 96);                  // the signature
+        const std::vector<std::uint8_t> got = read_n(fds[1], want.size());
+        check(want.size() == 359 && got == want, "a statement is 359 bytes on the wire, laid out as Rust's vote");
+        if (got != want) std::printf("     got %s\n    want %s\n", hex(got, 24).c_str(), hex(want, 24).c_str());
+        std::printf("  statement: len=0x00000162 type=0x3E payload=354 total=%zu\n", got.size());
+        ::close(fds[1]);
+    }
+
     // ── the peer handshake, as the real host dials it ─────────────────────────
     {
         // Stand in for validator 7's listener; a host at index 5 dials it.
@@ -151,23 +183,12 @@ int main() {
         ::getsockname(srv, reinterpret_cast<sockaddr*>(&a), &len);
         const std::uint16_t port = ntohs(a.sin_port);
 
-        std::array<std::uint8_t, 32> sk{};
-        PubKey pk{};
-        std::array<std::uint8_t, 32> seed{};
-        seed[0] = 0x5A;
-        cevm::crypto::bls::keygen(seed.data(), sk.data());
-        cevm::crypto::bls::sk_to_pk(sk.data(), pk.data());
-
         HostConfig cfg;
         cfg.index      = 5;
         cfg.port       = 0;
-        cfg.sk         = sk;
-        cfg.pk         = pk;
-        cfg.validators = {{pk, 20}};
-        cfg.wave       = WaveConfig{1, 1, 1};
         const test::Names names(1);
         cfg.link       = names.link(0);
-        Node2Host host(std::move(cfg));
+        Host host(std::move(cfg));
         host.listen_bind();
 
         std::thread dial([&] {

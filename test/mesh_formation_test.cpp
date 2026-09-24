@@ -19,11 +19,10 @@
 //   stake — comfortably over the ⅔ floor of 66 — all refused to start because the
 //   fifth was down.
 
-#include "lux/node/node_host.hpp"
+#include "lux/node/host.hpp"
 #include "names.hpp"
 
 #include <span>
-#include "bls_signature.hpp"
 
 #include <array>
 #include <chrono>
@@ -48,7 +47,6 @@ using namespace lux::consensus;
 namespace {
 
 constexpr std::uint32_t kN     = 3;
-constexpr std::uint64_t kStake = 20;
 constexpr int kDeadlineMs = 1500;
 // What is being proven is BOUNDED, not fast: before the fix these calls did not
 // return at all. The bound allows the deadline plus a peer-I/O window per
@@ -61,34 +59,17 @@ void check(bool ok, const std::string& what) {
     if (!ok) { std::printf("    ASSERT FAILED: %s\n", what.c_str()); ++g_fail; }
 }
 
-struct Key { std::array<std::uint8_t, 32> sk{}; PubKey pk{}; };
-Key make_key(std::uint8_t tag) {
-    std::array<std::uint8_t, 32> seed{};
-    seed[0] = tag;
-    for (int i = 1; i < 32; ++i) seed[i] = std::uint8_t(0xA5 ^ (tag + i));
-    Key k;
-    if (cevm::crypto::bls::keygen(seed.data(), k.sk.data()) != 0) { std::puts("keygen"); std::exit(2); }
-    if (cevm::crypto::bls::sk_to_pk(k.sk.data(), k.pk.data()) != 0) { std::puts("sk_to_pk"); std::exit(2); }
-    return k;
-}
-
-std::vector<Key> g_keys;
-std::vector<Validator> g_set;
 // The names every host here greets with: a link proves who answered, so a
 // host without one could not form a mesh at all. Made once in main.
 std::unique_ptr<test::Names> g_names;
 
-std::unique_ptr<Node2Host> make_host(std::uint32_t index, const std::string& bind = "127.0.0.1") {
+std::unique_ptr<Host> make_host(std::uint32_t index, const std::string& bind = "127.0.0.1") {
     HostConfig cfg;
-    cfg.index      = index;
-    cfg.host       = bind;
-    cfg.port       = 0;
-    cfg.sk         = g_keys[index].sk;
-    cfg.pk         = g_keys[index].pk;
-    cfg.validators = g_set;
-    cfg.wave       = WaveConfig{kN, 3, 4};
-    cfg.link       = g_names->link(index);
-    return std::make_unique<Node2Host>(std::move(cfg));
+    cfg.index = index;
+    cfg.host  = bind;
+    cfg.port  = 0;
+    cfg.link  = g_names->link(index);
+    return std::make_unique<Host>(std::move(cfg));
 }
 
 // A loopback port that is BOUND but never listening: connects to it are refused
@@ -138,8 +119,6 @@ int main() {
     std::printf("============ node — mesh formation is bounded, and partial ============\n");
     std::printf("a validator that never starts costs a deadline, not the cluster\n\n");
 
-    for (std::uint32_t i = 0; i < kN; ++i) g_keys.push_back(make_key(std::uint8_t(0xC0 + i)));
-    for (const auto& k : g_keys) g_set.push_back({k.pk, kStake});
     g_names = std::make_unique<test::Names>(kN);
 
     // [A] the inbound half of the phase is bounded. Host 1 waits on an inbound
@@ -288,7 +267,7 @@ int main() {
 
     // [D] regression: a complete set still forms a complete mesh, fast.
     {
-        std::vector<std::unique_ptr<Node2Host>> hosts;
+        std::vector<std::unique_ptr<Host>> hosts;
         std::map<std::uint32_t, PeerAddr> configured;
         for (std::uint32_t i = 0; i < kN; ++i) {
             hosts.push_back(make_host(i));

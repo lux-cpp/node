@@ -3,166 +3,297 @@
 //
 // engine.hpp — what turns a VM and a mesh into a chain that advances.
 //
-// Go calls this engine/chain: the loop that asks the VM for a block, asks
-// consensus to decide it, and tells the VM the answer. It is written against
-// `VM`, not against the EVM, because that is the whole point — C, P, X, Q and Z
-// differ in what a block contains and agree completely on what happens to it.
+// THE RULE IS GO'S (luxfi/consensus engine/chain, B1: the α-of-K certificate is
+// the only decider), ported clause for clause from lux-rs/node src/engine.rs,
+// which runs it. There are no rounds and no locks: Go deleted its Tendermint
+// braid in luxfi/consensus d13b4559, and one signature a height is the whole of
+// what keeps two certificates from one height.
 //
-// THE ORDER IS EXECUTE, THEN DECIDE. The block is run before a single vote is
-// cast, so the state root is a result rather than a promise, and it is that root
-// that goes into the signed VotePosition. Go builds in the same order
-// (dummy/consensus.go writes header.Root inside FinalizeAndAssemble, before
-// BuildBlock returns) — but Go then leaves the vote's execution axes EMPTY:
-// proposervm's ExecutionStateRoot() returns ids.Empty, so a Go validator
-// certifies the root only indirectly, through a block hash that happens to
-// commit to it. Here the axis is bound.
+//  - ONE PROPOSER A WINDOW. The windower (windower.hpp) names who may build at
+//    each slot of a height; a proposal is ML-DSA-signed by its slot's proposer
+//    and refused from anyone else (proposervm verifyPostDurangoBlockDelay,
+//    block.go:474). A validator builds only in its own window and only while no
+//    block is live or signed at the height, so the next window's proposer builds
+//    when the one before it went silent. engine.rs:923-972 `offer`.
+//  - THE SLOT CLOCK counts windows from when this validator took the height up;
+//    a proposal from a later slot is taken while this validator's wall clock,
+//    counted from the tip's timestamp, allows the slot within SKEW windows, and
+//    once it has run the local clock moves up to it — never past the wall-clock
+//    slot. engine.rs:701-794.
+//  - ONE SIGNATURE PER HEIGHT, through the journal (journal.hpp): a validator
+//    signs one block at a height, before or after a restart, and never a second
+//    (reserveSlotForSign, engine.go:2489; vote_guard.go:60).
+//  - THE CONVERGED WINNER. After a settle window with no new block, a validator
+//    signs the lowest-id live block that can still reach α given the verified
+//    votes — its votes plus every validator not yet heard from
+//    (snapshotVotableSlotsLocked engine.go:2922, convergedWinnerAtHeightLocked
+//    engine.go:2829, emitConvergedVote integration.go:1002; the α filter is
+//    lux-rs/node's own, engine.rs:974-1038 `vote`).
+//  - NO BUILDING BESIDE. Not while a sibling is live, not while bound, and not
+//    while f+1 verified votes name a block this validator lacks: one of those
+//    signers is honest, holds it and pushes it again — it is waited for until
+//    the retry gives up on it. engine.rs:914-930.
+//  - BOUNDED SIBLINGS. Every signed block that executes is live, two from one
+//    proposer included, within EACH a proposer and SIBLINGS_MAX a height; past
+//    either the highest id that nothing holds goes, so nobody drops the winner.
+//    engine.rs:796-817 `room`.
+//  - ONE SETTLE DEADLINE PER HEIGHT: a block arriving restarts the settle window
+//    only until SETTLE_MAX after the first arrived. engine.rs:882-889 `stir`.
+//  - THE RETRY re-sends the bound vote and re-pushes this validator's own block
+//    and the block it signed, doubling from twice the settle window to 16 s; a
+//    peer that joins, or the first live sibling beside the one signed, brings it
+//    forward (rePollAllPending, engine.go:1784). engine.rs:1098-1141.
+//  - A NODE THAT FELL BEHIND ASKS: certified blocks, each checked against this
+//    committee before the chain sees a byte of it. engine.rs:1143-1453.
 //
-// That is a DELIBERATE DIVERGENCE, and it is not a free one — it decides who
-// this node can form a quorum WITH, so it is a named choice rather than a
-// constant. See `Binding`.
+// AND ONE THING THE RUST NODE DOES NOT HAVE YET — THE ANCHOR. An export carries
+// blocks and no certificates, so a chain read off one has a tip nothing decided
+// (the import gate, ledger.hpp). When every validator imports the same export
+// nobody can build on it. So a gated validator whose tip is (T, H) signs ONE
+// statement at height T — anchor_message(chain, T, H, set root), through the
+// journal like any vote — and gossips it; α distinct committee signatures on the
+// same (T, H) are a certificate, the gate lifts, and T+1 is built. A validator
+// that imported a different tip signs a different message and is simply not in
+// the quorum. LLM.md "The anchor" is the specification.
+//
+// WHY IT IS SAFE: two certificates at one height need α signers each, so 2α − n
+// > f signers in both — an honest validator signing twice at one height, which
+// the journal refuses. The winner rule, the retry and the anchor only decide
+// which statement an honest validator makes, never whether it makes two.
 
 #pragma once
 
-#include "lux/node/node_host.hpp"
+#include "lux/node/committee.hpp"
+#include "lux/node/host.hpp"
+#include "lux/node/journal.hpp"
+#include "lux/node/ledger.hpp"
+#include "lux/node/pq_handshake.hpp"
+#include "lux/node/statement.hpp"
 #include "lux/node/vm.hpp"
+#include "lux/node/windower.hpp"
 
-#include <functional>
+#include <chrono>
+#include <deque>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace lux::node {
 
-// WHOSE MESSAGE THIS NODE SIGNS.
+using Clock    = std::chrono::steady_clock;
+using Duration = std::chrono::steady_clock::duration;
+
+// WHOSE MESSAGE THIS NODE SIGNS. The vote's execution axis is filled two ways
+// and they are mutually exclusive: validators that disagree about which do not
+// form a quorum.
 //
-// The vote's execution axes can be filled two ways, and the two are mutually
-// exclusive: a signed message either commits to the root this node computed or
-// it does not, and validators that disagree about which do not form a quorum —
-// their signatures simply fail to verify against each other's message.
-//
-//   Executed — bind execution_state_root to what THIS node's EVM produced.
-//     Stronger, and the reason is that divergent execution cannot hide: two
-//     nodes whose EVMs disagree sign different messages and stall the height
-//     instead of both signing a name they each mean differently.
-//
-//   Transport — leave the execution axes empty, which is what luxd signs.
-//     Go's proposervm returns ids.Empty for ExecutionStateRoot, and a Go voter
-//     does not execute the block it votes on. Matching that is the ONLY way a
-//     C++ node's votes verify inside a live Go network; binding the root there
-//     produces a message luxd drops rather than disputes.
-//
-// Both are correct; which one is right depends on the network. A pure C++
-// cluster takes Executed. Joining luxd takes Transport, until Go binds the axis
-// too — at which point this collapses back to one answer, which is where it
-// should end up.
-enum class Binding {
-    Executed,   // bind the root this node computed — a C++-only cluster
-    Transport,  // leave it empty, as luxd does — a mixed cluster
+//   Executed  — bind execution_state_root to what THIS node's EVM produced, so
+//               divergent execution stalls a height instead of hiding.
+//   Transport — leave it empty, as luxd signs: Go's proposervm returns
+//               ids.Empty for ExecutionStateRoot. A chain in a plugin takes
+//               this: its root does not cross the boundary (plugin.hpp).
+enum class Binding { Executed, Transport };
+
+// engine.rs:104-154, the same constants.
+inline constexpr auto          kSettleMin     = std::chrono::milliseconds(150);
+inline constexpr auto          kSettleMax     = std::chrono::milliseconds(2000);
+inline constexpr auto          kRetryMax      = std::chrono::milliseconds(16000);
+inline constexpr std::uint32_t kRetryAttempts = 8;
+inline constexpr std::uint64_t kEarly         = 1;
+inline constexpr std::uint64_t kSkew          = 2;
+inline constexpr std::size_t   kSiblingsMax   = 64;
+inline constexpr std::size_t   kEach          = 16;
+inline constexpr std::uint32_t kJunkEach      = 16;
+inline constexpr std::size_t   kRefusedMax    = 256;
+inline constexpr std::uint32_t kAheadEach     = 4;
+inline constexpr std::size_t   kLaterEach     = 16;
+
+// Catch-up on the mesh: lux-rs/node mesh.rs ASK (57, the answer under ZAP's
+// response flag), a question `from(u64) ‖ count(u32)`, an answer
+// `from(u64) ‖ tip(u64) ‖ n(u32) ‖ n × (block ‖ certificate)`.
+inline constexpr std::uint8_t  kAskMsgType    = 57;
+inline constexpr std::uint8_t  kAnswerMsgType = 57 | 0x80;
+inline constexpr std::uint32_t kBatchMax      = 64;
+inline constexpr std::uint32_t kAskBurst      = 32;
+inline constexpr std::uint32_t kAskRate       = 16;  // a second, past the burst
+// Proposals and statements held from one link between two passes.
+inline constexpr std::size_t   kArrivalsMax   = 8;
+inline constexpr std::size_t   kStatementsMax = 256;
+
+struct EngineConfig {
+    Committee             committee;
+    Node                  self{};
+    std::array<std::uint8_t, 32> sk{};   // the BLS voting key
+    pq::Identity          identity;       // the ML-DSA name a proposal is signed with
+    Id                    chain{};
+    Binding               binding = Binding::Executed;
+    Duration              window  = std::chrono::milliseconds(1000);
+    std::filesystem::path data;           // journal, ledger, held, the gate
 };
 
-// One decided height: the block, and the certificate that decided it.
-struct Decided {
-    std::shared_ptr<Block>            block;
-    lux::consensus::QuorumCert        cert;
+// Something worth saying.
+struct Event {
+    enum class What { Decided, Anchored, Waiting, Caught, Refused } what = What::Refused;
+    std::uint64_t              height = 0;
+    std::optional<std::uint64_t> slot;
+    Id                         block{};
+    std::size_t                signers = 0;
+    bool                       built   = false;
+    std::string                text;
 };
 
-// THE LOCK DISCIPLINE, IN ONE PLACE. The VM is single-threaded and the RPC
-// answers from other threads, so calls INTO the VM take a lock. Waiting for
-// consensus does not: submit / round / pump / isFinal touch the Party and the
-// transport, never the chain, and holding the chain across that wait is what
-// makes an RPC endpoint go silent for the length of every height. Which is not a
-// hypothetical — it is what this daemon did first, and why the rule lives here
-// rather than at each call site.
+struct Step {
+    std::vector<Event> events;
+    bool               quiet = true;  // nothing arrived from a peer
+};
+
 class Engine {
 public:
-    // The engine drives the VM; it does not own the mesh, which outlives it.
-    // `guard` is the chain's lock — the same one the RPC holds while it answers.
-    // `binding` decides whose signed message this node produces; see Binding.
-    // `set_root` is the commitment to the validator set the vote is cast under,
-    // which every node in the quorum must compute identically.
-    Engine(std::unique_ptr<VM> vm, Node2Host& host, std::mutex& guard,
-           Binding binding = Binding::Executed, Id set_root = {});
+    // Open the journal and the ledger under `cfg.data`, and read the import
+    // gate. Throws std::runtime_error when either cannot be opened: a validator
+    // that cannot record what it signs does not sign. `guard` is the chain's
+    // lock, the one the RPC holds while it answers.
+    Engine(std::unique_ptr<VM> vm, Host& host, std::mutex& guard, EngineConfig cfg);
 
-    Engine(const Engine&) = delete;
+    Engine(const Engine&)            = delete;
     Engine& operator=(const Engine&) = delete;
 
-    // Build the next block, execute it, and drive consensus until its position
-    // carries a verifying quorum certificate — then accept it. Returns the
-    // decided height, or nullopt if the deadline passed without a certificate.
-    //
-    // A nullopt is NOT a retryable condition for the caller: the block has
-    // already executed, so the state is ahead of the last accepted block and
-    // building a second block on top of it would extend an uncertified state.
-    // The daemon stops. Closing this properly needs an execution the VM can roll
-    // back, which cevm's commit() does not offer today (LLM.md).
-    std::optional<Decided> advance(int deadline_ms);
+    // One pass: take what arrived, propose if this validator's window is open
+    // and nothing is live, sign the converged winner once the height has
+    // settled, accept a block once a certificate stands for it, retry what is
+    // due, and ask for what this node missed. Never waits on the network.
+    Step step();
 
-    // Lead a height: build the block, REGISTER it, publish it, then decide it.
-    // The order is load-bearing and that is why it is one call rather than three
-    // the caller sequences. Registering before publishing is what lets a
-    // follower's vote — which can arrive before this node has finished its own
-    // round — be counted at all; published first, every such vote named a block
-    // this node had not submitted, and a validator broadcasts its ACCEPT exactly
-    // once.
-    std::optional<Decided> propose(
-        const std::function<void(std::span<const std::uint8_t>)>& publish, int deadline_ms);
-
-    // A block that arrived from a peer: parse it (which EXECUTES it and derives
-    // this node's own root) and decide it. Same loop, different source of the
-    // block — which is the only difference between proposing and following.
-    std::optional<Decided> follow(std::span<const std::uint8_t> block_bytes, int deadline_ms);
-
-    // Decide a block this caller already has. `advance` is build-then-decide and
-    // `follow` is parse-then-decide; a proposer that must PUBLISH the block
-    // between those two steps needs them apart, so the second half is public.
-    // Whichever way the block was obtained, this is the only path to a
-    // certificate.
-    std::optional<Decided> decide(const std::shared_ptr<Block>&, int deadline_ms);
-
-    VM&       vm() noexcept { return *vm_; }
-    const VM& vm() const noexcept { return *vm_; }
-
+    VM&           vm() noexcept { return *vm_; }
     std::uint64_t height() const { return vm_->last_accepted_height(); }
+    // False while the import gate stands.
+    bool          caught_up() const noexcept { return !gated_; }
+    // The height in progress and this validator's slot in it.
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> slot() const;
+    // Who proposes at (height, slot).
+    Node          proposer(std::uint64_t height, std::uint64_t slot) const { return windower_.expected(height, slot); }
+    std::uint32_t quorum() const { return lux::node::quorum(cfg_.committee); }
+    // The journal cannot write, and only a restart reopens it whole.
+    bool          broken() const noexcept { return journal_.broken(); }
 
-    // MAY THIS NODE PUT ITS SIGNATURE ON A HEIGHT AT ALL.
-    //
-    // False when the chain's tip sits above the highest height this node
-    // decided — the state a chain is left in by reading an export, which moves
-    // the tip and produces no certificate under it. Everything below such a tip
-    // is history this node took on someone else's word, so a vote cast from it
-    // would put this validator's name on an ancestry it never verified, and a
-    // block built on it would extend one. Refusing is the whole point: an
-    // implementation that imports and then proposes is worse than one that
-    // cannot import at all.
-    //
-    // Go reaches the same refusal from the other end — proposervm sees a
-    // missing outer anchor, enters backfill, and gates BuildBlock off until the
-    // outer index is rebuilt from certified peer state (vms/proposervm/vm.go).
-    // Same rule, said where this node produces a signature rather than where it
-    // wraps a block.
-    bool may_sign() const { return vm_->frontier() >= vm_->last_accepted_height(); }
+    // The position this node signs for a block. ONE definition, so a block
+    // proposed and the same block followed produce the same message.
+    lux::consensus::VotePosition position(const Block& b) const;
 
 private:
-    // The signed position for a block. ONE definition, so a block proposed and
-    // the same block followed produce the identical signed message — otherwise a
-    // proposer and its followers would never agree on anything.
-    lux::consensus::VotePosition position(const Block&) const;
+    struct Sibling {
+        Proposal               proposal;
+        std::array<std::uint8_t, 32> frame{};
+        Node                   proposer{};
+        bool                   own = false;
+        std::shared_ptr<Block> block;
+    };
+    struct Instance {
+        std::uint64_t                  height = 0;
+        Id                             tip{};
+        Clock::time_point              began;
+        std::uint64_t                  opened = 0;  // the tip's timestamp, seconds
+        std::map<Id, Sibling>          siblings;    // by id: the first is the lowest
+        std::optional<Clock::time_point> offered, closes;
+        std::map<std::pair<Node, Node>, std::pair<std::uint32_t, Clock::time_point>> junk;
+        std::map<std::array<std::uint8_t, 32>, std::pair<std::optional<Clock::time_point>, Duration>> refused;
+        std::map<Node, Statement>      votes;       // the first verified vote from each validator
+        std::optional<Statement>       bound;       // this validator's own statement here
+        std::optional<Id>              built;
+        std::optional<Clock::time_point> empty, stalled, hurried;
+        bool                           push = false;
+        Clock::time_point              retry;
+        Duration                       backoff{};
+        std::uint32_t                  attempts = 0;
+    };
+    struct Arrival {
+        bool                     vote = false;
+        std::optional<Proposal>  proposal;
+        std::optional<Statement> statement;
+    };
+    // The anchor in progress, while the gate stands.
+    struct Anchor {
+        std::uint64_t              height = 0;
+        Id                         tip{};
+        Message                    message{};
+        std::map<Node, Signature>  sigs;
+        bool                       signed_ = false;
+        bool                       refused = false;  // another statement stands at T
+        Clock::time_point          retry;
+        Duration                   backoff{};
+    };
+    struct Asked {
+        std::uint32_t     left = kAskBurst;
+        Clock::time_point since;
+    };
 
-    // Register the block, then run the rounds until it certifies. `decide` and
-    // `propose` differ only in what happens between those two steps.
-    //
-    // A registered block that does NOT certify is rejected before this returns.
-    // It is the only honest reading: settle is the whole life of a block here,
-    // so a block it gives up on is a block that will never be accepted, and its
-    // transactions belong back in the pool rather than in a block nobody has.
-    std::optional<Decided> settle(const std::shared_ptr<Block>&, int deadline_ms,
-                                  const std::function<void()>& after_submit);
+    Duration settle() const;
+    Duration poll() const { return cfg_.window / 100; }
+    std::uint64_t slot_of(const Instance& at) const;
+    std::uint64_t wall(const Instance& at) const;
+    Node          node_at(std::uint32_t seat) const;
+
+    Instance enter(std::uint64_t height, const Id& tip, Step& out);
+    void     arrive(Instance& at, const Node& link, Arrival a, Step& out);
+    void     later_from(const Node& link, Arrival a);
+    bool     signed_vote(const Statement& s, const Claim& c) const;
+    void     proposed(Instance& at, Proposal p, Step& out);
+    void     refuse(Instance& at, const Node& who, const Node& link, const std::array<std::uint8_t, 32>& frame,
+                    bool unavailable, const std::string& why, Step& out);
+    std::optional<std::optional<Id>> room(const Instance& at, const Node& who, const Id& id) const;
+    void     live(Instance& at, const Id& id, Sibling s);
+    void     stir(Instance& at) const;
+    void     hurry(Instance& at) const;
+    std::size_t named(const Instance& at, const Id& id) const;
+    void     voted(Instance& at, const Statement& s);
+    void     offer(Instance& at, Step& out);
+    void     vote(Instance& at, Step& out);
+    std::optional<std::pair<Id, std::size_t>> leading(const Instance& at) const;
+    bool     decide(Instance& at, Step& out);
+    bool     retry(Instance& at, Step& out);
+    void     behind(std::uint64_t height, bool lost, bool settled, Step& out);
+
+    // Statements and the anchor.
+    void     broadcast(const Statement& s);
+    std::optional<Statement> say(const Message& m, Step& out, std::optional<Clock::time_point>& stalled);
+    void     anchor_begin(Step& out);
+    void     anchor_statement(const Statement& s, const Claim& c, Step& out);
+    void     anchor_step(Step& out);
+    bool     lift(Step& out);
+
+    // Catch-up.
+    void     ask(std::uint64_t from);
+    void     serve(std::uint32_t seat, const std::vector<std::uint8_t>& question);
+    void     answered(std::uint32_t seat, const std::vector<std::uint8_t>& answer, Step& out);
+    bool     accept_certified(const std::shared_ptr<Block>& b, const Certificate& cert, Step& out);
 
     std::unique_ptr<VM> vm_;
-    Node2Host&          host_;
+    Host&               host_;
     std::mutex&         guard_;
-    Binding             binding_;
-    Id                  set_root_;
+    EngineConfig        cfg_;
+    Id                  set_root_{};
+    Windower            windower_;
+    Journal             journal_;
+    Ledger              ledger_;
+    bool                gated_ = false;
+
+    std::optional<Instance> at_;
+    std::optional<Anchor>   anchor_;
+    std::map<Node, std::vector<Arrival>> later_;
+    std::map<Node, std::uint64_t>        heights_;
+    std::map<Node, std::pair<std::uint32_t, Clock::time_point>> checks_;
+    std::size_t                          joined_ = 0;
+    std::optional<Clock::time_point>     asked_;
+    std::map<std::uint32_t, Asked>       askers_;
+
+    // What the mesh handed over since the last pass, by the seat it came in on.
+    std::map<std::uint32_t, std::deque<Proposal>>  proposals_in_;
+    std::map<std::uint32_t, std::deque<Statement>> statements_in_;
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> answers_in_;
 };
 
 }  // namespace lux::node

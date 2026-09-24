@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstring>
 #include <chrono>
 #include <optional>
 #include <set>
@@ -20,6 +21,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>  // TCP_NODELAY
 #include <poll.h>
@@ -79,34 +81,31 @@ std::vector<std::uint8_t> greet_read(int fd) {
     return body;
 }
 
-bool readable(int fd, int wait_ms) {
-    pollfd pf{fd, POLLIN, 0};
-    return ::poll(&pf, 1, wait_ms) > 0 && (pf.revents & POLLIN) != 0;
-}
 
 }  // namespace
 
 Mesh::~Mesh() {
+    // Wake the acceptor out of accept() and wait for it; then close what it
+    // proved and nobody took. Peer fds the transport holds are the transport's.
+    stopping_.store(true);
+    if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);
+    if (acceptor_.joinable()) acceptor_.join();
     if (listen_fd_ >= 0) ::close(listen_fd_);
-    // Peer fds are owned and closed by the transport.
+    for (const auto& [fd, seat] : arrived_) ::close(fd);
 }
 
 std::uint16_t Mesh::listen_bind(const std::string& host, std::uint16_t port) {
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    // Refused before a socket exists: a mesh host that is not an address would
-    // otherwise bind somewhere nobody asked for, or nowhere, and look up.
-    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1)
-        throw std::runtime_error("node: the mesh listens on an IPv4 address, and '" + host +
-                                 "' is not one");
-
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listen_fd_ < 0) throw std::runtime_error("node: socket() failed");
 
     int one = 1;
     ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
 
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1)
+        throw std::runtime_error("node: the mesh binds an IPv4 address, and " + host + " is not one");
     if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0)
         throw std::runtime_error("node: bind() failed on " + host + ":" + std::to_string(port));
 
@@ -118,37 +117,65 @@ std::uint16_t Mesh::listen_bind(const std::string& host, std::uint16_t port) {
     if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
         throw std::runtime_error("node: getsockname() failed");
     bound_port_ = ntohs(addr.sin_port);
+    acceptor_ = std::thread([this] { accepting(); });
     return bound_port_;
 }
 
-int Mesh::accept_one(std::uint32_t& peer_index) {
-    const int fd = ::accept(listen_fd_, nullptr, nullptr);
-    if (fd < 0) return -1;
-    bound_peer_io(fd);  // before the greeting: a silent dialer times out
+void Mesh::accepting() {
+    while (!stopping_.load()) {
+        const int fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (stopping_.load()) return;
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+        bound_peer_io(fd);  // before the greeting: a silent dialer times out
 
-    // Answer the greeting as the responder. What comes back is a name this peer
-    // SIGNED for, on this chain — so the seat below is proven rather than
-    // claimed, and a stranger gets no seat at all because it cannot sign for
-    // one. (The vote gate still verifies every vote; it is no longer the only
-    // thing standing between the port and a seat.)
-    const auto out = pq::run_responder(
-        link_.me, [fd](std::span<const std::uint8_t> b) { greet_write(fd, b); },
-        [fd] { return greet_read(fd); }, link_.chain);
-    if (!out.ok) { ::close(fd); return -1; }
+        // Answer the greeting as the responder. What comes back is a name this
+        // peer SIGNED for, on this chain — so the seat below is proven rather
+        // than claimed, and a stranger gets no seat at all because it cannot
+        // sign for one.
+        const auto out = pq::run_responder(
+            link_.me, [fd](std::span<const std::uint8_t> b) { greet_write(fd, b); },
+            [fd] { return greet_read(fd); }, link_.chain);
+        const auto seat = out.ok && link_.seat ? link_.seat(out.peer_node_id) : std::nullopt;
+        // Proved who it is, and it is nobody here; or a seat above this one,
+        // which is the end of the pair that accepts, not the one that dials.
+        if (!seat || *seat >= index_) {
+            ::close(fd);
+            continue;
+        }
+        const std::lock_guard<std::mutex> lock(arrived_mu_);
+        arrived_.emplace_back(fd, *seat);
+    }
+}
 
-    const auto seat = link_.seat ? link_.seat(out.peer_node_id) : std::nullopt;
-    if (!seat) { ::close(fd); return -1; }  // proved who it is, and it is nobody here
-    peer_index = *seat;
-    return fd;
+void Mesh::take_arrivals() {
+    std::vector<std::pair<int, std::uint32_t>> took;
+    {
+        const std::lock_guard<std::mutex> lock(arrived_mu_);
+        took.swap(arrived_);
+    }
+    // One connection per seat: a later link from a seat replaces the one before
+    // it (the transport's rule), so a retrying dialer ends up holding one link.
+    for (const auto& [fd, seat] : took) tx_.add_peer(fd, seat);
 }
 
 int Mesh::dial_once(const PeerAddr& a, std::uint32_t expect, int wait_ms) {
+    // A name is resolved at every attempt: in a cluster a peer that restarted
+    // can come back at another address under the same name.
+    addrinfo hints{};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* found   = nullptr;
+    if (::getaddrinfo(a.host.c_str(), std::to_string(a.port).c_str(), &hints, &found) != 0 || !found)
+        return -1;
     sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(a.port);
-    if (::inet_pton(AF_INET, a.host.c_str(), &addr.sin_addr) != 1) return -1;
+    std::memcpy(&addr, found->ai_addr, sizeof addr);
+    ::freeaddrinfo(found);
 
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
 
     // Non-blocking connect so a black-holed address costs `wait_ms`, not forever.
@@ -182,47 +209,37 @@ int Mesh::dial_once(const PeerAddr& a, std::uint32_t expect, int wait_ms) {
 }
 
 std::size_t Mesh::connect(const std::map<std::uint32_t, PeerAddr>& peers, int deadline_ms) {
-    // Per-pair direction: lower index dials, higher index accepts. So this node
-    // accepts from every peer with a smaller index and dials every larger one.
-    std::set<std::uint32_t> awaited;   // inbound seats still open
-    std::vector<std::pair<std::uint32_t, PeerAddr>> pending;  // seats still to dial
-    for (const auto& [idx, addr] : peers) {
-        if (idx == index_) continue;
-        if (idx < index_) awaited.insert(idx);
-        else              pending.emplace_back(idx, addr);
-    }
-
-    // ONE deadline for the whole phase. Accepts and dials are swept together each
-    // round, so a low-indexed peer that never shows up delays nothing else, and
-    // the retry policy for a dial lives here — in one place — rather than inside
-    // the dial.
+    // ONE deadline for the whole phase. The acceptor fills the seats below this
+    // one on its own thread; the seats above are dialed here, each attempt
+    // bounded, so a peer that never shows up delays nothing else.
     const Deadline deadline = Clock::now() + std::chrono::milliseconds(deadline_ms);
     for (;;) {
-        while (!awaited.empty() && readable(listen_fd_, 0)) {
-            std::uint32_t proven = 0;
-            const int fd = accept_one(proven);
-            if (fd < 0) continue;  // a link that failed its greeting costs only itself
-            // One connection fills at most the one seat its identity proves. A
-            // second link into a seat already filled — a retrying dialer, or the
-            // same validator twice — is dropped rather than counted as another
-            // peer, which is how the mesh used to believe it was complete while a
-            // validator was still missing.
-            if (awaited.erase(proven) == 0) { ::close(fd); continue; }
-            tx_.add_peer(fd);
+        take_arrivals();
+        const auto held = tx_.members();
+        const auto has  = [&](std::uint32_t s) { return std::find(held.begin(), held.end(), s) != held.end(); };
+        bool complete = true;
+        for (const auto& [idx, addr] : peers) {
+            if (idx == index_ || has(idx)) continue;
+            if (idx < index_) { complete = false; continue; }  // theirs to dial
+            const int fd = dial_once(addr, idx, std::min({ms_until(deadline), kPeerIoTimeoutMs, kDialAttemptMs}));
+            if (fd < 0) { complete = false; continue; }  // not listening yet (or gone) — swept again next round
+            tx_.add_peer(fd, idx);
         }
-        for (std::size_t k = 0; k < pending.size();) {
-            const int fd = dial_once(pending[k].second, pending[k].first,
-                                     std::min({ms_until(deadline), kPeerIoTimeoutMs, kDialAttemptMs}));
-            if (fd < 0) { ++k; continue; }  // not listening yet (or gone) — swept again next round
-            tx_.add_peer(fd);
-            pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(k));
-        }
-        if (awaited.empty() && pending.empty()) break;
+        if (complete) break;
         if (ms_until(deadline) == 0) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-
     return tx_.peer_count();
+}
+
+void Mesh::sweep(const std::map<std::uint32_t, PeerAddr>& peers) {
+    take_arrivals();
+    const auto held = tx_.members();
+    for (const auto& [idx, addr] : peers) {
+        if (idx <= index_ || std::find(held.begin(), held.end(), idx) != held.end()) continue;
+        const int fd = dial_once(addr, idx, kDialAttemptMs);
+        if (fd >= 0) tx_.add_peer(fd, idx);
+    }
 }
 
 }  // namespace lux::node
