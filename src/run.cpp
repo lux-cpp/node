@@ -1,12 +1,13 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// noded — a running Lux node: a C-Chain executed by cevm, decided by BLS
+// run.cpp — a node on one network: its EVM run as a plugin, decided by BLS
 // quorum-certificate consensus over a real TCP mesh, and served over JSON-RPC.
 //
-//   noded --committee <file> --peers <a:p,b:p,...> [--data DIR] [--rpc-port R]
-//         [--deadline-ms D] [--blocks B] [--chain-id C]
-//   noded --data DIR --publish
+//   <daemon> [--network NAME] --committee <file> --peers <a:p,b:p,...>
+//            [--data DIR] [--rpc-port R] [--rpc-host H] [--deadline-ms D]
+//            [--blocks B] [--import-chain-data PATH] [--archive-rpc URL] [--vm PATH]
+//   <daemon> [--network NAME] --data DIR --publish
 //
 // THE VALIDATOR SET IS READ, NOT DERIVED. A committee file names every
 // validator of this network by the ML-DSA-65 public key it published, the BLS
@@ -17,30 +18,24 @@
 // This node finds ITSELF in that file, by name: its seat is where its own
 // identity sits, and the peer list is positional against the same order, so the
 // third address belongs to the third line. The entry at this node's own seat is
-// where it listens. RPC is served on --rpc-port (0 = OS-assigned, printed at
-// startup).
+// where it listens.
 //
-// WHAT ONE HEIGHT IS. One validator PROPOSES — height mod n, so the turn moves
-// and no node is load-bearing — and gossips the block's bytes. Every other
-// validator parses those bytes and runs them through ITS OWN cevm, deriving the
-// state root itself rather than believing the proposer's. Each then signs a
-// VotePosition carrying the root ITS execution produced.
-//
-// A quorum certificate over that position is therefore agreement about an
-// executed RESULT, not about a name. A validator whose EVM diverged computes a
-// different root, signs a different message, and is simply not in the quorum;
-// the height stalls instead of forking. That is why the root is in the signed
-// message and why a follower is handed bytes rather than a header.
+// THE EVM IS A PLUGIN, started the way the Go node starts one and spoken to
+// over the same ZAP protocol (plugin.hpp). The chain's genesis, its history,
+// its state and its JSON-RPC are the plugin's; this node decides its blocks and
+// relays its RPC. One height: the proposer — height mod n — asks the plugin to
+// build and gossips the bytes; every other validator hands those bytes to ITS
+// plugin to parse and verify; the quorum certificate then decides the block
+// and each plugin is told to accept it.
 
 #include "lux/node/committee.hpp"
 #include "lux/node/engine.hpp"
-#include "lux/node/eth.hpp"
-#include "lux/node/evm.hpp"
-#include "lux/node/import.hpp"
 #include "lux/node/network.hpp"
-#include "lux/node/signer.hpp"
 #include "lux/node/node_host.hpp"
+#include "lux/node/plugin.hpp"
 #include "lux/node/rpc.hpp"
+#include "lux/node/signer.hpp"
+#include "lux/node/spec.hpp"
 
 #include <array>
 #include <atomic>
@@ -53,44 +48,18 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
-using namespace lux::node;
+namespace lux::node {
+
 using namespace lux::consensus;
 
 namespace {
-
-// The C-Chain's local EVM chain id. luxfi/genesis calls it LocalChainID and
-// pins it at 31337 ("the Anvil convention"), which is what eth_chainId answers
-// as 0x7a69. Mainnet is 96369 and testnet 96368; this daemon runs a local chain,
-// so it defaults to the local id and takes --chain-id for the others.
-constexpr std::uint64_t kLocalChainId = 31337;
-
-// What web3_clientVersion reports. luxfi/evm answers a bare version string
-// (plugin/evm/version.go), so this does too — with a name, because a client
-// The brand is a value the build supplies, not a match on the program name: a
-// binary that reads its own identity out of argv[0] answers to whatever it was
-// copied to, and a network's name is not a filename. Downstream networks set
-// these; unset, this is Lux.
-#ifndef LUX_NODE_BRAND
-#define LUX_NODE_BRAND "lux-cpp/luxd"
-#endif
-#ifndef LUX_NODE_ENDPOINT
-#define LUX_NODE_ENDPOINT "https://api.lux.network"
-#endif
-// The chain this daemon runs when the command line does not say. A downstream
-// network's daemon IS this daemon with its own number, so the number belongs
-// beside the name rather than in a wrapper that re-implements the node to pass
-// one flag. Unset, this is the local chain.
-#ifndef LUX_NODE_DEFAULT_CHAIN_ID
-#define LUX_NODE_DEFAULT_CHAIN_ID kLocalChainId
-#endif
-
-std::string get_client_version() { return LUX_NODE_BRAND "/v0.1.0"; }
 
 long arg(int argc, char** argv, const char* flag, long dflt) {
     for (int i = 1; i + 1 < argc; ++i)
@@ -153,36 +122,6 @@ std::string hex(std::span<const std::uint8_t> b) {
     return s;
 }
 
-// The genesis allocation. This is the account every local Ethereum toolchain
-// already holds the key for — the first Anvil/Hardhat account, which is the
-// convention the 31337 chain id names. It is a REAL keypair, so a transaction
-// signed with it recovers to this address and moves this balance; nothing here
-// is a placeholder.
-//
-//   secret 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-//   address 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
-evm::Genesis local_genesis(std::uint64_t chain_id) {
-    evm::Genesis g;
-    g.chain_id  = chain_id;
-    g.gas_limit = 30'000'000;
-
-    const std::array<std::uint8_t, 20> dev{0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88,
-                                           0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72,
-                                           0x79, 0xcf, 0xff, 0xb9, 0x22, 0x66};
-    evm::Word balance{};                 // 10_000 ether
-    balance[23] = 0x02; balance[24] = 0x1e; balance[25] = 0x19;
-    balance[26] = 0xe0; balance[27] = 0xc9; balance[28] = 0xba; balance[29] = 0xb2;
-    balance[30] = 0x40; balance[31] = 0x00;
-    g.alloc.emplace_back(dev, balance);
-
-    // LUX_MNEMONIC treasury: 0x9011E888251AB053B7bD1cdB598Db4f9DEd94714
-    const std::array<std::uint8_t, 20> treasury{0x90, 0x11, 0xe8, 0x88, 0x25, 0x1a, 0xb0, 0x53,
-                                                0xb7, 0xbd, 0x1c, 0xdb, 0x59, 0x8d, 0xb4, 0xf9,
-                                                0xde, 0xd9, 0x47, 0x14};
-    g.alloc.emplace_back(treasury, balance);
-    return g;
-}
-
 // A daemon stops when it is asked to, and finishes the height it is in. The
 // handler does nothing but set this — everything that must be torn down is torn
 // down on the way out of main, on the main thread.
@@ -191,10 +130,51 @@ void on_signal(int) { g_stop.store(true); }
 
 }  // namespace
 
-int main(int argc, char** argv) {
-    const char* prog = (argc > 0 && argv[0]) ? argv[0] : "luxd";
+int run(std::span<const Spec> specs, int argc, char** argv) {
+    const char* prog = (argc > 0 && argv[0]) ? argv[0] : "node";
     if (const char* slash = std::strrchr(prog, '/')) prog = slash + 1;
-    const std::string client_version = get_client_version();
+
+    // The network, by name. None named is the first spec; a name no spec has is
+    // refused rather than rounded to one, because a node that fell back to a
+    // network on a typo would join the wrong one and look like it had started.
+    if (specs.empty()) {
+        std::fprintf(stderr, "%s: no network to run\n", prog);
+        return 2;
+    }
+    const std::string wanted = arg_str(argc, argv, "--network", specs.front().name);
+    const Spec*       spec   = nullptr;
+    for (const auto& s : specs)
+        if (s.name == wanted) spec = &s;
+    if (spec == nullptr) {
+        std::string names;
+        for (const auto& s : specs) names += (names.empty() ? "" : ", ") + s.name;
+        std::fprintf(stderr, "%s: no network %s; this daemon runs %s\n", prog, wanted.c_str(),
+                     names.c_str());
+        return 2;
+    }
+    const std::string& client_version = spec->client;
+
+    // A spec's genesis names its own chain. One that named another would start
+    // a node that signs for one chain and executes a different one, so the two
+    // numbers are held to each other before anything is started.
+    try {
+        auto doc = nlohmann::json::parse(spec->genesis);
+        if (doc.contains("cChainGenesis")) {
+            const auto inner = doc["cChainGenesis"];
+            doc = inner.is_string() ? nlohmann::json::parse(inner.get<std::string>()) : inner;
+        }
+        const auto named = doc.at("config").at("chainId").get<std::uint64_t>();
+        if (named != spec->chain) {
+            std::fprintf(stderr, "%s: the %s genesis is chain %llu, and %s is chain %llu\n", prog,
+                         spec->name.c_str(), static_cast<unsigned long long>(named),
+                         spec->name.c_str(), static_cast<unsigned long long>(spec->chain));
+            return 2;
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s: the %s genesis is not a genesis document: %s\n", prog,
+                     spec->name.c_str(), e.what());
+        return 2;
+    }
 
     // The keys first: everything else is named by them. A validator that has
     // none makes them here, once, and keeps them.
@@ -202,20 +182,20 @@ int main(int argc, char** argv) {
     // behind: making a validator identity is a thing to do on purpose.
     const bool        publish        = has_flag(argc, argv, "--publish");
     const std::string data           = arg_str(argc, argv, "--data", ".lux");
-    const auto        eth            = std::uint64_t(arg(argc, argv, "--chain-id", long(LUX_NODE_DEFAULT_CHAIN_ID)));
+    const auto        eth            = spec->chain;
     const std::string committee_path = arg_str(argc, argv, "--committee", "");
     const std::string peer_list      = arg_str(argc, argv, "--peers", "");
     if (!publish && (committee_path.empty() || peer_list.empty())) {
         std::fprintf(stderr,
-                     "usage: %s --committee FILE --peers a:p,b:p,... [--data DIR] [--rpc-port R] [--rpc-host H]\n"
-                     "             [--deadline-ms D] [--blocks B] [--chain-id C] [--archive-rpc URL]\n"
-                     "             [--import-chain-data PATH]\n"
-                     "       %s --data DIR --publish [--chain-id C]\n"
+                     "usage: %s [--network NAME] --committee FILE --peers a:p,b:p,... [--data DIR]\n"
+                     "             [--rpc-port R] [--rpc-host H] [--deadline-ms D] [--blocks B]\n"
+                     "             [--archive-rpc URL] [--import-chain-data PATH] [--vm PATH]\n"
+                     "       %s [--network NAME] --data DIR --publish\n"
                      "\n"
                      "--committee names the validators of this network, one published line each;\n"
                      "--publish makes a line for it. --peers gives every validator's mesh address\n"
                      "in committee order, and the entry at this node's own seat is where it listens.\n"
-                     "A validator is named for a chain, so --chain-id decides who the file names.\n",
+                     "A validator is named for a chain, so --network decides who the file names.\n",
                      prog, prog);
         return 2;
     }
@@ -225,7 +205,7 @@ int main(int argc, char** argv) {
     // signed over, so a line published for another network authorises nothing
     // here. Needed before the file is read, and it is the same 32 bytes every
     // vote carries.
-    const Id chain_id = evm::chain_id(eth);
+    const Id chain_id = lux::node::chain_id(eth);
 
     // The chains this node answers for are its network's to name, and the chain
     // id names the network (network.hpp). A Zoo node is `zoo`, never `c`.
@@ -348,60 +328,54 @@ int main(int argc, char** argv) {
 
     // consensus throws at its boundary on a set/wave combination that cannot
     // reach a decision. A daemon says so and exits; it does not abort.
-    std::unique_ptr<Node2Host> hostp;
-    std::unique_ptr<evm::Chain> chainp;
+    // THE CHAIN, in its own process. What it is told is what Go tells it: the
+    // network, its id, the validator running it, its genesis, and a config that
+    // carries --import-chain-data through, so the plugin reads the export before
+    // it serves anything — Go's flag, Go's moment, Go's idempotence.
+    plugin::Start with;
+    with.network = spec->network;
+    with.chain   = chain_id;
+    with.node    = me.node();
+    with.genesis.assign(spec->genesis.begin(), spec->genesis.end());
+    const std::string config =
+        import_path.empty() ? std::string("{}")
+                            : nlohmann::json{{"import-chain-data", import_path}}.dump();
+    with.config.assign(config.begin(), config.end());
+    with.data_dir = data + "/chains/" + self;
+    with.alias    = self;
+
+    // Where the plugin is: the spec says where the image puts it, and --vm is
+    // for a node run anywhere else.
+    const std::string vm = arg_str(argc, argv, "--vm", spec->vm);
+
+    std::unique_ptr<Node2Host>     hostp;
+    std::unique_ptr<plugin::Chain> chainp;
+    std::vector<plugin::Handler>   handlers;
     try {
         hostp  = std::make_unique<Node2Host>(std::move(cfg));
-        chainp = std::make_unique<evm::Chain>(local_genesis(eth));
+        chainp = plugin::Chain::start(vm, with);
+        chainp->enter(plugin::Phase::Bootstrapping);
+        chainp->enter(plugin::Phase::Ready);
+        handlers = chainp->handlers();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "node %ld: cannot start — %s\n", index, e.what());
         return 2;
     }
-    Node2Host&  host  = *hostp;
-    evm::Chain& chain = *chainp;
+    Node2Host&     host  = *hostp;
+    plugin::Chain& chain = *chainp;
 
     const std::uint16_t port = host.listen_bind();
     std::printf("node %ld: chain %s — the network its validators are entitled on\n", index,
                 hex(chain_id).c_str());
     std::printf("node %ld: validator %s, seat %ld of %ld in %s\n", index,
                 hex(me.node()).c_str(), index, n, committee_path.c_str());
-    std::printf("node %ld: consensus 127.0.0.1:%u  chain %s (eth chainId %llu)\n",
-                index, port, self.c_str(), static_cast<unsigned long long>(chain.eth_chain_id()));
-    std::printf("node %ld: genesis state root %s\n", index, hex(chain.state_root()).c_str());
+    std::printf("node %ld: consensus 127.0.0.1:%u  chain %s (eth chainId %llu, network %u)\n",
+                index, port, self.c_str(), static_cast<unsigned long long>(eth), spec->network);
+    std::printf("node %ld: vm %s %s, tip %s at height %llu\n", index, vm.c_str(),
+                chain.version().c_str(), hex(chain.last_accepted()).c_str(),
+                static_cast<unsigned long long>(chain.last_accepted_height()));
     std::printf("node %ld: validator set root %s\n", index, hex(set_root).c_str());
     std::fflush(stdout);
-
-    // ── the export, read before anything else looks at the chain ────────────
-    if (!import_path.empty()) {
-        try {
-            // The flag door's checkpoint: say where the read has got to, every
-            // 4096 blocks. A mainnet export is a million blocks and takes
-            // minutes, and an operator watching a silent process cannot tell a
-            // slow read from a wedged one.
-            const auto mark = [index](const Id& tip, std::uint64_t height) {
-                std::printf("node %ld: import at height %llu, tip %s\n", index,
-                            static_cast<unsigned long long>(height), hex(tip).c_str());
-                std::fflush(stdout);
-            };
-            const Import in = import_chain_data(chain, import_path, mark);
-            std::printf("node %ld: import %s\n", index, import_path.c_str());
-            std::printf("node %ld: import genesis %s\n", index, hex(in.genesis).c_str());
-            std::printf("node %ld: import tip %s height %llu time %llu\n", index,
-                        hex(in.tip).c_str(), static_cast<unsigned long long>(in.height),
-                        static_cast<unsigned long long>(in.timestamp));
-            std::printf("node %ld: import state root %s (carried from the header — an export "
-                        "holds blocks, not state)\n", index, hex(in.root).c_str());
-            std::printf("node %ld: import %llu blocks ingested, %llu already held, %llu "
-                        "transactions recovered\n", index,
-                        static_cast<unsigned long long>(in.blocks),
-                        static_cast<unsigned long long>(in.skipped),
-                        static_cast<unsigned long long>(in.txs));
-            std::fflush(stdout);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "node %ld: import failed — %s\n", index, e.what());
-            return 2;
-        }
-    }
 
     // ── the RPC, up before consensus ────────────────────────────────────────
     // It must answer while the mesh is still forming, so that "is it listening"
@@ -417,12 +391,13 @@ int main(int argc, char** argv) {
     if (!archive_rpc.empty()) {
         rpc.set_archive_rpc(archive_rpc);
     }
-    serve_eth(rpc, chain, client_version);
-    // The second door onto the reader the flag above already used. Two ways in,
-    // one implementation — a node that grew a separate reader per entry point
-    // would have two answers to what a block is, inside one binary.
-    serve_admin(rpc, chain);
-    const std::string public_api = LUX_NODE_ENDPOINT;
+    // The chain's JSON-RPC is its plugin's, relayed under every alias the chain
+    // answers to. The plugin names the prefix it serves it under.
+    rpc.network(net);
+    for (const auto& h : handlers)
+        if (h.prefix == "/rpc")
+            for (const auto& alias : net.served) rpc.relay(alias, h.addr, h.prefix);
+    const std::string& public_api = spec->endpoint;
     rpc.about(Rpc::Json{
         {"client", client_version},
         {"mode", "light"},
@@ -448,14 +423,6 @@ int main(int argc, char** argv) {
     std::map<std::uint32_t, PeerAddr> peers;
     for (std::size_t j = 0; j < addresses.size(); ++j)
         if (long(j) != index) peers[std::uint32_t(j)] = addresses[j];
-
-    // A transaction from a peer goes through the SAME door as one from an RPC
-    // caller: decoded, its sender recovered, or refused. A peer is trusted with
-    // bytes and nothing else.
-    host.on(kTxMsgType, [&](const std::vector<std::uint8_t>& raw) {
-        const std::lock_guard<std::mutex> lock(rpc.guard());
-        (void)chain.accept_tx_from_peer(raw);
-    });
 
     // Proposed blocks arrive here and wait to be executed. Only the bytes are
     // kept — parsing is execution, and it happens on the driver's thread where
@@ -490,10 +457,10 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(two_thirds_stake_floor(total_stake)));
     std::fflush(stdout);
 
-    // Executed: this is a C++-only cluster, so the vote binds the root this
-    // node's EVM produced and a divergent EVM stalls the height instead of
-    // hiding. Joining luxd takes Binding::Transport — see engine.hpp.
-    Engine engine(std::move(chainp), host, rpc.guard(), Binding::Executed, set_root);
+    // Transport, as luxd votes: a plugin's block does not hand its host the
+    // root it executed to, so the vote binds the block and the plugin's own
+    // verify is what refuses a block that does not execute.
+    Engine engine(std::move(chainp), host, rpc.guard(), Binding::Transport, set_root);
 
     // Pump the mesh for `ms`, so gossip lands and inbound blocks arrive. The one
     // place this daemon waits.
@@ -540,13 +507,6 @@ int main(int argc, char** argv) {
         const std::uint64_t height   = engine.height() + 1;
         const bool          proposer = (height % std::uint64_t(n)) == std::uint64_t(index);
 
-        // Hand this node's pending transactions to its peers, so a transaction
-        // submitted here is mined by whoever leads next. Gossip is idempotent: a
-        // transaction a peer already holds is recognised by its hash and dropped.
-        {
-            const std::lock_guard<std::mutex> lock(rpc.guard());
-            for (const auto& raw : chain.pending_raw()) host.gossip(kTxMsgType, raw);
-        }
         settle(blocks == 0 ? 1000 : 60);
         // Asked to stop while waiting: leave BEFORE proposing. Entering a height
         // here would run its full deadline against peers that are also leaving
@@ -595,18 +555,11 @@ int main(int argc, char** argv) {
             settle(500);
             continue;
         }
-        std::size_t ntx = 0;
-        {
-            const std::lock_guard<std::mutex> lock(rpc.guard());
-            ntx = chain.block_txs(d->block->id()).size();
-        }
-        std::printf("node %ld: block %llu %s %s  root %s  txs %zu  voters %zu  stake %llu\n",
+        std::printf("node %ld: block %llu %s %s  voters %zu  stake %llu\n",
                     index,
                     static_cast<unsigned long long>(d->block->height()),
                     proposer ? "led " : "flwd",
                     hex(d->block->id()).c_str(),
-                    hex(d->block->root()).c_str(),
-                    ntx,
                     d->cert.voters.size(),
                     static_cast<unsigned long long>(d->cert.voted_stake));
         std::fflush(stdout);
@@ -618,3 +571,5 @@ int main(int argc, char** argv) {
     rpc.stop();
     return rc;
 }
+
+}  // namespace lux::node

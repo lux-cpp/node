@@ -163,7 +163,7 @@ add_subdirectory("${CONSENSUS_DIR}" consensus-build)
 
 # ── Reuse cevm's build the same way. EXCLUDE_FROM_ALL because node links four of
 #    its libraries and does not want its 40-odd test and benchmark binaries; they
-#    stay buildable by name. Static, because noded is one process: cevm defaults
+#    stay buildable by name. Static, because luxd is one process: cevm defaults
 #    to a shared library so it can be loaded as an EVMC plugin, which is not how
 #    it is used here.
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -194,11 +194,9 @@ add_library(node STATIC
     src/mesh.cpp          # the socket dance
     src/node_host.cpp     # one Party driven over that mesh
     src/engine.cpp        # execute → decide → accept, for any VM
-    src/evm.cpp           # the C-Chain, executed by cevm
-    src/import.cpp        # the C-chain's external format, read back
     src/network.cpp       # which chain aliases this node's network owns
-    src/rpc.cpp           # HTTP JSON-RPC
-    src/eth.cpp           # the eth methods, mounted on an Rpc
+    src/rpc.cpp           # HTTP JSON-RPC, and the relay to a chain's own server
+    src/run.cpp           # a node on one network's spec
     src/validators.cpp    # the set-root commitment a vote binds
     src/committee.cpp     # the network description all three daemons read
     src/plugin.cpp        # a chain in another process, over ZAP
@@ -232,15 +230,10 @@ find_package(nlohmann_json CONFIG REQUIRED)
 target_link_libraries(node PUBLIC evm-state evm lux::crypto-secp256k1 lux::crypto-sha256 nlohmann_json::nlohmann_json)
 target_compile_options(node PRIVATE -Wall -Wextra -Wpedantic)
 
-# ── luxd — the standalone daemon process (C++ version)
-add_executable(luxd src/noded.cpp)
+# ── luxd — this node on a local Lux chain
+add_executable(luxd src/luxd.cpp)
 target_link_libraries(luxd PRIVATE node)
 target_compile_options(luxd PRIVATE -Wall -Wextra)
-
-# ── noded — backwards-compatible alias
-add_executable(noded src/noded.cpp)
-target_link_libraries(noded PRIVATE node)
-target_compile_options(noded PRIVATE -Wall -Wextra)
 
 # ── lux-join — a validator on a REAL, external luxd network (not this node's
 #   own self-referential mesh): PQ-gated TLS, the p2p Handshake, and a signed
@@ -263,18 +256,17 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #                   and the possession proof that is checked rather than trusted
 #   chain_route     every spelling of a chain's path reaches that one chain
 #   archive_proxy   what a relayed answer's status is, when this node is a proxy
-#   block_reject    a block that is not accepted gives its transactions back
-#   import          the canonical RLP export, walked block by block, and the
-#                   refusal that follows a tip nobody here decided
 #   pq_handshake    the strict-PQ peer handshake: Go's own answers to the three
 #                   derivations, then a full exchange over a real socket pair
 #   pq_vector       the validator link held to a handshake the GO node produced:
 #                   its frames, its names, its session key (LP-10602)
-#   plugin          a REAL Go VM plugin, started the way the Go node starts one
+#   run             what a node refuses before it starts: a spec whose genesis
+#                   names another chain, a network no spec has
+#   plugin          cevm's EVM plugin, started the way the Go node starts one
 #                   and driven through a height over ZAP
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root committee chain_route archive_proxy block_reject import pq_handshake pq_vector plugin)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root committee chain_route archive_proxy pq_handshake pq_vector run)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
@@ -284,6 +276,15 @@ foreach(_t ${NODE_TESTS})
     # not compile; the label is what says which tests are this repository's.
     set_tests_properties(${_t} PROPERTIES LABELS node)
 endforeach()
+
+# The plugin test drives THIS build's EVM plugin — cevm's, the one the node runs
+# its chain in — the way the node does, so it is built with the test.
+add_executable(plugin_test test/plugin_test.cpp)
+target_link_libraries(plugin_test PRIVATE node)
+target_compile_options(plugin_test PRIVATE -Wall -Wextra)
+add_dependencies(plugin_test cevm-bin)
+add_test(NAME plugin COMMAND plugin_test $<TARGET_FILE:cevm-bin>)
+set_tests_properties(plugin PROPERTIES LABELS node)
 
 # The committee test reads REAL FILES — the same files the Rust node reads, so
 # "both accept this" is a fact about one artifact rather than about two string
@@ -300,7 +301,7 @@ target_compile_definitions(pq_vector_test PRIVATE
 # its own; blst/bls stay clean). One place for the whole node surface.
 if (NODE_SANITIZE)
     set(_n2_san -fsanitize=${NODE_SANITIZE} -fno-omit-frame-pointer)
-    set(_n2_targets node noded)
+    set(_n2_targets node luxd)
     foreach(_t ${NODE_TESTS})
         list(APPEND _n2_targets ${_t}_test)
     endforeach()

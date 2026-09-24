@@ -3,7 +3,10 @@
 
 #include "lux/node/network.hpp"
 
+#include <test/state/hash_utils.hpp>  // cevm::keccak256
+
 #include <algorithm>
+#include <cstring>
 #include <string_view>
 
 namespace lux::node {
@@ -57,6 +60,16 @@ Network network_of(std::uint64_t chain_id) {
     // own number and under nothing else. Falling through to Lux here would hand
     // an unknown chain the C-Chain's name — the bug this table exists to remove.
     return Network{{}, {self}, {self}};
+}
+
+Id chain_id(std::uint64_t eth) {
+    std::vector<std::uint8_t> tag{'l', 'u', 'x', '-', 'e', 'v', 'm', ':'};
+    for (int i = 7; i >= 0; --i)
+        tag.push_back(static_cast<std::uint8_t>((eth >> (i * 8)) & 0xff));
+    const auto h = cevm::keccak256({tag.data(), tag.size()});
+    Id out{};
+    std::memcpy(out.data(), h.bytes, 32);
+    return out;
 }
 
 }  // namespace lux::node

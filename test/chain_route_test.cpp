@@ -89,7 +89,7 @@ Reply call(std::uint16_t port, const char* verb, const std::string& path, const 
 
 const char* kChainId = R"({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]})";
 
-// A node on one network, wired the way serve_eth wires a real one: the method
+// A node on one network, wired the way a chain's own server is: the method
 // table registered under every alias its own chain answers to, and the network
 // itself handed to the Rpc. Nothing here enumerates paths — the aliases come
 // from the chain id, which is the thing under test.
@@ -120,6 +120,19 @@ struct Node {
         return r.status == 200 && r.body.find("\"" + answer + "\"") != std::string::npos;
     }
 };
+
+// Every spelling of one alias on a node at `port` that relays it, answered by
+// the chain's own server `far`.
+void every_spelling_of(std::uint16_t port, const Node& far, const std::string& alias) {
+    std::string upper = alias;
+    for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    for (const char* middle : {"chain", "bc"})
+        for (const std::string& word : {alias, upper})
+            for (const char* tail : {"", "/rpc"}) {
+                const std::string path = "/v1/" + std::string(middle) + "/" + word + tail;
+                check(far.served(call(port, "POST", path, kChainId)), "POST " + path + " (relayed)");
+            }
+}
 
 // Every spelling of one alias: both middle words, both cases, `/rpc` present and
 // absent. A node either answers all of them or none of them.
@@ -286,6 +299,36 @@ int main() {
             refused = true;
         }
         check(refused, "a host that is not an IPv4 address is refused");
+    }
+
+    // ── a chain kept in another process ─────────────────────────────────────
+    {
+        // What run() does with an EVM plugin: the chain's calls go to the
+        // plugin's own server and come back as it answered them. `far` stands in
+        // for that server; `near` is the node that relays to it.
+        Node          far(200200);
+        const Network zoo = network_of(200200);
+        Rpc           near{0};
+        for (const auto& alias : zoo.served)
+            near.relay(alias, "127.0.0.1:" + std::to_string(far.port()), "/");
+        near.network(zoo);
+        near.about(Rpc::Json{{"client", "lux-cpp/test"}});
+        near.start();
+        std::printf("zoo node relaying to its chain's server (port %u -> %u)\n", near.port(),
+                    far.port());
+        every_spelling_of(near.port(), far, "zoo");
+        every_spelling_of(near.port(), far, "200200");
+        check(call(near.port(), "POST", "/v1/chain/c/rpc", kChainId).status == 404,
+              "a relayed chain does not make c a Zoo chain");
+
+        // A server that is not there is a gateway failure, said as one — not a
+        // 200 carrying an error a client has to parse to learn the chain is down.
+        Rpc gone{0};
+        gone.relay("zoo", "127.0.0.1:1", "/");
+        gone.network(zoo);
+        gone.start();
+        check(call(gone.port(), "POST", "/v1/chain/zoo/rpc", kChainId).status == 502,
+              "a chain whose server does not answer is a 502");
     }
 
     std::printf("%s\n", g_fail == 0 ? "PASS" : "FAIL");

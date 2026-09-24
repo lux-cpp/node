@@ -23,7 +23,7 @@
 
 #include "lux/node/committee.hpp"
 
-#include "lux/node/evm.hpp"  // chain_id — the network the names are bound to
+#include "lux/node/network.hpp"  // chain_id — the network the names are bound to
 
 #include <cstdio>
 #include <fstream>
@@ -55,7 +55,7 @@ std::string hex(const Id& id) { return hex(std::span<const std::uint8_t>(id.data
 std::string hex(const Node& n) { return hex(std::span<const std::uint8_t>(n.data(), n.size())); }
 
 // The chain those four are ENTITLED on: the local C-Chain, whose 32-byte id is
-// `evm::chain_id(31337)`. It is not in any name above — it is in every proof.
+// `chain_id(31337)`. It is not in any name above — it is in every proof.
 const std::array<std::uint8_t, 32> kChain = [] {
     std::array<std::uint8_t, 32> c{};
     const char*                  hex = "c066f0c6c80088c742bf27c7e3f8d5ad18a903a4162ba17dba4168e1c51ede87";
@@ -139,7 +139,7 @@ int main() {
 
     // ── the name is not scoped; the proof is ────────────────────────────────
     {
-        check(kChain == lux::node::evm::chain_id(31337),
+        check(kChain == lux::node::chain_id(31337),
               "the fixture chain is the local C-Chain's own id, not a constant");
 
         // THE SAME FILE, read as a committee of another network. The four names

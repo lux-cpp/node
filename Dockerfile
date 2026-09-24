@@ -7,7 +7,7 @@
 #              ML-KEM-768 of the post-quantum peer handshake, as a Go c-archive
 #   deps       AWS-LC, cevm's Conan dependencies, the consensus engine and cevm
 #   test       every test target, run by ctest (`--target test`)
-#   builder    luxd, noded and lux-join
+#   binaries   luxd, lux-join, and cevm — the EVM plugin luxd runs its chain in
 #   runtime    gcr.io/distroless/cc-debian12:nonroot and the binaries
 #
 # What is not pinned by commit resolves when the image is built: Debian's
@@ -275,16 +275,18 @@ RUN cmake --build /src/build && \
 # ── binaries ────────────────────────────────────────────────────────────────
 # Then two checks before anything ships: the binaries need no library the
 # runtime lacks (a Conan .so, or a system libssl in place of AWS-LC, would pass
-# here and fail on first exec there), and noded runs. --publish on a throwaway
+# here and fail on first exec there), and luxd runs. --publish on a throwaway
 # directory makes an ML-DSA-65 identity through libluxcrypto's Go runtime and a
 # BLS key, and prints the committee line the BLS key signs.
 FROM builder AS binaries
 RUN <<'EOF'
 set -eu
-cmake --build /src/build --target luxd noded lux-join
-mkdir -p /out
-for b in luxd noded lux-join; do
-  strip -o "/out/$b" "/src/build/$b"
+cmake --build /src/build --target luxd lux-join cevm-bin
+mkdir -p /out/bin /out/libexec/lux
+strip -o /out/bin/luxd /src/build/luxd
+strip -o /out/bin/lux-join /src/build/lux-join
+strip -o /out/libexec/lux/cevm "$(find /src/build -type f -name cevm -perm -u+x | head -n1)"
+for b in bin/luxd bin/lux-join libexec/lux/cevm; do
   needs=$(readelf -d "/out/$b" | sed -n 's/.*(NEEDED).*\[\(.*\)\]$/\1/p')
   test -n "$needs"
   extra=$(printf '%s\n' "$needs" | grep -Evx 'lib(c|m|pthread|dl|rt|resolv|gcc_s|stdc\+\+|gomp)\.so\.[0-9]+|ld-linux-(x86-64|aarch64)\.so\.[0-9]+' || true)
@@ -294,7 +296,7 @@ for b in luxd noded lux-join; do
   fi
 done
 k=$(mktemp -d)
-/out/noded --data "$k" --publish > "$k.line"
+/out/bin/luxd --data "$k" --publish > "$k.line"
 test -s "$k.line"
 rm -rf "$k" "$k.line"
 EOF
@@ -304,7 +306,7 @@ EOF
 # package manager or fetcher: an image that holds a validator's key holds
 # nothing that can be told to fetch and run.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
-COPY --from=binaries /out/ /usr/local/bin/
+COPY --from=binaries /out/ /usr/local/
 # RPC, and the base port the vote mesh listens on.
 EXPOSE 9730 9731
 USER nonroot

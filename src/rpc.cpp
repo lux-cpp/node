@@ -318,6 +318,11 @@ std::string lower(std::string s) {
 void Rpc::method(std::string alias, std::string name, Method fn) {
     methods_[lower(std::move(alias))][std::move(name)] = std::move(fn);
 }
+
+void Rpc::relay(std::string alias, std::string addr, std::string path) {
+    relays_[lower(std::move(alias))] = {std::move(addr), std::move(path)};
+}
+
 void Rpc::network(Network n) {
     // Folded on the way in, once, so the whole server below compares lowercase
     // against lowercase — the same rule method() applies to a registration.
@@ -446,7 +451,7 @@ void Rpc::answer(int fd) {
                 }}
             };
             write_all(fd, response(200, "OK", h.dump()));
-        } else if (chain.health && methods_.count(chain.alias) != 0) {
+        } else if (chain.health && (methods_.count(chain.alias) != 0 || relays_.count(chain.alias) != 0)) {
             Json h = {
                 {"chain", chain.alias},
                 {"healthy", true},
@@ -472,7 +477,8 @@ void Rpc::answer(int fd) {
     // node owns `c`; a Zoo node asked for it does not have one to give.
     // A chain this node KEEPS is always answerable: its methods are registered
     // here, whoever registered them. Ownership limits only what may be RELAYED.
-    const bool kept = methods_.find(alias) != methods_.end();
+    const auto relayed = relays_.find(alias);
+    const bool kept    = methods_.find(alias) != methods_.end() || relayed != relays_.end();
     if (alias.empty() || chain.health || (!kept && !net_.owns(alias))) {
         write_all(fd, response(404, "Not Found",
                                R"({"jsonrpc":"2.0","id":null,)"
@@ -502,6 +508,22 @@ void Rpc::answer(int fd) {
         write_all(fd, response(200, "OK",
                                R"({"jsonrpc":"2.0","id":null,)"
                                R"("error":{"code":-32000,"message":"light node: this chain is not kept here; configure --archive-rpc to proxy it from a full archive node"}})"));
+        return;
+    }
+
+    // A chain kept in another process answers for itself. Its status is its own:
+    // a relay that rewrapped every answer as 200 would tell a client a chain is
+    // there when its server said otherwise.
+    if (relayed != relays_.end()) {
+        const Proxied proxied =
+            proxy_to_archive("http://" + relayed->second.first, relayed->second.second, body);
+        if (proxied.empty()) {
+            write_all(fd, response(502, "Bad Gateway",
+                                   R"({"jsonrpc":"2.0","id":null,)"
+                                   R"("error":{"code":-32000,"message":"the chain's own server did not answer"}})"));
+            return;
+        }
+        write_all(fd, response(proxied.status, reason_for(proxied.status), proxied.body));
         return;
     }
 

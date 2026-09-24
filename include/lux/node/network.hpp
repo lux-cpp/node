@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "lux/node/vm.hpp"  // Id
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -44,5 +46,11 @@ struct Network {
 
 // The network a chain id belongs to.
 Network network_of(std::uint64_t chain_id);
+
+// The 32-byte consensus id of the chain whose EVM chain id is `eth`: keccak of
+// "lux-evm:" and the id as 8 big-endian bytes. A committee line is signed over
+// it and every vote carries it, so a chain cannot be configured with an EVM id
+// of 31337 and a consensus id belonging to some other chain.
+[[nodiscard]] Id chain_id(std::uint64_t eth);
 
 }  // namespace lux::node

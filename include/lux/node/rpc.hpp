@@ -75,6 +75,12 @@ public:
     // spelling of the path that names it — see chain_path() in rpc.cpp.
     void method(std::string alias, std::string name, Method fn);
 
+    // Serve the chain `alias` from another process: its JSON-RPC is answered by
+    // the HTTP server at `addr` (host:port) under `path`, which is what a VM
+    // plugin reports it listens on (plugin::Handler). The request goes through
+    // as it came and the answer comes back with its own status.
+    void relay(std::string alias, std::string addr, std::string path);
+
     // The network this node belongs to. Its aliases are the ONLY ones this
     // server answers for, and a path naming any other chain is refused before an
     // archive is consulted. Its canonical alias is also what `POST /` reaches,
@@ -109,6 +115,7 @@ private:
     std::map<std::string, std::map<std::string, Method>> methods_;
     Network                                         net_;
     std::string                                     archive_rpc_;
+    std::map<std::string, std::pair<std::string, std::string>> relays_;  // alias → (addr, path)
     Json                                            about_;
     std::mutex                                      mu_;
     std::thread                                     accepting_;

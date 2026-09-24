@@ -75,7 +75,7 @@ std::optional<Decided> Engine::settle(const std::shared_ptr<Block>& blk, int dea
     // accept is this node giving up on it. Giving up silently is what left the
     // chain disagreeing with its peers about what was still pending: the
     // daemon's height loop simply retries a height it could not certify
-    // (noded.cpp: "timeout — retrying"), and the abandoned block took the
+    // (run.cpp: "timeout — retrying"), and the abandoned block took the
     // transactions with it — the C-Chain's build() swaps the whole mempool into
     // the block, so a height that timed out emptied the pool and the next one
     // was built from nothing. So say it: the block was decided against.
