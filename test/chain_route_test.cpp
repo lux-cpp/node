@@ -25,6 +25,8 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <thread>
+#include <chrono>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -320,6 +322,45 @@ int main() {
         every_spelling_of(near.port(), far, "200200");
         check(call(near.port(), "POST", "/v1/chain/c/rpc", kChainId).status == 404,
               "a relayed chain does not make c a Zoo chain");
+
+        // A server that keeps its connection open after answering — a VM plugin's
+        // does — is answered as soon as its Content-Length is in, not when the
+        // relay's receive timeout gives up on it.
+        {
+            const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in la{};
+            la.sin_family      = AF_INET;
+            la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            ::bind(lfd, reinterpret_cast<sockaddr*>(&la), sizeof(la));
+            ::listen(lfd, 1);
+            socklen_t ll = sizeof(la);
+            ::getsockname(lfd, reinterpret_cast<sockaddr*>(&la), &ll);
+            std::thread held([lfd] {
+                const int c = ::accept(lfd, nullptr, nullptr);
+                char      buf[4096];
+                (void)::recv(c, buf, sizeof(buf), 0);
+                const std::string body = R"({"jsonrpc":"2.0","id":1,"result":"0x30e08"})";
+                const std::string out  = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                         "Content-Length: " + std::to_string(body.size()) +
+                                         "\r\n\r\n" + body;
+                (void)::send(c, out.data(), out.size(), 0);
+                std::this_thread::sleep_for(std::chrono::seconds(6));  // and does not hang up
+                ::close(c);
+            });
+            Rpc kept{0};
+            kept.relay("zoo", "127.0.0.1:" + std::to_string(ntohs(la.sin_port)), "/");
+            kept.network(zoo);
+            kept.start();
+            const auto  t0 = std::chrono::steady_clock::now();
+            const Reply r  = call(kept.port(), "POST", "/v1/chain/zoo/rpc", kChainId);
+            const auto  ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - t0).count();
+            check(r.status == 200 && r.body.find("0x30e08") != std::string::npos,
+                  "a server that keeps its connection open is relayed");
+            check(ms < 1000, "as soon as its answer is in (" + std::to_string(ms) + " ms)");
+            held.join();
+            ::close(lfd);
+        }
 
         // A server that is not there is a gateway failure, said as one — not a
         // 200 carrying an error a client has to parse to learn the chain is down.

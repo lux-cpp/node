@@ -182,6 +182,24 @@ int status_of(const std::string& head) {
     return (code >= 100 && code <= 599) ? code : 0;
 }
 
+// Whether `resp` holds a whole HTTP answer: its head, and a body as long as
+// Content-Length says, or a chunked body through its last chunk. An answer that
+// states neither ends when the connection does.
+bool complete(const std::string& resp) {
+    const auto end = resp.find("\r\n\r\n");
+    if (end == std::string::npos) return false;
+    std::string head = resp.substr(0, end);
+    std::transform(head.begin(), head.end(), head.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (head.find("transfer-encoding: chunked") != std::string::npos ||
+        head.find("transfer-encoding:chunked") != std::string::npos)
+        return resp.size() >= end + 9 && resp.compare(resp.size() - 5, 5, "0\r\n\r\n") == 0;
+    const auto at = head.find("content-length:");
+    if (at == std::string::npos) return false;
+    const auto want = static_cast<std::size_t>(std::strtoull(head.c_str() + at + 15, nullptr, 10));
+    return resp.size() - (end + 4) >= want;
+}
+
 Proxied proxy_to_archive(const std::string& archive_url, const std::string& target_path, const std::string& body) {
     if (archive_url.empty() || target_path.empty()) return {};
     std::string url = archive_url;
@@ -226,9 +244,12 @@ Proxied proxy_to_archive(const std::string& archive_url, const std::string& targ
 
     write_all(sock, req);
 
+    // The answer ends where its own framing says, not when the far side hangs
+    // up: a server that keeps its connection alive — a VM plugin's does —
+    // would otherwise hold every relayed call for the whole receive timeout.
     std::string resp;
     char buf[4096];
-    while (true) {
+    while (!complete(resp)) {
         ssize_t n = ::recv(sock, buf, sizeof(buf), 0);
         if (n <= 0) break;
         resp.append(buf, n);
