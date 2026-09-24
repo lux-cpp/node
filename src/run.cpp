@@ -5,8 +5,9 @@
 // quorum-certificate consensus over a real TCP mesh, and served over JSON-RPC.
 //
 //   <daemon> [--network NAME] --committee <file> --peers <a:p,b:p,...>
-//            [--data DIR] [--rpc-port R] [--rpc-host H] [--deadline-ms D]
-//            [--blocks B] [--import-chain-data PATH] [--archive-rpc URL] [--vm PATH]
+//            [--data DIR] [--rpc-port R] [--rpc-host H] [--mesh-host H]
+//            [--deadline-ms D] [--blocks B] [--import-chain-data PATH]
+//            [--archive-rpc URL] [--vm PATH]
 //   <daemon> [--network NAME] --data DIR --publish      (also writes DIR/published)
 //
 // THE VALIDATOR SET IS READ, NOT DERIVED. A committee file names every
@@ -37,6 +38,8 @@
 #include "lux/node/rpc.hpp"
 #include "lux/node/signer.hpp"
 #include "lux/node/spec.hpp"
+
+#include <arpa/inet.h>
 
 #include <array>
 #include <atomic>
@@ -189,13 +192,14 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
     if (!publish && (committee_path.empty() || peer_list.empty())) {
         std::fprintf(stderr,
                      "usage: %s [--network NAME] --committee FILE --peers a:p,b:p,... [--data DIR]\n"
-                     "             [--rpc-port R] [--rpc-host H] [--deadline-ms D] [--blocks B]\n"
-                     "             [--archive-rpc URL] [--import-chain-data PATH] [--vm PATH]\n"
+                     "             [--rpc-port R] [--rpc-host H] [--mesh-host H] [--deadline-ms D]\n"
+                     "             [--blocks B] [--archive-rpc URL] [--import-chain-data PATH] [--vm PATH]\n"
                      "       %s [--network NAME] --data DIR --publish\n"
                      "\n"
                      "--committee names the validators of this network, one published line each;\n"
                      "--publish makes a line for it. --peers gives every validator's mesh address\n"
-                     "in committee order, and the entry at this node's own seat is where it listens.\n"
+                     "in committee order, and the entry at this node's own seat is where it listens;\n"
+                     "--mesh-host is the address it binds (127.0.0.1; 0.0.0.0 in a pod).\n"
                      "A validator is named for a chain, so --network decides who the file names.\n",
                      prog, prog);
         return 2;
@@ -290,6 +294,19 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
     // 127.0.0.1 serves this machine only; a node behind a door or an ingress
     // runs with --rpc-host 0.0.0.0.
     const std::string rpc_host = arg_str(argc, argv, "--rpc-host", "127.0.0.1");
+    // The same for the validator mesh: 127.0.0.1 is this machine only, and a
+    // validator whose peers are other pods runs with --mesh-host 0.0.0.0. Its
+    // own --peers entry is the address the OTHERS dial — in a cluster a Service
+    // address the pod does not hold — so it is not what the pod binds.
+    const std::string mesh_host = arg_str(argc, argv, "--mesh-host", "127.0.0.1");
+    {
+        in_addr parsed{};
+        if (::inet_pton(AF_INET, mesh_host.c_str(), &parsed) != 1) {
+            std::fprintf(stderr, "%s: --mesh-host %s: expected an IPv4 address (0.0.0.0 binds every interface)\n",
+                         prog, mesh_host.c_str());
+            return 2;
+        }
+    }
     const long blocks      = arg(argc, argv, "--blocks", 0);  // 0 = until stopped
 
     // Go's flag, spelled Go's way, so one runbook drives all three
@@ -315,6 +332,7 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
 
     HostConfig cfg;
     cfg.index      = std::uint32_t(index);
+    cfg.host       = mesh_host;
     cfg.port       = addresses[std::size_t(index)].port;
     cfg.sk         = me.secret();
     cfg.pk         = me.key();
@@ -377,13 +395,19 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
     Node2Host&     host  = *hostp;
     plugin::Chain& chain = *chainp;
 
-    const std::uint16_t port = host.listen_bind();
+    std::uint16_t port = 0;
+    try {
+        port = host.listen_bind();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "node %ld: cannot listen — %s\n", index, e.what());
+        return 2;
+    }
     std::printf("node %ld: chain %s — the network its validators are entitled on\n", index,
                 hex(chain_id).c_str());
     std::printf("node %ld: validator %s, seat %ld of %ld in %s\n", index,
                 hex(me.node()).c_str(), index, n, committee_path.c_str());
-    std::printf("node %ld: consensus 127.0.0.1:%u  chain %s (eth chainId %llu, network %u)\n",
-                index, port, self.c_str(), static_cast<unsigned long long>(eth), spec->network);
+    std::printf("node %ld: consensus %s:%u  chain %s (eth chainId %llu, network %u)\n", index,
+                mesh_host.c_str(), port, self.c_str(), static_cast<unsigned long long>(eth), spec->network);
     std::printf("node %ld: vm %s %s, tip %s at height %llu\n", index, vm.c_str(),
                 chain.version().c_str(), hex(chain.last_accepted()).c_str(),
                 static_cast<unsigned long long>(chain.last_accepted_height()));

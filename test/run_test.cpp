@@ -49,6 +49,14 @@ int publish(std::span<const Spec> specs, std::vector<std::string> args) {
     return rc;
 }
 
+int run_with(std::span<const Spec> specs, std::vector<std::string> args) {
+    args.insert(args.begin(), "run_test");
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    return run(specs, int(args.size()), argv.data());
+}
+
 std::string read_all(const std::string& path) {
     std::ifstream in(path);
     std::ostringstream out;
@@ -104,6 +112,19 @@ int main() {
           "--network selects a spec by its name");
     check(publish(std::array{good, second}, {"--network", "mainnet"}) == 2,
           "a network no spec has is refused rather than rounded to one");
+
+    {
+        // A mesh host is an address, and one that is not is refused before the
+        // chain, the RPC or the mesh is started — with a line that says so.
+        char tmpl[] = "/tmp/lux-run-XXXXXX";
+        const std::string dir = ::mkdtemp(tmpl);
+        (void)publish_into(dir, std::array{good}, {});
+        std::ofstream(dir + "/committee") << read_all(dir + "/published");
+        const int rc = run_with(std::array{good}, {"--data", dir, "--committee", dir + "/committee", "--peers",
+                                                   "127.0.0.1:1", "--mesh-host", "pod.local"});
+        check(rc == 2, "--mesh-host that is not an IPv4 address is refused before anything starts");
+        std::filesystem::remove_all(dir);
+    }
 
     std::printf("\n%s\n", g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;

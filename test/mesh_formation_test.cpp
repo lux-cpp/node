@@ -36,6 +36,8 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -76,9 +78,10 @@ std::vector<Validator> g_set;
 // host without one could not form a mesh at all. Made once in main.
 std::unique_ptr<test::Names> g_names;
 
-std::unique_ptr<Node2Host> make_host(std::uint32_t index) {
+std::unique_ptr<Node2Host> make_host(std::uint32_t index, const std::string& bind = "127.0.0.1") {
     HostConfig cfg;
     cfg.index      = index;
+    cfg.host       = bind;
     cfg.port       = 0;
     cfg.sk         = g_keys[index].sk;
     cfg.pk         = g_keys[index].pk;
@@ -107,6 +110,22 @@ struct DownPeer {
     }
     ~DownPeer() { if (fd >= 0) ::close(fd); }
 };
+
+// This machine's first IPv4 address that is not loopback, or nothing.
+std::string outward() {
+    ifaddrs* all = nullptr;
+    if (::getifaddrs(&all) != 0) return {};
+    std::string found;
+    for (ifaddrs* i = all; i != nullptr && found.empty(); i = i->ifa_next) {
+        if (i->ifa_addr == nullptr || i->ifa_addr->sa_family != AF_INET) continue;
+        if ((i->ifa_flags & IFF_LOOPBACK) || !(i->ifa_flags & IFF_UP)) continue;
+        char text[INET_ADDRSTRLEN] = {};
+        const auto* a = reinterpret_cast<const sockaddr_in*>(i->ifa_addr);
+        if (::inet_ntop(AF_INET, &a->sin_addr, text, sizeof text)) found = text;
+    }
+    ::freeifaddrs(all);
+    return found;
+}
 
 long elapsed_ms(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -288,6 +307,48 @@ int main() {
             check(reached[i] == kN - 1, "[D] host " + std::to_string(i) + " reached every peer");
         check(took < kDeadlineMs, "[D] a complete set forms without waiting out the deadline");
         std::printf("  [D] full %u-node mesh formed in %ld ms\n", kN, took);
+    }
+
+    // ── [F] a validator in a pod binds every interface ────────────────────────
+    // Its peers are other machines, so the mesh listens where they can reach
+    // it: two hosts bound to 0.0.0.0 meet over this machine's own outward
+    // address when it has one, and over 127.0.0.1 through the same bind when it
+    // does not. The control is the old bind: a host on 127.0.0.1 is not there
+    // at the outward address.
+    {
+        const std::string far  = outward();
+        const std::string dial = far.empty() ? "127.0.0.1" : far;
+        auto h0 = make_host(0, "0.0.0.0");
+        auto h1 = make_host(1, "0.0.0.0");
+        const std::uint16_t p0 = h0->listen_bind();
+        const std::uint16_t p1 = h1->listen_bind();
+        std::map<std::uint32_t, PeerAddr> configured{{0, {dial, p0}}, {1, {dial, p1}}};
+        std::size_t r0 = 0, r1 = 0;
+        {
+            std::thread a([&] { r0 = h0->connect_mesh(configured, kDeadlineMs); });
+            std::thread b([&] { r1 = h1->connect_mesh(configured, kDeadlineMs); });
+            a.join();
+            b.join();
+        }
+        check(r0 == 1 && r1 == 1, "[F] two hosts bound to 0.0.0.0 meet at " + dial);
+        std::printf("  [F] bound 0.0.0.0, met over %s (%s)\n", dial.c_str(),
+                    far.empty() ? "no outward address here" : "this machine's outward address");
+        if (!far.empty()) {
+            auto lo  = make_host(1);  // bound 127.0.0.1, as every validator was
+            auto out = make_host(0, "0.0.0.0");
+            const std::uint16_t pl = lo->listen_bind();
+            (void)out->listen_bind();
+            std::map<std::uint32_t, PeerAddr> to{{1, {far, pl}}};
+            check(out->connect_mesh(to, 600) == 0,
+                  "[F] control: a host bound to 127.0.0.1 is not there at " + far);
+        }
+        bool refused = false;
+        try {
+            (void)make_host(0, "not-an-address")->listen_bind();
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        check(refused, "[F] a mesh host that is not an IPv4 address is refused");
     }
 
     std::printf("------------------------------------------------------------------------\n");

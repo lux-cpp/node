@@ -40,6 +40,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace lux::node {
@@ -48,6 +49,7 @@ namespace lux::node {
 // out of scope: the peer set is supplied to connect_mesh, fixed for the run.
 struct HostConfig {
     std::uint32_t                              index;       // this node's own seat
+    std::string                                host = "127.0.0.1";  // the address the mesh listens on
     std::uint16_t                              port;        // requested listen port (0 = OS-assigned)
     std::array<std::uint8_t, 32>               sk;          // this node's BLS secret key
     lux::consensus::PubKey                    pk;          // this node's BLS public key
@@ -81,10 +83,11 @@ public:
     Node2Host(const Node2Host&) = delete;
     Node2Host& operator=(const Node2Host&) = delete;
 
-    // Bind 127.0.0.1:cfg.port and listen. Returns the port actually bound (which
+    // Bind cfg.host:cfg.port and listen. Returns the port actually bound (which
     // resolves a requested 0). Throws std::runtime_error at the boundary on
     // failure. The config keeps the request; port() reports the result.
-    std::uint16_t listen_bind() { return mesh_.listen_bind(cfg_.port); }
+    std::uint16_t listen_bind() { return mesh_.listen_bind(cfg_.host, cfg_.port); }
+    const std::string& host() const noexcept { return cfg_.host; }
 
     // Reach as many of `peers` as possible within ONE deadline. Returns the number
     // of peers connected (== peer_count()). Must be preceded by listen_bind.

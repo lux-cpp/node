@@ -91,19 +91,24 @@ Mesh::~Mesh() {
     // Peer fds are owned and closed by the transport.
 }
 
-std::uint16_t Mesh::listen_bind(std::uint16_t port) {
+std::uint16_t Mesh::listen_bind(const std::string& host, std::uint16_t port) {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    // Refused before a socket exists: a mesh host that is not an address would
+    // otherwise bind somewhere nobody asked for, or nowhere, and look up.
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1)
+        throw std::runtime_error("node: the mesh listens on an IPv4 address, and '" + host +
+                                 "' is not one");
+
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) throw std::runtime_error("node: socket() failed");
 
     int one = 1;
     ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port);
     if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0)
-        throw std::runtime_error("node: bind() failed on port " + std::to_string(port));
+        throw std::runtime_error("node: bind() failed on " + host + ":" + std::to_string(port));
 
     // Backlog must hold inbound dialers until accept() drains it.
     if (::listen(listen_fd_, 128) != 0)
