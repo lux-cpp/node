@@ -138,6 +138,27 @@ public:
     std::uint64_t          frontier() const override { return 0; }
 };
 
+// A committee of one: this node is the whole validator set, as an archive's is.
+std::unique_ptr<Node2Host> alone_host() {
+    HostConfig                   cfg;
+    std::array<std::uint8_t, 32> seed{};
+    seed.fill(0x4b);
+    std::array<std::uint8_t, 32> sk{};
+    PubKey                       pk{};
+    if (cevm::crypto::bls::keygen(seed.data(), sk.data()) != 0) { std::puts("keygen"); std::exit(2); }
+    if (cevm::crypto::bls::sk_to_pk(sk.data(), pk.data()) != 0) { std::puts("sk_to_pk"); std::exit(2); }
+    cfg.sk         = sk;
+    cfg.pk         = pk;
+    cfg.index      = 0;
+    cfg.port       = 0;
+    cfg.validators = {{pk, 1}};
+    cfg.wave       = WaveConfig::feasible(1);
+    cfg.accepted   = 0;
+    auto h = std::make_unique<Node2Host>(std::move(cfg));
+    h->listen_bind();
+    return h;
+}
+
 }  // namespace
 
 int main() {
@@ -165,6 +186,24 @@ int main() {
         check(!d.has_value(), "a block this node's own execution refuses is not proposed");
         check(t.rejected == 0, "and it is dropped, not rejected: it never entered consensus");
         check(t.accepted == 0, "and certainly not accepted");
+    }
+
+    // An archive runs as a committee of itself, and its key is thrown away with
+    // its pod. That is safe only because one key certifies nothing: finality is
+    // asked at the Quasar tier, which refuses any set below four seats. (The
+    // Nova tier floors at one signer, so a set of one WOULD certify itself
+    // there — this pins that the node never asks it.)
+    std::printf("\na committee of one certifies nothing\n");
+    {
+        auto       host = alone_host();
+        std::mutex guard;
+        Tally      t;
+        Engine     engine(std::make_unique<CountingVM>(&t, /*verifies=*/true), *host, guard);
+
+        const auto d = engine.advance(/*deadline_ms=*/150);
+        check(!d.has_value(), "a block its only validator votes for is not decided");
+        check(t.accepted == 0, "nor accepted");
+        check(t.rejected == 1, "and is given back when the height is given up");
     }
 
     std::printf("\na chain that says no\n");
