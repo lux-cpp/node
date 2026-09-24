@@ -203,8 +203,9 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
                      "\n"
                      "--committee names the validators of this network, one published line each;\n"
                      "--publish makes a line for it. --peers gives every validator's mesh address\n"
-                     "in committee order, and the entry at this node's own seat is where it listens.\n"
-                     "--produce sets a proposer's window to five of these (default 200 ms).\n"
+                     "in committee order, and the entry at this node's own seat is where the others\n"
+                     "dial it; --mesh-host is the address it binds (127.0.0.1; 0.0.0.0 in a pod).\n"
+                     "--produce MS makes a proposer's window five times MS (default 200).\n"
                      "A validator is named for a chain, so --network decides who the file names.\n",
                      prog, prog);
         return 2;
@@ -307,13 +308,19 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
     // 127.0.0.1 serves this machine only; a node behind a door or an ingress
     // runs with --rpc-host 0.0.0.0.
     const std::string rpc_host = arg_str(argc, argv, "--rpc-host", "127.0.0.1");
-    // Where the mesh listens: the address this seat's own --peers entry names
-    // when that is an IPv4 address, every interface when it is a name — a name
-    // is a cluster's (zood-0.zood), and the pod does not hold it as an address.
-    in_addr    literal{};
-    const auto own     = addresses[std::size_t(index)].host;
-    const std::string mesh_host =
-        arg_str(argc, argv, "--mesh-host", ::inet_pton(AF_INET, own.c_str(), &literal) == 1 ? own : "0.0.0.0");
+    // The same for the validator mesh: 127.0.0.1 is this machine only, and a
+    // validator whose peers are other pods runs with --mesh-host 0.0.0.0. Its
+    // own --peers entry is the address the OTHERS dial — in a cluster a Service
+    // address the pod does not hold — so it is not what the pod binds.
+    const std::string mesh_host = arg_str(argc, argv, "--mesh-host", "127.0.0.1");
+    {
+        in_addr parsed{};
+        if (::inet_pton(AF_INET, mesh_host.c_str(), &parsed) != 1) {
+            std::fprintf(stderr, "%s: --mesh-host %s: expected an IPv4 address (0.0.0.0 binds every interface)\n",
+                         prog, mesh_host.c_str());
+            return 2;
+        }
+    }
     const long blocks      = arg(argc, argv, "--blocks", 0);  // 0 = until stopped
 
     // Go's flag, spelled Go's way, so one runbook drives all three
