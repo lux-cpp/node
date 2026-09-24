@@ -130,13 +130,18 @@ Id to_id(const std::vector<std::uint8_t>& b) {
 // wire; nothing about it is computed here, which is the point of the boundary.
 class Remote final : public Block {
 public:
-    Remote(Chain& on, Id id, Id parent, std::uint64_t height, std::vector<std::uint8_t> bytes)
-        : on_(on), id_(id), parent_(parent), height_(height), bytes_(std::move(bytes)) {}
+    Remote(Chain& on, Id id, Id parent, std::uint64_t height, std::int64_t stamp,
+           std::vector<std::uint8_t> bytes)
+        : on_(on), id_(id), parent_(parent), height_(height), stamp_(stamp), bytes_(std::move(bytes)) {}
 
     Id                            id() const override { return id_; }
     Id                            parent() const override { return parent_; }
     std::uint64_t                 height() const override { return height_; }
     std::span<const std::uint8_t> bytes() const override { return bytes_; }
+    // Go's BlockResponse carries the time in nanoseconds (time.Time.UnixNano).
+    std::uint64_t                 timestamp() const override {
+        return stamp_ > 0 ? std::uint64_t(stamp_) / 1000000000ULL : 0;
+    }
 
     // THE ROOT DOES NOT CROSS THIS BOUNDARY. Go's BlockResponse carries id,
     // parent, bytes, height and timestamp — and no execution state root, because
@@ -153,6 +158,7 @@ private:
     Chain&                    on_;
     Id                        id_{}, parent_{};
     std::uint64_t             height_ = 0;
+    std::int64_t              stamp_  = 0;
     std::vector<std::uint8_t> bytes_;
 };
 
@@ -332,6 +338,7 @@ namespace {
 struct Answer {
     std::vector<std::uint8_t> id, parent, bytes;
     std::uint64_t             height = 0;
+    std::int64_t              stamp  = 0;
     std::uint8_t              err    = 0;
     bool                      ok     = false;
 };
@@ -339,10 +346,9 @@ struct Answer {
 Answer read_block(const std::vector<std::uint8_t>& payload) {
     Answer           a;
     lux::zap::Reader r(payload.data(), payload.size());
-    std::int64_t     stamp = 0;
     bool             with_context = false;
     if (!r.read_bytes(a.id) || !r.read_bytes(a.parent) || !r.read_bytes(a.bytes) ||
-        !r.read_u64(a.height) || !r.read_i64(stamp) || !r.read_bool(with_context) ||
+        !r.read_u64(a.height) || !r.read_i64(a.stamp) || !r.read_bool(with_context) ||
         !r.read_u8(a.err))
         return a;
     a.ok = true;
@@ -357,7 +363,7 @@ std::shared_ptr<Block> Chain::build() {
     // NOTHING TO BUILD IS "NO", NOT A FAILURE — the house form, and Go's: an
     // empty mempool answers with an error code, not a broken link.
     if (!a.ok || a.err != 0) return nullptr;
-    return std::make_shared<Remote>(*this, to_id(a.id), to_id(a.parent), a.height, a.bytes);
+    return std::make_shared<Remote>(*this, to_id(a.id), to_id(a.parent), a.height, a.stamp, a.bytes);
 }
 
 std::shared_ptr<Block> Chain::parse(std::span<const std::uint8_t> bytes) {
@@ -365,7 +371,7 @@ std::shared_ptr<Block> Chain::parse(std::span<const std::uint8_t> bytes) {
     w.write_bytes(bytes.data(), bytes.size());
     const auto a = read_block(st_->call(kParseBlock, w, "parse"));
     if (!a.ok || a.err != 0) return nullptr;
-    return std::make_shared<Remote>(*this, to_id(a.id), to_id(a.parent), a.height, a.bytes);
+    return std::make_shared<Remote>(*this, to_id(a.id), to_id(a.parent), a.height, a.stamp, a.bytes);
 }
 
 std::shared_ptr<Block> Chain::get(const Id& id) const {
@@ -374,7 +380,7 @@ std::shared_ptr<Block> Chain::get(const Id& id) const {
     const auto a = read_block(st_->call(kGetBlock, w, "get"));
     if (!a.ok || a.err != 0) return nullptr;
     return std::make_shared<Remote>(const_cast<Chain&>(*this), to_id(a.id), to_id(a.parent),
-                                    a.height, a.bytes);
+                                    a.height, a.stamp, a.bytes);
 }
 
 void Chain::prefer(const Id& id) {

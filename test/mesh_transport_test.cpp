@@ -107,7 +107,7 @@ int main() {
     {
         MeshVoteTransport tx(counting_sink);
         Link l;
-        tx.add_peer(l.ours);
+        tx.add_peer(l.ours, 1);
         send_raw(l.theirs, header(0xFFFFFFFFu, lux::consensus::zap::kVoteMsgType));
 
         // Flood as hard as the peer can while the transport keeps pumping. The
@@ -135,7 +135,7 @@ int main() {
         delivered = 0;
         MeshVoteTransport tx(counting_sink);
         Link l;
-        tx.add_peer(l.ours);
+        tx.add_peer(l.ours, 1);
         const std::uint32_t over = kMaxMeshFrame + 1;
         check(over < lux::zap::MaxMessageSize, "[2] the test length is legal ZAP, illegal here");
         send_raw(l.theirs, header(over, lux::consensus::zap::kVoteMsgType));
@@ -150,7 +150,7 @@ int main() {
         delivered = 0;
         MeshVoteTransport tx(counting_sink);
         Link l;
-        tx.add_peer(l.ours);
+        tx.add_peer(l.ours, 1);
         std::vector<std::uint8_t> f = header(4, 0x2A);   // a type nothing registered
         for (int i = 0; i < 4; ++i) f.push_back(0xEE);
         send_raw(l.theirs, f);
@@ -164,9 +164,9 @@ int main() {
         delivered = 0;
         std::size_t got = 0;
         MeshVoteTransport tx(counting_sink);
-        tx.on(kTxMsgType, [&](const std::vector<std::uint8_t>& p) { got += p.size(); });
+        tx.on(kTxMsgType, [&](std::uint32_t, const std::vector<std::uint8_t>& p) { got += p.size(); });
         Link l;
-        tx.add_peer(l.ours);
+        tx.add_peer(l.ours, 1);
         std::vector<std::uint8_t> f = header(3, kTxMsgType);
         for (int i = 0; i < 3; ++i) f.push_back(0x11);
         send_raw(l.theirs, f);
@@ -180,7 +180,7 @@ int main() {
         delivered = 0;
         MeshVoteTransport tx(counting_sink);
         Link l;
-        tx.add_peer(l.ours);
+        tx.add_peer(l.ours, 1);
         send_raw(l.theirs, vote_frame(0x42));
         l.close_theirs();  // EOF arrives with the vote already in flight
         tx.pump();
@@ -193,7 +193,7 @@ int main() {
         delivered = 0;
         MeshVoteTransport tx(counting_sink);
         Link l;
-        tx.add_peer(l.ours);
+        tx.add_peer(l.ours, 1);
         l.close_theirs();
         ::shutdown(l.ours, SHUT_RDWR);  // writes now fail outright
 
@@ -211,8 +211,8 @@ int main() {
         delivered = 0;
         MeshVoteTransport tx(counting_sink);
         Link bad, good;
-        tx.add_peer(bad.ours);
-        tx.add_peer(good.ours);
+        tx.add_peer(bad.ours, 1);
+        tx.add_peer(good.ours, 2);
         send_raw(bad.theirs, header(0xFFFFFFFFu, lux::consensus::zap::kVoteMsgType));
         send_raw(good.theirs, vote_frame(0x44));
         tx.pump();

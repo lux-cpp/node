@@ -52,6 +52,11 @@ struct Block {
     virtual std::uint64_t height() const = 0;                 // Go Height
     virtual std::span<const std::uint8_t> bytes() const = 0;  // Go Bytes
 
+    // When the block says it was made, in seconds since the epoch. A proposer's
+    // slot at the next height is counted from its parent's time, as Go's
+    // windower counts it (proposervm TimeToSlot, windower.go:325).
+    virtual std::uint64_t timestamp() const = 0;              // Go Timestamp
+
     // The state root this block's execution PRODUCED — Go's
     // canonicalCommitter.ExecutionStateRoot. It is what validators sign over, so
     // it is computed by running the block, never copied from a proposer.

@@ -192,8 +192,11 @@ endif()
 
 add_library(node STATIC
     src/mesh.cpp          # the socket dance
-    src/node_host.cpp     # one Party driven over that mesh
-    src/engine.cpp        # execute → decide → accept, for any VM
+    src/windower.cpp      # who proposes at a height and a slot: Go's proposervm windower
+    src/statement.cpp     # what a validator signs — a vote or an anchor — and α of them
+    src/journal.cpp       # one statement a height, on the device before it is signed
+    src/ledger.cpp        # the certificates accepted on, the import gate, the held block
+    src/engine.cpp        # the height rule: windows, one signature, the converged winner
     src/network.cpp       # which chain aliases this node's network owns
     src/rpc.cpp           # HTTP JSON-RPC, and the relay to a chain's own server
     src/run.cpp           # a node on one network's spec
@@ -247,9 +250,12 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #   wire_vector     the bytes on the wire, written from the spec and read off a socket
 #   mesh_transport  what one hostile or dead socket can do to this node
 #   mesh_formation  mesh setup is bounded, and a missing validator is not a dead cluster
-#   node_cluster   five hosts finalize over a real loopback mesh
-#   node_liveness  down + wedged-but-present validators routed around, on the wire
-#   boot_floor      a restarted validator does not re-sign a height it decided
+#   windower        Go's proposer schedule, held to windower_test.go's vectors
+#   statement       the vote and the anchor, their domain, the journal both go
+#                   through, the certificate rule, the ledger and held records
+#   live            five validators import Zoo mainnet's tip, anchor it and
+#                   build on it; one seat down; one that imported another tip;
+#                   one that restarts and catches up
 #   hostile_decode  what a stranger can send the two decoders that take his bytes
 #   set_root        the validator-set commitment, against Go's encoding
 #   committee       the network description: the parse, the refusals, the root,
@@ -260,15 +266,17 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #                   derivations, then a full exchange over a real socket pair
 #   pq_vector       the validator link held to a handshake the GO node produced:
 #                   its frames, its names, its session key (LP-10602)
-#   engine          reject after give-up, drop after a failed verify, and a
-#                   chain that refuses to build or parse does not stop the node
+#   engine          one validator against a scripted peer: a proposal from the
+#                   wrong window is never parsed, a refused block is never
+#                   signed, a gated node signs only its anchor, a chain that
+#                   refuses to build does not stop it
 #   run             what a node refuses before it starts: a spec whose genesis
 #                   names another chain, a network no spec has
 #   plugin          cevm's EVM plugin, started the way the Go node starts one
 #                   and driven through a height over ZAP
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation node_cluster node_liveness boot_floor hostile_decode set_root committee chain_route archive_proxy pq_handshake pq_vector run engine)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation hostile_decode set_root committee chain_route archive_proxy pq_handshake pq_vector run windower statement live engine)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
