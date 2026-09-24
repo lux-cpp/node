@@ -305,6 +305,7 @@ cmake --build build -j
 ctest --test-dir build -L node --output-on-failure   # this repository's 17
 ./scripts/cluster.sh build/luxd build/bin/cevm       # 5 luxd PROCESSES over cevm, 12 transactions
 ./scripts/cluster.sh build/luxd build/bin/cevm 2     # ...with validator 2 held down
+./scripts/cluster.sh build/luxd build/bin/cevm 2 6   # ...continuing an export of 6 blocks
 ```
 
 The four "missing house Conan recipes" recorded in lux-cpp/sdk's notes
@@ -575,11 +576,12 @@ consensus 9928599:
 | what one validator refuses | `engine_test`: a proposal signed for another's window is never parsed; a refused block is never signed; a gated node builds nothing in its own window and signs only its anchor; a chain that refuses to build does not stop it — each against a control |
 | processes, the cevm plugin, Zoo mainnet's export | zooai/node `test/live.sh`: five `zood` processes import `zoo-mainnet-200200.rlp` and every one anchors 799 at `0xd6f92941…f72b8`; with seat 3 down four anchor, and seat 3 started later anchors on the ledger answer; a seat that imported the export cut at 798 anchors nothing and stays at 798 |
 | processes, the cevm plugin, transactions | `scripts/cluster.sh`: five `luxd` on the local chain, twelve transactions relayed across the mesh, every validator at height 12 with the same block hash at every height; with seat 2 held down, the same with four |
+| processes, the cevm plugin, an import continued | `scripts/cluster.sh luxd cevm -1 6`: cevm alone builds six blocks into an export (`local_export`); five `luxd` import it, all five anchor height 6, and blocks 7..12 are built on it with the same hash at every height on every seat; with seat 3 held down (`… 3 6`), four anchor and build the same |
 
 Building 800 on Zoo mainnet's own export over cevm needs a transaction from a
-funded Zoo account, and there is no key to sign one with here: the process-level
-proof of building is the local chain's, and the proof of building on an import
-is `live_test`'s.
+funded Zoo account, and there is no key to sign one with here: building on an
+imported tip over cevm is proven on the local chain's export, and on Zoo's tip
+by `live_test`.
 
 ## The bug that was here, and why no gate saw it
 

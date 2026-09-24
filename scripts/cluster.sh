@@ -12,21 +12,29 @@
 # "slot" each block was built in is printed, and a slot above 0 is a height
 # whose first window was somebody else's.
 #
+# With IMPORT > 0 the chain does not start at genesis: the first IMPORT
+# transactions are built into blocks by the cevm plugin alone (local_export,
+# beside luxd) and written as an export, and every validator starts with
+# --import-chain-data on it. Its tip is one no quorum decided, so each signs an
+# anchor on it (engine.hpp); once α have, the rest of the transactions are built
+# on top.
+#
 # Transactions go to the validators in turn and are relayed across the mesh, so
 # whichever validator holds the window holds the transaction. They are
 # test/local/txs.txt: transfers signed by the first Anvil/Hardhat account, the
 # key luxd's local spec funds (src/luxd.cpp). A Cancun block that would owe a
 # block gas cost is not built, so they are sent a block interval apart.
 #
-# Usage: scripts/cluster.sh LUXD CEVM [down] [n] [mesh-port] [rpc-port]
+# Usage: scripts/cluster.sh LUXD CEVM [down] [import] [n] [mesh-port] [rpc-port]
 set -uo pipefail
 
 LUXD="${1:?luxd}"
 CEVM="${2:?cevm}"
 DOWN="${3:--1}"
-N="${4:-5}"
-BASE="${5:-19310}"
-RPC="${6:-19410}"
+IMPORT="${4:-0}"
+N="${5:-5}"
+BASE="${6:-19310}"
+RPC="${7:-19410}"
 TXS="$(cd "$(dirname "$0")/.." && pwd)/test/local/txs.txt"
 FROM=0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
 
@@ -57,16 +65,31 @@ for i in $(seq 0 $((N - 1))); do
   "$LUXD" --data "$TMP/v$i" --publish >>"$TMP/committee.txt"
   peers="${peers:+$peers,}127.0.0.1:$((BASE + i))"
 done
+imported=()
+if (( IMPORT > 0 )); then
+  made="$("$(dirname "$LUXD")/local_export" "$CEVM" "$TMP/local.rlp" "$TXS" "$IMPORT")" || { echo "FAIL  the export"; exit 1; }
+  echo "== the export: $made"
+  imported=(--import-chain-data "$TMP/local.rlp")
+fi
 for i in "${live[@]}"; do
   "$LUXD" --data "$TMP/v$i" --committee "$TMP/committee.txt" --peers "$peers" --vm "$CEVM" \
-          --rpc-port $((RPC + i)) --deadline-ms 3000 >"$TMP/node$i.log" 2>&1 &
+          --rpc-port $((RPC + i)) --deadline-ms 3000 "${imported[@]}" >"$TMP/node$i.log" 2>&1 &
   pids+=("$!")
 done
 if (( DOWN >= 0 )); then echo "== ${#live[@]} of $N validators up, seat $DOWN held down"; else echo "== $N validators up"; fi
 for _ in $(seq 1 60); do grep -q "window" "$TMP/node${live[0]}.log" 2>/dev/null && break; sleep 0.5; done
 
+if (( IMPORT > 0 )); then
+  for i in "${live[@]}"; do
+    for _ in $(seq 1 120); do grep -q "ANCHORED the imported tip at height $IMPORT " "$TMP/node$i.log" && break; sleep 0.5; done
+    grep -q "ANCHORED the imported tip at height $IMPORT " "$TMP/node$i.log" \
+      && ok "seat $i anchored the imported tip at height $IMPORT" || bad "seat $i did not anchor height $IMPORT"
+  done
+fi
+
 sent=0
 while read -r tx; do
+  if (( sent < IMPORT )); then sent=$((sent + 1)); continue; fi
   seat="${live[$((sent % ${#live[@]}))]}"
   answer="$(call "$seat" eth_sendRawTransaction "[\"$tx\"]")"
   echo "$answer" | grep -q '"result"' || bad "transaction $sent to seat $seat: $answer"
@@ -85,7 +108,8 @@ for _ in $(seq 1 60); do
 done
 
 height=$(( $(call "${live[0]}" eth_blockNumber | field result) ))
-(( height >= 1 )) && ok "the chain is at height $height after $sent transactions" || bad "no block was built"
+(( height > IMPORT )) && ok "the chain is at height $height after $sent transactions ($IMPORT imported)" \
+  || bad "no block was built past height $IMPORT"
 for i in "${live[@]}"; do
   n="$(call "$i" eth_getTransactionCount "[\"$FROM\",\"latest\"]" | field result)"
   [[ "$n" == "$want" ]] && ok "seat $i executed all $sent transactions" || bad "seat $i nonce $n, want $want"
@@ -106,4 +130,5 @@ grep -h " led " "$TMP"/node*.log | sort -t' ' -k4,4n -u | sed 's/^/  /'
 
 echo
 if (( fail )); then echo "FAIL"; for i in "${live[@]}"; do echo "--- node $i"; tail -15 "$TMP/node$i.log"; done; exit 1; fi
-echo "PASS — ${#live[@]} of $N validators, one chain"
+if (( IMPORT > 0 )); then echo "PASS — ${#live[@]} of $N validators, one chain, continued from an export at $IMPORT"
+else echo "PASS — ${#live[@]} of $N validators, one chain"; fi

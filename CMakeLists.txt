@@ -296,6 +296,12 @@ add_dependencies(plugin_test cevm-bin)
 add_test(NAME plugin COMMAND plugin_test $<TARGET_FILE:cevm-bin>)
 set_tests_properties(plugin PROPERTIES LABELS node)
 
+# The tool scripts/cluster.sh builds its export with: the local chain, built by
+# the cevm plugin alone, written as luxfi/state writes an export.
+add_executable(local_export test/local/export.cpp)
+target_link_libraries(local_export PRIVATE node)
+add_dependencies(local_export cevm-bin)
+
 # The committee test reads REAL FILES — the same files the Rust node reads, so
 # "both accept this" is a fact about one artifact rather than about two string
 # literals that were typed twice.
