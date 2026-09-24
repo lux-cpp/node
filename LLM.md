@@ -1,36 +1,34 @@
-# node — a running Lux node (a C-Chain executed by cevm, decided by BLS consensus)
+# node — a running Lux node (a chain in a plugin, decided by BLS certificates)
 
-`noded` runs a **C-Chain**: it executes real EVM blocks through **cevm**, decides
-them with **BLS quorum-certificate consensus** over a **mesh of real TCP
-sockets** framed by the canonical **ZAP** wire codec, and serves them over
-**JSON-RPC**. N validators, each on a real listener, dial each other, take turns
-proposing, and independently execute every block before signing it.
+`luxd` (and every brand's daemon built on `run()`: `zood` is this node on Zoo's
+specs) runs a network's chain: its EVM is **cevm run as a plugin** over the same
+ZAP protocol the Go node speaks to its plugins, its heights are decided by
+**α-of-n BLS certificates** over a **mesh of real TCP links** proven by the
+post-quantum validator handshake, and it serves the chain over **JSON-RPC**.
 
-**The signed message carries the state root each node's own EVM produced.** One
-validator proposes and publishes the block's bytes; every other validator parses
-those bytes, runs the transactions through ITS OWN cevm, and derives the root
-itself. A quorum certificate is therefore agreement about an executed RESULT, not
-about a name — a node whose EVM diverged signs a different message and is simply
-not in the quorum, so divergence stalls a height instead of forking it.
+A height is decided on **Go's rule, as lux-rs/node runs it**: one proposer a
+window from Go's proposervm windower, one signature a height through a durable
+journal, the lowest live block that can still reach α. An imported chain —
+blocks read off an export, no certificates under them — is continued by the
+**anchor**: α validators sign the tip they imported, and build on it.
 
 ```
 $ curl -s -X POST -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
-    http://127.0.0.1:19850/v1/chain/C/rpc
+    http://127.0.0.1:19850/v1/chain/c/rpc
 {"id":1,"jsonrpc":"2.0","result":"0x7a69"}
 ```
 
 ## The network is a file, not a convention
 
-`noded` used to take `--index I --n N --base-port P` and DERIVE its validator set
-from those three numbers. That set was a private convention: it could only ever
-agree with copies of itself that had been told the same three numbers, and an
-operator had no way to describe one network to more than one implementation. The
-flags are gone. What replaces them is the file the Rust node already reads:
+A validator set derived from an index and a count is a private convention: it
+agrees only with copies of itself told the same numbers. The set is a file, the
+one the Rust node reads:
 
 ```
-noded --data DIR --publish                      # once per validator
-noded --committee FILE --peers a:p,b:p,... [--data DIR]
+luxd --data DIR --publish                      # once per validator
+luxd --committee FILE --peers a:p,b:p,... [--data DIR] [--produce MS]
+     [--mesh-host H] [--import-chain-data PATH]
 ```
 
 One line per validator, three hex fields, `#` starts a comment:
@@ -92,141 +90,195 @@ port, in flight there.
 `test/committee/elsewhere.txt` is those same four validators publishing for a
 different chain: the same names, and not one of them admitted here.
 
-Two validators still cannot decide anything, which has nothing to do with the
-file: `WaveConfig::feasible(2)` sizes the committee at `kMinBFTCommittee` = 4 and
-asks for `two_thirds_count(4)` = 3 confirming votes, which 2 reachable validators
-can never cast; and `cert.cpp` refuses a Quasar certificate outright below 4
-seats. Run two processes on a two-line committee and they publish, seat
-themselves, agree on the set root, form the mesh — and report `height 1 NOT
-CERTIFIED before deadline`. Four is the floor.
+Fewer than four validators certify nothing, which has nothing to do with the
+file: a Quasar certificate is refused outright below `kMinBFTCommittee` = 4
+seats (f = (n−1)/3 is 0 there), and `verify(Certificate)` calls that floor. A
+committee of one is what an archive runs as: it serves the chain, refuses
+transactions at the door, and — importing — stays gated.
 
-## Layer decomposition (decomplected — each layer is independently testable)
+## Layer decomposition (each layer independently testable)
 
 ```
-  rpc          Rpc / serve_eth   NEW  src/rpc.cpp, src/eth.cpp — HTTP JSON-RPC at
-                                       /v1/chain/<alias>/rpc. Knows JSON, no chain.
-  chain        evm::Chain        NEW  src/evm.cpp — the C-Chain: genesis, mempool,
-                                       execution through cevm, the real MPT root.
-                                       The ONLY unit that knows evmc/intx/StateDB.
-  export       import_chain_data NEW  src/import.cpp — the C-chain's EXTERNAL
-                                       format (RLP) read back: ids recomputed,
-                                       links walked, tx tries rebuilt. Knows the
-                                       Ethereum block, not consensus.
-  vm seam      VM / Block        NEW  include/lux/node/vm.hpp — what a chain is,
-                                       asked once. P, X, Q and Z plug in here.
-  engine       Engine            NEW  src/engine.cpp — execute → decide → accept,
-                                       for any VM. Owns the lock discipline.
-  node-host    Node2Host         NEW  src/node_host.cpp   — listen/accept/dial the
-                                       mesh; own one Party; drive submit/round/pump.
-  mesh         MeshVoteTransport  NEW  include/.../mesh_vote_transport.hpp (header-only)
-                                       VoteTransport over N peer fds; broadcast→all,
-                                       pump→drain all, one eviction rule. Holds a vote
-                                       SINK, not a Node — zero consensus knowledge.
-  reassembler  FrameReader        NEW  include/.../frame_reader.hpp (header-only)
-                                       the ONE place that knows non-blocking framing:
-                                       reassembles ZAP frames from recv(MSG_DONTWAIT),
-                                       bounded by the frame size its link carries.
-  codec/wire   encode/decode_vote REUSE consensus/.../zap/vote_codec.hpp
-               Writer/Reader/           zap-cpp-core/.../zap/wire.hpp
-               write_frame_locked
-  luxd peer    Peer               NEW  src/peer.cpp — the OTHER wire: one link to a
-                                       real luxd. TLS 1.3 (peer_tls), then the
-                                       strict-PQ handshake, then p2p + a vote.
-  pq handshake pq::run_initiator  NEW  src/pq_handshake.cpp — ML-KEM-768 session and
-                                       ML-DSA-65 identity, transport-agnostic; the
-                                       frame lambdas in peer.cpp are its one binding.
-  consensus    Node / Wave /      REUSE consensus (the gate, unmodified)
-               QuorumCertEngine
-  crypto       consensus::bls    REUSE consensus (consensus DST) + blst
-  evm          process_block /   REUSE cevm (lib/evm + lib/evm/state)
-               StateDB / MPT           the interpreter, the state, the real root
-  ecrecover    secp256k1_ecrecover REUSE lux-crypto (a tx's sender is RECOVERED)
+  run        run(spec)          src/run.cpp — flags, keys, committee, the plugin,
+                                 the RPC, the engine loop; what a brand's main calls.
+  engine     Engine             src/engine.cpp — the height rule and the anchor,
+                                 one pass at a time (step), never waiting on a peer.
+  windower   Windower           src/windower.cpp — Go's proposervm schedule, and
+                                 the header a proposer signs.
+  statement  Statement /        src/statement.cpp — the two 226-byte messages a
+             Certificate        validator signs (vote, anchor), the one rule a
+                                 certificate is held to.
+  journal    Journal            src/journal.cpp — one statement a height, on the
+                                 device before the key is used.
+  ledger     Ledger, gate, held src/ledger.cpp — the certificate every accepted
+                                 block was accepted on, the import gate, the block
+                                 last signed.
+  host       Host               include/lux/node/host.hpp — Mesh + transport, no
+                                 consensus state.
+  mesh       Mesh               src/mesh.cpp — bind, accept (own thread), dial,
+                                 sweep; the PQ greeting decides who a link is.
+  transport  MeshVoteTransport  per-link ZAP framing, typed handlers by seat,
+                                 one eviction rule.
+  vm seam    VM / Block         include/lux/node/vm.hpp — what a chain is.
+  plugin     plugin::Chain      src/plugin.cpp — a chain in another process, over ZAP.
+  rpc        Rpc                src/rpc.cpp — /v1/chain/<alias>/rpc, relayed to
+                                 the plugin's own server; transactions taken there
+                                 are relayed across the mesh.
+  consensus  REUSED             lux-cpp/consensus — the canonical vote message,
+                                 the BLS domain, the Quasar floors.
 ```
 
-## What a height is
+## The height rule
+
+Go's (luxfi/consensus engine/chain, B1: the α-of-K certificate is the only
+decider). No rounds and no locks: Go deleted its Tendermint braid in
+luxfi/consensus d13b4559, and it does not come back. Each clause below is ported
+from **lux-rs/node v0.2.2 (c1e764b)**, cited file:line, and keeps its semantics;
+the constants are the same numbers.
+
+| clause | C++ | Rust |
+|---|---|---|
+| **Windower**: one proposer per (height, slot), MT19937-64 seeded `chainSource ^ height ^ Reverse64(slot)`, stake-weighted heap over validators sorted by node id — Go's windower.go:153/271-317, held to windower_test.go's vectors | `Windower::expected` | proposer.rs:79-236 |
+| **Slot clock**: windows since this validator took the height up; a proposal from a slot past `slot+EARLY(1)` is taken only if its slot is within `SKEW(2)` windows of this validator's wall-clock slot (windows since the tip's timestamp); once it has run, the local clock moves up to it and never past the wall-clock slot | `slot_of`, `wall`, `proposed` | engine.rs:455, 723-726, 776-782, 789 |
+| **A proposal is signed and checked**: ML-DSA-65 over `chain ‖ parent ‖ SHA-256(set ‖ parent ‖ height ‖ slot ‖ 0x42 ‖ key ‖ block)`, context `lux-node-proposal-v1`, verified against the slot's expected proposer before a byte is parsed | `proposal_header`, `proposed` | proposer.rs:45-77, engine.rs:727-742, host.rs:280 |
+| **Build only in your window**, only while nothing is live, bound or built at the height, and not while f+1 verified votes name a block you lack (until the retry gives up — then build) | `offer` | engine.rs:923-972 |
+| **One signature per height**: every statement goes through the journal first; a standing one is said again, never replaced | `say`, `Journal` | journal.rs:174, host.rs:221-270, engine.rs:1013-1020 |
+| **Converged winner**: after a settle window (window/5, clamped 150 ms–2 s) with no new block, sign the lowest-id live block that can still reach α — its verified votes plus every validator not yet heard from | `vote` | engine.rs:977-1038 (the α filter :996-1002) |
+| **Sibling caps**: every signed block that executes is live, within `EACH` (16) a proposer and `SIBLINGS_MAX` (64) a height; past either, the highest id nothing holds goes (and is rejected), a block a vote names always has room | `room` | engine.rs:130-131, 801-817 |
+| **One settle deadline per height**: an arrival restarts the settle window only until `SETTLE_MAX` after the first | `stir` | engine.rs:884-889 |
+| **The retry**: re-send the bound vote, re-push your own block and the one you signed, doubling from 2×settle to 16 s; the first live sibling resets it, a new link or a sibling beside the one signed brings it forward (no attempt counted); 8 attempts, then ask | `retry`, `live`, `hurry` | engine.rs:526-530, 862-899, 1106-1141 |
+| **Decide** on α verified votes for a block held and executed; the certificate is over this node's own position; a vote that signed other roots under the id is let go | `decide` | engine.rs:1052-1096 |
+| **Catch-up**: f+1 validators heard at later heights, a certificate for a block not held, or an exhausted retry → ask every peer once a window; each record's certificate is checked against this committee, the block against it, before the chain executes it | `behind`, `answered`, `serve` | engine.rs:1148-1453, mesh.rs:499-560 |
+
+**Wire.** A statement is ZAP msg 62, `bytes(message 226) ‖ bytes(node 20) ‖
+bytes(sig 96)` — lux-rs/node's vote frame, so a Rust validator reads a C++ vote.
+A proposal is msg 59, `1 ‖ height ‖ slot ‖ sig(3309) ‖ block`; an ask is msg 57
+and its answer 57|0x80; a transaction is msg 58 — Rust's ids and layouts. The
+greeting is still the LP-10602 handshake with 4-byte framing, which Rust does not
+speak, so the two do not share a link yet.
+
+**Why it is safe.** Two certificates at one height need α signers each, so
+2α − n > f signers in both — an honest validator signing twice at one height,
+which the journal refuses. The winner rule, the retry and the anchor decide which
+statement an honest validator makes, never whether it makes two. A height whose
+honest validators are bound to different blocks, none able to reach α, stays
+uncertified: the price of one signature a height (Go: "unrecoverable",
+engine.go:1716). With one seat of five down, α = 4 is every seat that is up.
+
+**Hardening beyond the rule.** A statement is taken only on its signer's own
+link (nobody relays a vote), and a link whose statements fail their signature
+spends `JUNK_EACH` turns a settle window; an answer is taken only to the
+question this node asked that peer; a gated node asks for two records, not a
+batch.
+
+## The anchor — continuing an imported chain
+
+An export carries blocks and no certificates. A node that read one holds a tip
+no quorum spoke about (Go: proposervm's missing outer index, which "MUST NOT be
+treated as a caught-up validator until … rebuilt from certified peer state").
+The **import gate** says so: `<data>/uncertified`, written and synced BEFORE the
+plugin reads the export whenever `--import-chain-data` is given, read at every
+start. While it stands the node builds nothing and signs no block. It still
+executes, so it can accept what others certify.
+
+When every validator imports the same export, nobody can certify anything on
+it. The anchor is the way out, and it is ONE statement:
 
 ```
-  proposer = height mod n          the turn moves; no node is load-bearing
-    build()      execute the mempool through cevm, commit → REAL MPT root
-    submit(pos)  REGISTER the block locally .......... before publishing it
-    gossip       publish the block's bytes (ZAP kBlockMsgType)
-    round/pump   β-confirmation, then sign + broadcast the ACCEPT vote
-  followers
-    parse(bytes) execute the SAME transactions through THEIR OWN cevm
-    submit(pos)  their root, their signed message
-    round/pump   sign if their execution agrees
-  everyone
-    accept()     on a VERIFYING quorum cert: advance the tip and the
-                 decided-height frontier
+message (226 bytes, the canonical vote message's layout):
+  0   tag          18   "LUX/chain/anchor" 00 00
+  18  version       2   3 (kQuorumCertVersion), big-endian
+  20  role          1   1 (kQCFinality)
+  21  chain        32   the chain id every committee line is entitled on
+  53  height        8   T, the imported tip's height, big-endian
+  61  round         4   0
+  65  block        32   H, the imported tip's id
+  97  parent       32   zero
+  129 state root   32   zero
+  161 payload root 32   zero
+  193 set root     32   the committee's validator-set root (Go SetRoot)
+  225 accept        1   1
+signature: BLS12-381 min-pk, the consensus vote ciphersuite
+           (BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_), over the 226 bytes
 ```
 
-Register-before-publish is load-bearing and was learned the hard way: published
-first, every follower vote arrived naming a block the proposer had not yet
-submitted, the gate turned them away as `RejectedNoSuchBlock`, and a validator
-broadcasts its ACCEPT exactly once — so the proposer could not certify the block
-it had just made. `Node2Host` additionally BUFFERS votes for a block it has not
-registered yet and replays them on the next `submit`, bounded at
-`kMaxEarlyVotes`, because the same window exists between two followers.
+- **Domain separation** is the tag. A vote is the same layout under
+  `LUX/chain/vote/v2\0`; the tags differ at byte 10, so a signature over one is
+  never a signature over the other (statement_test signs an anchor on (799, H)
+  and checks it fails as a vote for block H at 799). A reader refuses an anchor
+  whose round, parent, state or payload axes are not zero, so a (chain, T, H,
+  set) has exactly one anchor message.
+- **One signature per height still holds.** The slot — chain at 21, height at
+  53, round at 61 — sits where a vote's does, so the anchor goes through the same
+  journal as a vote and takes height T's slot: a validator that already signed
+  anything at T cannot anchor there (it waits for a block certified on its tip),
+  and one that anchored T never signs a block at T.
+- **Who signs**: a gated validator, once, at its own tip (T, H). It is sent as a
+  statement (msg 62) and re-sent on the retry schedule — at once, then doubling
+  from 2×settle to 16 s — and at once when a peer joins.
+- **The certificate**: α = signer_floor(Quasar, n) distinct committee signatures
+  on the SAME message, aggregated — the one rule every certificate is held to
+  (`verify(Certificate)`: the committee's chain and set root, n ≥ 4, α signers,
+  stake past ⅔, one aggregate pairing). Anchor signatures on another (T, H) never
+  count toward it.
+- **What it does**: the certificate is written to `<data>/ledger` as the record
+  at height T (block H), synced; then the gate is removed and the removal
+  synced. The node is a validator from T+1.
+- **A validator that was not there** (down, or late) asks its peers from its tip
+  (T, count 2); the anchor record at T lifts its gate when it names its own tip,
+  and a certified T+1 on its tip does the same. A validator that imported a
+  different tip signs a different message, never reaches α, and is never lifted
+  by the others' records: correct, and safe.
+- **A restart** with the flag still set closes the gate again, and the engine
+  lifts it at once when the ledger already holds a certificate on the tip.
 
-Why a new `FrameReader` instead of `lux::zap::read_frame`: `read_frame` blocks
-and treats `EAGAIN` as fatal, so it cannot serve a single-threaded pump over N
-peers (a partial frame on one peer would stall the rest). `FrameReader`
-accumulates ready bytes and yields a frame only once complete — fragmentation is
-invisible above it. The fds stay **blocking** (writes never drop) while reads go
-through `MSG_DONTWAIT` (pump never blocks).
+For the Rust node: `Slot::read` accepts the anchor tag beside the vote tag (the
+journal is otherwise unchanged); `gate.rs`'s lift gains the anchor certificate
+as a way out; the ledger's first record may be an anchor. Nothing else moves.
 
-Why `MeshVoteTransport` carries a sink, not a `Node*`: it makes the transport
-pure sockets+framing+codec, with no consensus type in it. The host wires the sink
-to `Node::onVote`.
+## The mesh is not the quorum, and it is not formed once
 
-## The mesh is not the quorum
+`connect_mesh` reaches as many configured peers as it can within one deadline
+and returns how many; it never demands all of them. `run()` does not exit when a
+quorum is not yet reachable: it says so and goes on, and every other window
+`sweep` hands the transport the links the acceptor proved and dials each higher
+seat that holds none — so a validator that starts before its peers, or restarts,
+is met again (lux-rs/node host.rs sweep).
 
-`connect_mesh` reaches as many configured peers as it can within ONE deadline and
-returns how many. It does not demand all of them: the finality rule already says
-how many votes are enough, and "every peer must connect" is that rule said a
-second time and disagreeing with it — four validators holding 80 of 100 stake,
-over the ⅔ floor of 66, would all refuse to start because the fifth was down.
-`noded` reads the returned count against `two_thirds_stake_floor`.
+Per pair, the lower seat dials and the higher accepts. The acceptor runs on its
+own thread: it takes a connection, answers the LP-10602 greeting as the
+responder (each read bounded by `kPeerIoTimeoutMs`), and queues the proven seat;
+a stranger that connects and says nothing holds that thread for a timeout and
+never the engine. A second proven link from one seat REPLACES the first: a
+restarted validator proves its name afresh, and only the holder of that key can.
 
 The mesh listens on `--mesh-host` (default 127.0.0.1, like `--rpc-host`); a
 validator whose peers are other pods runs with `--mesh-host 0.0.0.0`. Its own
 `--peers` entry is the address the others dial — in a cluster a Service
 address the pod does not hold — so it is not what the pod binds. A host that is
-not an IPv4 address is refused before anything starts. `mesh_formation_test`
-[F] meets two 0.0.0.0-bound hosts over the machine's outward address, and shows
-a 127.0.0.1-bound one is not there.
+not an IPv4 address is refused before anything starts. A peer's address may be
+a name: it is resolved at every dial, so a pod that comes back at another
+address is found. `mesh_formation_test` [F] meets two 0.0.0.0-bound hosts over
+the machine's outward address, and shows a 127.0.0.1-bound one is not there.
 
-Per pair, the lower index dials and the higher index accepts → exactly one
-connection per pair. A dialer writes a 4-byte BE index handshake (ZAP `Writer`,
-the same encoder the frames use); the acceptor consumes it so the frame stream
-starts clean, and matches the claimed index against the slots it is waiting on —
-so one connection fills at most the slot it names. Accepts and dials are swept
-together each round, so an absent low-indexed peer starves nothing, and the retry
-policy lives in the sweep rather than inside the dial. A node with an absent
-validator waits out the mesh window before starting consensus: it cannot tell
-"not started yet" from "not coming".
+## What one hostile peer can do (and what it costs)
 
-## What one hostile socket can do (and what it costs)
-
-One eviction rule, in `MeshVoteTransport::dead`: a peer whose stream closed, whose
-framing was violated, or whose socket will not take a write is dropped. Frames
-already reassembled are delivered first, so a validator that votes and then hangs
-up still counts. Under it:
-
-- the reader states the frame size its link carries (a vote is 188 bytes; the cap
-  is one page) and a **rejected stream accepts no further bytes** — 8 MiB fed
-  after a rejection is 0 bytes held;
-- every peer socket carries a send and receive timeout, so a peer that stops
-  reading makes `broadcast` fail rather than hang;
-- `SIGPIPE` is disarmed once, in the one place node writes to a socket — a peer
-  that hangs up mid-broadcast used to kill the validator.
+One eviction rule, in `MeshVoteTransport::dead`: a stream that closed, a framing
+violation, a socket that will not take a write — the peer is dropped. The link's
+frame cap is 2 MiB of block plus a proposal's head (mesh.rs LINK_MAX), far under
+ZAP's 16 MiB, and only a validator that proved its seat reaches the reader.
+Per link and pass, at most 8 proposals and 256 statements are queued; a
+proposal's ML-DSA signature is checked before it is parsed; a frame refused once
+is remembered for the height; refused frames spend `JUNK_EACH` turns per
+(proposer, link) a settle window.
 
 ## Concurrency model
 
-Share-nothing. Each `Node` is touched by exactly one thread (its host driver).
-Mesh setup is the only concurrent phase; the consensus phase is single-threaded
-round-robin → deterministic. No application mutex except the per-peer write mutex
-required by `write_frame_locked` (uncontended here).
+The engine, the host, the transport and the plugin link are driven by ONE
+thread, `run()`'s loop. The acceptor thread shares only a locked queue of proven
+links. The RPC answers on its own threads and takes the chain lock (`guard`) for
+every call into the chain; the engine takes the same lock around each VM call and
+never while it waits.
 
 ## Build & test (links the reused checkouts, no vendoring)
 
@@ -250,11 +302,9 @@ conan install ../../luxcpp/cevm -pr ../../luxcpp/cevm/.github/conan/manylinux-re
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=../../luxcpp/cevm/build-node/build/Release/generators/conan_toolchain.cmake
 cmake --build build -j
-ctest --test-dir build --output-on-failure    # 54: node, consensus, and cevm's parity gates
-                                             # (evm-gethdiff skips without a geth to diff)
-./scripts/chain.sh                            # 5 processes serving one C-Chain over JSON-RPC
-./scripts/cluster.sh build/noded 19310 5      # 5 real PROCESSES, consensus only
-./scripts/cluster.sh build/noded 19310 5 4    # ...with validator 4 held down
+ctest --test-dir build -L node --output-on-failure   # this repository's 17
+./scripts/cluster.sh build/luxd build/bin/cevm       # 5 luxd PROCESSES over cevm, 12 transactions
+./scripts/cluster.sh build/luxd build/bin/cevm 2     # ...with validator 2 held down
 ```
 
 The four "missing house Conan recipes" recorded in lux-cpp/sdk's notes
@@ -291,19 +341,28 @@ takes α). Use a worktree pinned to the commit you mean and pass
   `luxfi/validators`, so the encoder is never compared to itself.
 - `frame_reader_test` — the reassembler alone: fragmentation, batching, the
   rejection latch, and the per-link frame cap.
-- `wire_vector_test` — the two formats node owns end to end, written as literal
-  bytes from the spec and compared against a socket the real transport wrote: the
-  4-byte BE index handshake and the 193-byte vote frame.
+- `wire_vector_test` — the formats node owns end to end, written as literal
+  bytes from the spec and compared against a socket the real transport wrote:
+  the 359-byte statement frame (msg 62, Rust's vote frame), the greeting's
+  framing, and the 193-byte consensus vote frame the transport still carries.
 - `mesh_transport_test` — what one hostile or dead socket can do: oversize
   announce + flood, an over-cap frame, vote-then-hang-up, an unwritable peer, and
   that eviction is per-peer.
 - `mesh_formation_test` — setup is bounded (an absent peer, and a stranger that
   connects and says nothing, each cost a deadline), partial (2 of 3 report 1), and
   slot-checked (claims {0,0,9} against slots {0,1} admit exactly one peer).
-- `node_cluster_test` — 5 hosts, ephemeral ports, full TCP mesh; asserts **no
-  node final before `pump()`**, then all 5 finalize with a verifying cert.
-- `node_liveness_test` — a DOWN validator (in every host's configured set, and
-  dialled) and a WEDGED-but-present one are both routed around on the wire.
+- `windower_test` — Go's proposer schedule, held to windower_test.go's vectors;
+  the header a proposer signs moves with every field it binds.
+- `statement_test` — the vote and the anchor, their domain separation, the
+  statement frame, the certificate rule (α of five, not three; not over another
+  message, set or chain), the journal both kinds go through (one slot, one
+  statement, a torn tail cut back, a second holder refused), the ledger, the
+  held proposal and the gate.
+- `engine_test` — one validator against a scripted peer, each refusal against a
+  control that shows it is the thing tested.
+- `live_test` — five validators on real sockets, each on its own thread: the
+  anchor on Zoo mainnet's tip and blocks on it; one seat down; one that imported
+  another tip; one that restarts and catches up.
 - `hostile_decode_test` — the two decoders that take bytes from strangers,
   `Tx::decode` (any `eth_sendRawTransaction` caller) and `Chain::parse` (any
   peer), fed bytes a stranger would send. Both had a way to end the process: an
@@ -327,8 +386,10 @@ takes α). Use a worktree pinned to the commit you mean and pass
   transcript shows up as two different keys rather than as a handshake that
   reports success.
 
-Verified clean under ThreadSanitizer and ASan+UBSan+Leak (run TSan under
-`setarch -R`; instrumentation covers node + consensus, never blst/bls).
+Clean under ThreadSanitizer (`-DNODE_SANITIZE=thread`, run under `setarch -R`;
+instrumentation covers node + consensus, never blst/bls): `statement`,
+`mesh_transport`, `mesh_formation`, `engine` and `live` report no race — the
+last with five engines, five acceptor threads and a restart in one process.
 
 ## Conformance to Go
 
@@ -499,60 +560,26 @@ Two things found while pinning the set root, both in trees this repo only reads:
   `ids.NodeIDScheme.DeriveMLDSA` in Go. There is one derivation in this tree and
   the committee calls it.
 
-## What is real, and what is not (measured, not asserted)
+## What runs, and what it was run against
 
-REAL — observed on a running 5-process cluster, not inferred:
+Measured on the build pod (2026-09-24), node at this branch, cevm main 244b7cb9,
+consensus 9928599:
 
 | | evidence |
 |---|---|
-| cevm builds and links into `noded` | `libevm.a` + `libevm-state.a`; `noded` links them |
-| the state root is a real Ethereum MPT root | `evm-state-root-parity` and `evm-block-root-parity` pass — byte-identical to luxfi/geth, and they now run in THIS repo's `ctest` |
-| genesis root is computed from the allocation | `0x29e1beb5aa…`, identical on every node, changes when the alloc changes |
-| blocks execute and finalize | 3507 heights over five processes, every node at the same height |
-| the certified root is the executed root | `VotePosition::execution_state_root` = what this node's cevm returned |
-| every node executes independently | all five report the same root for a height; the proposer only publishes bytes |
-| a transaction is real end to end | signed by `eth-account` (an independent implementation), sender RECOVERED here via secp256k1, balance moved exactly 1 ether, nonce 0→1, root changed `0x29e1beb5…` → `0xd117904d…` |
-| contract creation and storage work | a constructor's `SSTORE` is readable through `eth_getStorageAt` |
-| JSON-RPC is live | `eth_chainId` → `0x7a69`, `eth_blockNumber` advances off the real pipeline |
-| an RLP export imports and matches Go | the canonical `lux-testnet-96368.rlp`: 218 blocks, 219 senders recovered, every link walked, tip `0x722e2b39ae8973ab5d94b51451623352650b728e411ce0261c5efcd23aa381a5` and state root `0x4e19366fcc65d7ddd0b803bfbd7537f0c0ddc5d190c3ded40712408fcb137f35` — the same two values Go's import of the same bytes produced. `zoo-testnet` (84), `zoo-mainnet` (799) and `spc-mainnet` (10) import the same way |
-| …and at mainnet size | `lux-mainnet-96369.rlp`, 1.2 GB: 1,082,780 blocks and 1,229,884 senders recovered in ~4.5 min, peak RSS ~4.2 GB, tip `0x32dede1f…61f0`. The export is MAPPED, not read into a buffer — but every block it ingests is kept in memory, so an import is bounded by the same absence of persistence the rest of this node has |
-| an imported node refuses to validate | `import_test`: the engine proposes nothing, follows nothing, and never asks the chain to build, through either door; `luxd` prints NOT A CAUGHT-UP VALIDATOR and parks |
-| both doors are one reader | on a live `luxd`, `--import-chain-data` reads the canonical export to tip `0x722e2b39…81a5`, and `admin_importChain` given the same file on the same node answers `{"blocks":0,"skipped":218}` at the same tip — resume, across the two doors, off one head |
+| Go's proposer schedule | `windower_test`: height 1 slots 0..23, 720, 721 and heights 1/2 slot 0 are windower_test.go's answers |
+| five validators continue an imported chain | `live_test` [1]: five seats import Zoo mainnet's tip (799, `0xd6f92941…f72b8`), all five anchor it, all five accept the same blocks 800..806 |
+| one seat down | `live_test` [2]: four of five carry the chain to 803; heights 800 and 802, whose first window is the missing seat's, are built in a later window; the seat starts, lifts its gate on the anchor its peers hold, catches up and goes on |
+| a seat that imported another tip | `live_test` [3]: the other four anchor and build to 805; it anchors nothing, decides nothing, stays gated at its own tip, and its journal holds one statement — its own anchor |
+| a seat restarts | `live_test` [4]: its journal reopens, its peers meet it again, it takes 804..808 on certificates and goes on to 811 with the others |
+| what one validator refuses | `engine_test`: a proposal signed for another's window is never parsed; a refused block is never signed; a gated node builds nothing in its own window and signs only its anchor; a chain that refuses to build does not stop it — each against a control |
+| processes, the cevm plugin, Zoo mainnet's export | zooai/node `test/live.sh`: five `zood` processes import `zoo-mainnet-200200.rlp` and every one anchors 799 at `0xd6f92941…f72b8`; with seat 3 down four anchor, and seat 3 started later anchors on the ledger answer; a seat that imported the export cut at 798 anchors nothing and stays at 798 |
+| processes, the cevm plugin, transactions | `scripts/cluster.sh`: five `luxd` on the local chain, twelve transactions relayed across the mesh, every validator at height 12 with the same block hash at every height; with seat 2 held down, the same with four |
 
-| precompiles work from contract code | SHA-256, RIPEMD-160 and IDENTITY match Python's hashlib byte-for-byte, called from deployed bytecode on the live chain |
-| DELEGATECALL delegates | a proxy's storage takes the write; the implementation's own storage is untouched |
-
-NOT REAL YET — named, not hidden:
-
-- **No rollback of a speculative execution.** cevm's `commit()` clears the
-  journal, so a block cannot be reverted once its root is computed. A height that
-  fails to certify leaves the state ahead of the last accepted block, and `noded`
-  STOPS rather than build on it. Fail-secure, and the next thing to close.
-- **An import does not derive state.** The blocks and the tip are real and
-  checked; the EVM state behind them is not, because an export carries no genesis
-  allocation to execute from. `eth_getBalance` after an import answers from the
-  configured genesis, not from the imported chain — which is the second reason
-  such a node must not validate, and why it parks instead.
-- **No recovery from an import.** Go rebuilds the missing outer index from
-  certified peer state (`enterOuterBackfill`); this node refuses and stops there.
-- **No persistence.** State and blocks are in memory; a restart is a new chain.
-  `HostConfig::accepted` exists to be seeded from a durable store, and there is
-  no durable store.
-- **One resident state, so no historical reads.** A `blockNumber` parameter is
-  accepted and the tip is answered; the RPC does not reconstruct a past state.
-- **`eth_call`, receipts, logs and a fee market are absent**, not stubbed. There
-  is no `eth_getTransactionReceipt` returning a fabricated receipt.
-- **P, X, Q and Z are not here.** The `VM` seam is what they plug into; only C is
-  implemented.
-- **The C-Chain is IN-PROCESS, not a plugin.** luxd loads its EVM as a separate
-  process over ZAP (`vms/rpcchainvm/zap`, MsgBuildBlock=9 … MsgBlockReject=30).
-  This node links cevm directly. The `VM` interface is the seam a ZAP client
-  would implement, so the split is a transport change rather than a rewrite.
-- **PQ reaches the luxd peer path and nothing else.** `lux-join` now runs the
-  ML-KEM-768 + ML-DSA-65 handshake against a real luxd (below). Block signing
-  is still classical blst, and node's OWN internal mesh handshake is still 4
-  plaintext bytes — two different wires, and only the first is post-quantum.
-- **The internal mesh handshake is 4 plaintext bytes** (see below).
+Building 800 on Zoo mainnet's own export over cevm needs a transaction from a
+funded Zoo account, and there is no key to sign one with here: the process-level
+proof of building is the local chain's, and the proof of building on an import
+is `live_test`'s.
 
 ## The bug that was here, and why no gate saw it
 
@@ -582,147 +609,27 @@ passing.
 Go leaves the vote's execution axes EMPTY: `proposervm`'s
 `ExecutionStateRoot()` returns `ids.Empty`, so a Go validator certifies the root
 only indirectly, through a block hash that happens to commit to it. This node
-BINDS the axis. What is gained is that divergent execution cannot hide. What it
+BINDS the axis when it executes in process (`Binding::Executed`); a chain in a
+plugin cannot hand it the root, so `run()` signs `Transport`, as Go does. What is gained is that divergent execution cannot hide. What it
 costs is interop: a signed message that binds the root is not the message Go
 signs for the same block, so a C++ and a Go validator cannot form one quorum
 until Go binds it too. Stated here because it is a protocol difference, not an
 implementation detail.
 
-## Reading a chain back (two doors, one reader)
+## Not here yet
 
-The C-chain speaks two encodings. **ZAP** is the serialization everything in this
-stack uses — votes, blocks on the wire, the frame. **RLP** is what the C-chain
-hands to Ethereum, and a chain's history leaves it as an *export*: a bare
-concatenation of RLP-encoded blocks with no envelope, no index and no length
-prefix. `luxd --import-chain-data PATH` reads one. The flag is spelled Go's way
-because it is the same flag: Go passes it into the C-Chain's config and the VM
-reads the export at startup, before the chain serves anything, and a second run
-of an unchanged flag is a no-op rather than a failure. One runbook, three
-implementations.
-
-A node is asked to read an export in **two** ways and there is **one** reader.
-`--import-chain-data PATH` at startup and the `admin_importChain` RPC while it
-runs are both calls to `import_chain_data`; `serve_admin` (`src/eth.cpp`) is nine
-lines and `noded`'s flag is shorter, and neither decodes anything. Go has that
-exact shape — `admin_api.go:84` and `vm.go:628` both call
-`importBlocksFromFile` — and it is worth keeping because the alternative is the
-usual one: the flag grows a reader, the RPC grows another, and a single binary
-ends up with two answers to what a block is.
-
-```
-$ curl -s -X POST -H 'content-type: application/json' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"admin_importChain",
-             "params":["…/lux-testnet-96368.rlp"]}' \
-    http://127.0.0.1:41898/v1/chain/C/rpc
-{"blocks":218,"skipped":0,"transactions":219,"heightBefore":"0x0",
- "heightAfter":"0xda","frontier":"0x0",
- "tip":"0x722e2b39ae…81a5","stateRoot":"0x4e19366f…7f35"}
-```
-
-`frontier` rides along in the answer, so a caller polling the door that filled
-the chain is told in the same breath that the node has decided none of it.
-
-**The lock and the checkpoint.** `Rpc` holds THE chain lock for the whole of
-every method call, which is what Go spells `vmLock.Lock()` at the top of
-`ImportChain` — a read that arrives mid-height waits for it. Every 4096 blocks
-(Go's `defaultCommitInterval`) the reader stops and tells its door where it has
-got to. Go commits the state trie there and moves the accepted-block pointer in
-the same step "so there's no crash window where state is persisted but
-acceptedBlockDB is stale"; here the pointer is moved by `ingest`, and the reader
-READS IT BACK and refuses to go on unless it names the block just ingested — so
-a checkpoint can only ever report a height the chain already holds. Resume is
-the same fact from the other side: the head on entry is where the last run of
-*either* door stopped, the file is re-walked from the front with every check
-re-run, and only blocks above the head are ingested.
-
-**What is proven, and what is only carried.** Every hash compared here is one
-this node computed: a block's id is `keccak(rlp(header))` over the header's own
-bytes; block N's parentHash must equal the id computed for block N−1, walked over
-every block rather than sampled; the body's transactions rebuild the header's
-`transactionsRoot` as a Merkle-Patricia trie; the uncle list hashes to
-`ommersHash`; and every transaction is decoded and its sender RECOVERED with
-secp256k1 — which also refuses another chain's export, since a transaction binds
-its chain id.
-
-The `stateRoot` is the one thing NOT proven, and naming it is the point. An
-export carries blocks, not state: deriving these roots means executing every
-transaction from the genesis ALLOCATION, which an export does not contain (the
-canonical lux-testnet export's genesis alloc is not in `lux/state`). So the roots
-are read from the headers as claims, and this node ends up knowing a tip whose
-state it did not compute.
-
-### And therefore it is not a validator
-
-Reading an export moves the tip and produces **no certificate under it**. Go
-names the same state in `vms/proposervm/vm.go` — an inner chain restored without
-its outer index — and says what has to follow: such a chain "will NOT build
-blocks and MUST NOT be treated as a caught-up validator until the outer index is
-rebuilt from certified peer state." A node that imports and then proposes signs
-an ancestry it never verified, which is worse than one that cannot import at all.
-
-The rule is one predicate in one place. `VM::frontier()` is a VALUE — the highest
-height this node itself decided — and `Engine::may_sign()` compares it to the
-tip. It is asked at the top of `settle()`, the single door every signed message
-passes through, and again in front of `build()`/`parse()`, because building is
-executing and a refusal behind the execution would already have run a block
-against state this node never derived. `evm::Chain::ingest` moves the tip and
-deliberately does not touch the frontier; `BlockImpl::accept` — reached only on a
-verifying quorum certificate — is the only thing that does.
-
-`import_test` drives the engine over an imported chain and asserts that the chain
-was never even **asked** to build, with the un-imported chain as the control —
-and does it again over a chain filled through the RPC door, because the refusal
-is a property of the chain and not of the door that filled it.
-`noded` says the same thing out loud and parks: RPC keeps answering, so the
-imported history is readable and the state is visible rather than silent.
-
-```
-node 0: import tip 0x722e2b39ae…81a5 height 218 time 1746815479
-node 0: import state root 0x4e19366f…7f35 (carried from the header — an export holds blocks, not state)
-node 0: import 218 blocks ingested, 0 already held, 219 transactions recovered
-node 0: NOT A CAUGHT-UP VALIDATOR — tip is height 218, this node's own decisions stop at height 0
-```
-
-Recovery — rebuilding those heights from certified peer state — is **not here**.
-Go has `enterOuterBackfill`; this node has the refusal and no way out of it but a
-fresh start. Said plainly rather than hidden behind a tip that looks healthy.
-
-## Scope (honest)
-
-Does: real listen/accept/connect mesh, bounded and partial; ZAP framing with
-non-blocking reassembly and per-peer eviction; real BLS quorum-cert finality
-across threads and processes; real EVM execution with a geth-identical MPT root;
-transaction and block gossip; live JSON-RPC.
-
-Does NOT yet, in the order it matters:
-
-- **Authentication on node's OWN mesh.** The index handshake is 4 plaintext
-  bytes. A stranger that connects first takes a validator's inbound slot, which
-  is a liveness DoS even though safety holds (votes self-identify by pubkey and
-  the gate verifies BLS + set membership). This is the internal mesh, not the
-  luxd peer path: that one is authenticated, by the ML-DSA-65 handshake above.
-  Go ZAP has an X25519 + ML-KEM-768 hybrid handshake with AEAD; node uses only
-  the frame layer — no reqID, no multiplexing, no ZAP RPC.
-- **A PQ responder.** `pq::run_initiator` has no counterpart, because nothing
-  in this node is dialled by a luxd. Adding one before something accepts a
-  connection would be another file that compiles and is never called, which is
-  the state this whole section is about.
-- **Sampling.** `Node2Host::round` drives the wave from the committee this node
-  can *reach* — a connectivity measure, not a poll of anyone's opinion. It is one
-  expression, in one place, and photon sampling replaces exactly it.
-- **Reconnection.** The peer set is one-shot: no discovery, no backoff, no
-  re-dial after an eviction. An evicted peer is gone for the run.
-- **Persistence.** `noded` now runs many heights (3507 observed), but the
-  frontier, the state and the blocks are all in memory: a restart is a new chain.
-  `Party::mark_finalized_through` is called (via `Node2Host::accept`) when a
-  height certifies, and `HostConfig::accepted` exists to re-seed it on boot —
-  from a durable store that does not exist yet.
-- **The ZAP message set.** The link carries three types: votes (`0x11`),
-  transactions (`0x12`) and proposed blocks (`0x13`). Go's p2p wire has 26
-  (`Get`/`Put`/`PushQuery`/`PullQuery`/`Chits`, the bootstrap and state-sync
-  families, the handshake). Note also that Go's p2p framing counts the type byte
-  in its length and caps at 2 MiB, whereas the plugin-RPC framing this node uses
-  excludes it and caps at 16 MiB — they are two different wires with one name.
+- **Rust wire.** Statements, proposals, asks and transactions are Rust's ids and
+  layouts; the greeting is not, so a C++ and a Rust validator do not share a link.
+- **A certificate in Go's codec.** The ledger keeps `message ‖ signers ‖
+  aggregate`; Go's `cert_codec.go` shape is what a mixed network will need.
+- **Pruning.** The journal keeps every statement and reads them all at start
+  (226 bytes a height); entries below the accepted tip can go.
+- **A split height.** A height whose honest signers are bound to different
+  blocks, none able to reach α, stays uncertified (Go: "unrecoverable"; left to
+  Nova, which this node does not run). With one seat of five down, α is every
+  seat that is up, so one late sibling at the wrong moment is enough.
+- **Sampling.** Every validator is polled; there is no photon sampling.
+- **P, X, Q and Z.** The `VM` seam is what they plug into; only the EVM runs.
 
 ## This file
 
@@ -746,10 +653,10 @@ on Linux: the KEM round-trips to an agreeing shared secret, ML-DSA-65 signs at
 Nothing needs to be vendored from `luxcpp/pqclean` or `luxcpp/lattice` for
 either.
 
-One place now USES them, and it is the one that faces a real network. The rest
-is unchanged: node's own mesh handshake is still four plaintext bytes, its
-internal NodeID is still an index, and blocks are still signed with classical
-BLS.
+Three places USE them: the luxd peer path (below), node's own mesh greeting
+(LP-10602, "The link two validators run before a frame"), and the proposal a
+window's proposer signs (ML-DSA-65, "The height rule"). Votes, anchors and
+certificates are classical BLS.
 
 ## The strict-PQ peer handshake, and the two ways it was wrong
 
@@ -824,11 +731,13 @@ mutually exclusive — validators that disagree about it do not form a quorum,
 their signatures simply fail against each other's message.
 
 - `Executed` binds `execution_state_root` to what this node's EVM produced, so a
-  divergent EVM stalls a height instead of hiding. `noded` uses this.
+  divergent EVM stalls a height instead of hiding. A chain linked in process
+  can take this; the tests' chains do.
 - `Transport` leaves the execution axes empty, which is what luxd signs: Go's
   proposervm returns `ids.Empty`, and a Go voter does not execute the block it
   votes on. A C++ node that binds the root inside a live Go network produces a
-  message Go DROPS rather than disputes.
+  message Go DROPS rather than disputes. `run()` signs this: its chain is a
+  plugin, whose verify is what refuses a block that does not execute.
 
 Joining luxd takes `Transport` until Go binds the axis too, at which point this
 collapses back to one answer.

@@ -206,6 +206,10 @@ private:
         std::optional<Id>              built;
         std::optional<Clock::time_point> empty, stalled, hurried;
         bool                           push = false;
+        // The block and signature count a certificate was last tried with and
+        // did not form: tried again only when either moves, so a set that
+        // cannot certify (below the Quasar floor) costs no pairing a pass.
+        std::optional<std::pair<Id, std::size_t>> tried;
         Clock::time_point              retry;
         Duration                       backoff{};
         std::uint32_t                  attempts = 0;
@@ -222,9 +226,11 @@ private:
         Message                    message{};
         std::map<Node, Signature>  sigs;
         bool                       signed_ = false;
-        bool                       refused = false;  // another statement stands at T
+        bool                       refused = false;  // another statement stands at T, or T is behind the ledger
         Clock::time_point          retry;
         Duration                   backoff{};
+        std::optional<Clock::time_point> stalled;    // the journal did not take it
+        std::size_t                tried = 0;        // signatures a certificate was last tried with
     };
     struct Asked {
         std::uint32_t     left = kAskBurst;
@@ -249,7 +255,6 @@ private:
     void     stir(Instance& at) const;
     void     hurry(Instance& at) const;
     std::size_t named(const Instance& at, const Id& id) const;
-    void     voted(Instance& at, const Statement& s);
     void     offer(Instance& at, Step& out);
     void     vote(Instance& at, Step& out);
     std::optional<std::pair<Id, std::size_t>> leading(const Instance& at) const;
@@ -266,7 +271,7 @@ private:
     bool     lift(Step& out);
 
     // Catch-up.
-    void     ask(std::uint64_t from);
+    void     ask(std::uint64_t from, std::uint32_t count);
     void     serve(std::uint32_t seat, const std::vector<std::uint8_t>& question);
     void     answered(std::uint32_t seat, const std::vector<std::uint8_t>& answer, Step& out);
     bool     accept_certified(const std::shared_ptr<Block>& b, const Certificate& cert, Step& out);
@@ -289,6 +294,12 @@ private:
     std::size_t                          joined_ = 0;
     std::optional<Clock::time_point>     asked_;
     std::map<std::uint32_t, Asked>       askers_;
+    // The question each peer has not answered yet: an answer is taken only to
+    // a question this node asked that peer (mesh.rs NONE).
+    std::map<std::uint32_t, std::uint64_t> awaiting_;
+    // Statements at this height whose signature did not check, a link's turns
+    // a settle window: past them, that link's statements are not looked at.
+    std::map<Node, std::pair<std::uint32_t, Clock::time_point>> forged_;
 
     // What the mesh handed over since the last pass, by the seat it came in on.
     std::map<std::uint32_t, std::deque<Proposal>>  proposals_in_;
