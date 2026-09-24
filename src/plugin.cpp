@@ -397,6 +397,23 @@ std::string Chain::version() const {
     return v;
 }
 
+std::vector<Handler> Chain::handlers() const {
+    lux::zap::Writer w;
+    const auto       payload = st_->call(kCreateHandlers, w, "create handlers");
+    lux::zap::Reader r(payload.data(), payload.size());
+    std::uint32_t    n = 0;
+    if (!r.read_u32(n)) throw std::runtime_error("plugin: create handlers: no count");
+    std::vector<Handler> out;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        Handler h;
+        if (!r.read_string(h.prefix) || !r.read_string(h.addr))
+            throw std::runtime_error("plugin: create handlers: handler " + std::to_string(i) +
+                                     " is not a prefix and an address");
+        out.push_back(std::move(h));
+    }
+    return out;
+}
+
 bool Chain::healthy() const {
     lux::zap::Writer w;
     try {
@@ -408,8 +425,12 @@ bool Chain::healthy() const {
 }
 
 bool Remote::verify() {
+    // Go's BlockVerifyRequest: the block's BYTES and whether a P-chain height
+    // rides with them (luxfi/api zap). Accept and reject name the block by id;
+    // verify hands it over whole, because verifying is re-reading.
     lux::zap::Writer w;
-    w.write_bytes(id_.data(), id_.size());
+    w.write_bytes(bytes_.data(), bytes_.size());
+    w.write_bool(false);
     try {
         (void)on_.st_->call(kBlockVerify, w, "verify");
         return true;

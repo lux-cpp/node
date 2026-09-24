@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Lux Industries, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause-Eco
 //
-// plugin_test.cpp — a REAL Go VM plugin, driven from this host.
+// plugin_test.cpp — a REAL VM plugin, driven from this host.
 //
 // A test against a server this repo also wrote proves the two halves agree with
 // each other. So this one takes a plugin BINARY — one of the programs the Go
@@ -113,6 +113,18 @@ int main(int argc, char** argv) {
         check(true, "MsgSetState carries it from Bootstrapping to Ready");
     } catch (const std::exception& e) {
         check(false, std::string("MsgSetState: ") + e.what());
+    }
+
+    // ── where it serves its RPC ─────────────────────────────────────────────
+    // The node relays the chain's JSON-RPC to the address the plugin names here,
+    // so a plugin that names none is a chain nobody can call.
+    try {
+        bool rpc = false;
+        for (const auto& h : chain->handlers())
+            if (h.prefix == "/rpc" && !h.addr.empty()) rpc = true;
+        check(rpc, "MsgCreateHandlers names the address its /rpc is served on");
+    } catch (const std::exception& e) {
+        check(false, std::string("MsgCreateHandlers: ") + e.what());
     }
 
     // ── the tip it came up with ─────────────────────────────────────────────

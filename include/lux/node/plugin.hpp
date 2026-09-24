@@ -58,6 +58,7 @@ namespace lux::node::plugin {
 enum Msg : std::uint8_t {
     kInitialize   = 1,
     kSetState     = 2,
+    kCreateHandlers = 4,
     kBuildBlock   = 9,
     kParseBlock   = 10,
     kGetBlock     = 11,
@@ -105,6 +106,14 @@ struct Start {
     std::string               alias = "C";    // the path segment RPC reaches it under
 };
 
+// One HTTP surface a chain serves. A request under `prefix` of the chain's path
+// goes to `addr`, the host:port the plugin itself listens on. Go reads the same
+// two strings off the same message (luxfi/api zap HTTPHandler).
+struct Handler {
+    std::string prefix;
+    std::string addr;
+};
+
 // One block, as the far side described it: the block's own operations are calls
 // back over the link, so it holds its chain rather than any state of its own.
 class Remote;
@@ -138,6 +147,9 @@ public:
     // while its history is being fetched and Ready when it may build and vote,
     // and it is the node that knows which.
     void enter(Phase p);
+
+    // The HTTP surfaces the chain serves, in the order it lists them.
+    [[nodiscard]] std::vector<Handler> handlers() const;
 
     // What the plugin answers about itself, and whether it says it is well.
     [[nodiscard]] std::string version() const;
