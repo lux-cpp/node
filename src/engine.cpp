@@ -331,8 +331,13 @@ void Engine::arrive(Instance& at, const Node& link, Arrival a, Step& out) {
         else if (p.height == at.height + 1) later_from(link, std::move(a));
         return;
     }
-    const Statement& s     = *a.statement;
-    const auto       claim = read(s.message);
+    const Statement& s = *a.statement;
+    // A validator says its statements itself: the mesh is full, and nobody
+    // relays a vote. One that names another signer than the link it came in on
+    // is not looked at, so a link can make this node check its own signatures
+    // and nobody else's.
+    if (s.node != link) return;
+    const auto claim = read(s.message);
     if (!claim) return;
     if (claim->kind == Kind::Anchor) {
         anchor_statement(s, *claim, out);
@@ -340,7 +345,15 @@ void Engine::arrive(Instance& at, const Node& link, Arrival a, Step& out) {
     }
     const std::uint64_t h = claim->slot.height;
     if (h == at.height) {
-        voted(at, s);
+        if (at.votes.count(s.node)) return;
+        if (const auto f = forged_.find(link);
+            f != forged_.end() && f->second.first == 0 && Clock::now() - f->second.second < settle())
+            return;
+        if (!signed_vote(s, *claim)) {
+            (void)spend(forged_, link, kJunkEach, settle());
+            return;
+        }
+        at.votes.emplace(s.node, s);
         return;
     }
     if (h < at.height) return;
@@ -555,14 +568,6 @@ std::size_t Engine::named(const Instance& at, const Id& id) const {
     return n;
 }
 
-// The first vote from each validator at this height, checked. engine.rs:907.
-void Engine::voted(Instance& at, const Statement& s) {
-    if (at.votes.count(s.node)) return;
-    const auto claim = read(s.message);
-    if (!claim || !signed_vote(s, *claim)) return;
-    at.votes.emplace(s.node, s);
-}
-
 // Build and propose, when this validator's window is open and nothing is live
 // or signed at the height. So is a block f+1 validators signed that this one
 // lacks: one of them is honest and pushes it again — it is waited for, not
@@ -689,8 +694,12 @@ bool Engine::decide(Instance& at, Step& out) {
         else wrong.push_back(who);
     }
     for (const auto& w : wrong) at.votes.erase(w);
+    if (at.tried && at.tried->first == l->first && at.tried->second == sigs.size()) return false;
     const auto cert = certify(m, sigs, cfg_.committee);
-    if (!cert) return false;
+    if (!cert) {
+        at.tried = std::make_pair(l->first, sigs.size());
+        return false;
+    }
     if (!accept_certified(sib.block, *cert, out)) {
         at.stalled = Clock::now();
         return false;
@@ -750,7 +759,11 @@ void Engine::behind(std::uint64_t height, bool lost, bool settled, Step&) {
     if (!lost && !(settled && ahead > faults) && !gated_) return;
     if (asked_ && Clock::now() - *asked_ < cfg_.window) return;
     asked_ = Clock::now();
-    ask(gated_ ? height - 1 : height);
+    // A gated node needs two records at most — the anchor on its tip, or the
+    // block certified on it — and asks for no more, so one that imported a tip
+    // nobody else holds costs its peers two reads a window, not a batch.
+    if (gated_) ask(height - 1, 2);
+    else ask(height, kBatchMax);
 }
 
 void Engine::broadcast(const Statement& s) { host_.gossip(kStatementMsgType, encode(s)); }
@@ -817,7 +830,7 @@ void Engine::anchor_statement(const Statement& s, const Claim& c, Step&) {
 void Engine::anchor_step(Step& out) {
     if (!gated_ || !anchor_) return;
     Anchor& a = *anchor_;
-    if (!a.signed_ && !a.refused) {
+    if (!a.signed_ && !a.refused && (!a.stalled || Clock::now() - *a.stalled >= settle())) {
         switch (journal_.admit(a.message)) {
             case Journal::Admit::Ok: {
                 const Statement s = sign(a.message, cfg_.self, cfg_.sk);
@@ -833,6 +846,7 @@ void Engine::anchor_step(Step& out) {
                 break;
             case Journal::Admit::NotDurable:
             case Journal::Admit::NotAStatement:
+                a.stalled = Clock::now();
                 out.events.push_back(refused("anchoring: the journal did not take the statement"));
                 break;
         }
@@ -842,10 +856,22 @@ void Engine::anchor_step(Step& out) {
         a.retry   = Clock::now() + a.backoff;
         a.backoff = std::min<Duration>(a.backoff * 2, kRetryMax);
     }
-    if (a.sigs.size() < quorum()) return;
+    if (a.refused || a.sigs.size() < quorum() || a.sigs.size() == a.tried) return;
+    if (a.stalled && Clock::now() - *a.stalled < settle()) return;
+    a.tried         = a.sigs.size();
     const auto cert = certify(a.message, a.sigs, cfg_.committee);
     if (!cert) return;
+    if (const auto last = ledger_.last(); last && last->first >= a.height) {
+        // A ledger that already certifies heights at or past the tip is not a
+        // ledger of this chain as it stands; the anchor is not written over it.
+        a.refused = true;
+        out.events.push_back(refused("anchoring: this node's ledger already runs to height " +
+                                     std::to_string(last->first) + ", past the imported tip"));
+        return;
+    }
     if (!ledger_.append(Record{a.height, a.tip, *cert})) {
+        a.stalled = Clock::now();
+        a.tried   = 0;  // tried again once the stall passes
         out.events.push_back(refused("anchoring: the certificate did not reach the device"));
         return;
     }
@@ -873,11 +899,12 @@ bool Engine::lift(Step& out) {
 
 // ── catch-up ──────────────────────────────────────────────────────────────────
 
-void Engine::ask(std::uint64_t from) {
+void Engine::ask(std::uint64_t from, std::uint32_t count) {
     std::vector<std::uint8_t> q;
     put_be(q, from, 8);
-    put_be(q, kBatchMax, 4);
-    host_.gossip(kAskMsgType, q);
+    put_be(q, count, 4);
+    for (const auto seat : host_.members())
+        if (host_.send(seat, kAskMsgType, q)) awaiting_[seat] = from;
 }
 
 // Answer a peer's question from the ledger: heights in order until one is
@@ -946,6 +973,11 @@ void Engine::answered(std::uint32_t seat, const std::vector<std::uint8_t>& answe
     std::uint64_t    from = 0, reported = 0;
     std::uint32_t    n    = 0;
     if (!r.read_u64(from) || !r.read_u64(reported) || !r.read_u32(n) || n > kBatchMax) return;
+    // Only an answer to the question this node asked that peer, once: anything
+    // else is a peer choosing what this node spends its pairings on.
+    const auto awaited = awaiting_.find(seat);
+    if (awaited == awaiting_.end() || awaited->second != from) return;
+    awaiting_.erase(awaited);
     std::vector<std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>> records;
     for (std::uint32_t i = 0; i < n; ++i) {
         std::vector<std::uint8_t> block, cert;
