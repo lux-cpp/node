@@ -362,6 +362,36 @@ int main() {
             ::close(lfd);
         }
 
+        // A method this node refuses is answered here, alone or inside a batch,
+        // and the rest of a batch still reaches the chain.
+        {
+            Rpc shut{0};
+            for (const auto& alias : zoo.served)
+                shut.relay(alias, "127.0.0.1:" + std::to_string(far.port()), "/");
+            shut.refuse("eth_sendRawTransaction", "this node accepts no transactions");
+            shut.network(zoo);
+            shut.start();
+            const Reply one = call(shut.port(), "POST", "/v1/chain/zoo/rpc",
+                                   R"({"jsonrpc":"2.0","id":7,"method":"eth_sendRawTransaction","params":["0x00"]})");
+            const auto  j   = Rpc::Json::parse(one.body.empty() ? "{}" : one.body);
+            check(one.status == 200 && j.value("id", 0) == 7 && j.contains("error") &&
+                      j["error"].value("message", "") == "this node accepts no transactions",
+                  "a refused method is answered with its reason, under its own id");
+            const Reply both = call(shut.port(), "POST", "/v1/chain/zoo/rpc",
+                                    R"([{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]},)"
+                                    R"({"jsonrpc":"2.0","id":2,"method":"eth_sendRawTransaction","params":["0x00"]}])");
+            const auto  b    = Rpc::Json::parse(both.body.empty() ? "[]" : both.body);
+            bool answered = false, refused = false;
+            for (const auto& r : b) {
+                if (r.value("id", 0) == 1 && r.value("result", "") == far.answer) answered = true;
+                if (r.value("id", 0) == 2 && r.contains("error")) refused = true;
+            }
+            check(both.status == 200 && b.is_array() && b.size() == 2 && answered && refused,
+                  "a batch keeps the chain's answer to its other call beside the refusal");
+            check(far.served(call(shut.port(), "POST", "/v1/chain/zoo/rpc", kChainId)),
+                  "and a method it does not refuse still reaches the chain");
+        }
+
         // A server that is not there is a gateway failure, said as one — not a
         // 200 carrying an error a client has to parse to learn the chain is down.
         Rpc gone{0};

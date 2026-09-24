@@ -28,6 +28,7 @@
 // plugin to parse and verify; the quorum certificate then decides the block
 // and each plugin is told to accept it.
 
+#include "lux/consensus/threshold.hpp"
 #include "lux/node/committee.hpp"
 #include "lux/node/engine.hpp"
 #include "lux/node/network.hpp"
@@ -406,6 +407,18 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
     // The chain's JSON-RPC is its plugin's, relayed under every alias the chain
     // answers to. The plugin names the prefix it serves it under.
     rpc.network(net);
+    // A committee below the Quasar floor certifies nothing: a transaction sent
+    // here would be built, voted on by this node alone and given back at every
+    // height, with its sender told it was taken. It is refused at the door.
+    if (committee.size() < kMinBFTCommittee) {
+        const std::string why = "this node certifies no blocks (its committee has " +
+                                std::to_string(committee.size()) + " validator" +
+                                (committee.size() == 1 ? "" : "s") + ", and a block needs " +
+                                std::to_string(kMinBFTCommittee) +
+                                "), so it accepts no transactions";
+        rpc.refuse("eth_sendRawTransaction", why);
+        rpc.refuse("eth_sendTransaction", why);
+    }
     for (const auto& h : handlers)
         if (h.prefix == "/rpc")
             for (const auto& alias : net.served) rpc.relay(alias, h.addr, h.prefix);

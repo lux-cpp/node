@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <optional>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -344,6 +345,10 @@ void Rpc::relay(std::string alias, std::string addr, std::string path) {
     relays_[lower(std::move(alias))] = {std::move(addr), std::move(path)};
 }
 
+void Rpc::refuse(std::string method, std::string why) {
+    refused_[std::move(method)] = std::move(why);
+}
+
 void Rpc::network(Network n) {
     // Folded on the way in, once, so the whole server below compares lowercase
     // against lowercase — the same rule method() applies to a registration.
@@ -536,13 +541,60 @@ void Rpc::answer(int fd) {
     // a relay that rewrapped every answer as 200 would tell a client a chain is
     // there when its server said otherwise.
     if (relayed != relays_.end()) {
+        // Calls this node refuses are answered here and never reach the chain.
+        const auto refusal = [this](const Json& one) -> std::optional<Json> {
+            if (!one.is_object()) return std::nullopt;
+            const auto m = one.find("method");
+            if (m == one.end() || !m->is_string()) return std::nullopt;
+            const auto r = refused_.find(m->get<std::string>());
+            if (r == refused_.end()) return std::nullopt;
+            return Json{{"jsonrpc", "2.0"},
+                        {"id", one.contains("id") ? one["id"] : Json()},
+                        {"error", {{"code", -32000}, {"message", r->second}}}};
+        };
+        std::string forward = body;
+        Json        refusals = Json::array();
+        if (!refused_.empty()) {
+            try {
+                const Json req = Json::parse(body);
+                if (req.is_array()) {
+                    Json kept = Json::array();
+                    for (const auto& one : req) {
+                        if (auto e = refusal(one)) refusals.push_back(*e);
+                        else kept.push_back(one);
+                    }
+                    if (kept.empty()) {
+                        write_all(fd, response(200, "OK", refusals.dump()));
+                        return;
+                    }
+                    if (!refusals.empty()) forward = kept.dump();
+                } else if (auto e = refusal(req)) {
+                    write_all(fd, response(200, "OK", e->dump()));
+                    return;
+                }
+            } catch (const std::exception&) {
+                // Not JSON: the chain's own server says so, in its own words.
+            }
+        }
+
         const Proxied proxied =
-            proxy_to_archive("http://" + relayed->second.first, relayed->second.second, body);
+            proxy_to_archive("http://" + relayed->second.first, relayed->second.second, forward);
         if (proxied.empty()) {
             write_all(fd, response(502, "Bad Gateway",
                                    R"({"jsonrpc":"2.0","id":null,)"
                                    R"("error":{"code":-32000,"message":"the chain's own server did not answer"}})"));
             return;
+        }
+        if (!refusals.empty() && proxied.ok()) {
+            try {
+                Json out = Json::parse(proxied.body);
+                if (out.is_array()) {
+                    for (auto& e : refusals) out.push_back(std::move(e));
+                    write_all(fd, response(proxied.status, reason_for(proxied.status), out.dump()));
+                    return;
+                }
+            } catch (const std::exception&) {
+            }
         }
         write_all(fd, response(proxied.status, reason_for(proxied.status), proxied.body));
         return;

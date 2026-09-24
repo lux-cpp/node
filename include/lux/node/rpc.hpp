@@ -81,6 +81,11 @@ public:
     // as it came and the answer comes back with its own status.
     void relay(std::string alias, std::string addr, std::string path);
 
+    // Answer `method` on a relayed chain with an error saying `why`, rather than
+    // relaying it. A batch keeps its other calls, and gets the chain's answers
+    // to them alongside the refusals.
+    void refuse(std::string method, std::string why);
+
     // The network this node belongs to. Its aliases are the ONLY ones this
     // server answers for, and a path naming any other chain is refused before an
     // archive is consulted. Its canonical alias is also what `POST /` reaches,
@@ -116,6 +121,7 @@ private:
     Network                                         net_;
     std::string                                     archive_rpc_;
     std::map<std::string, std::pair<std::string, std::string>> relays_;  // alias → (addr, path)
+    std::map<std::string, std::string>                         refused_; // method → why
     Json                                            about_;
     std::mutex                                      mu_;
     std::thread                                     accepting_;
