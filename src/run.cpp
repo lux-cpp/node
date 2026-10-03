@@ -509,6 +509,32 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
     }
     Engine& engine = *enginep;
 
+    // /v1/health's consensus check: the engine's report, published after every
+    // pass and read by the RPC's threads under its own lock.
+    std::mutex  health_mu;
+    Rpc::Json   health = {{"healthy", false}, {"message", "starting"}};
+    rpc.consensus([&] {
+        const std::lock_guard<std::mutex> lock(health_mu);
+        return health;
+    });
+    const auto publish_health = [&] {
+        const auto h         = engine.health();
+        const bool reachable = h.peers + 1 >= h.quorum;
+        std::string message  = h.gated     ? "gated: the tip was imported and no certificate stands on it yet"
+                             : h.stalled   ? "stalled: a record did not reach the device"
+                             : !reachable  ? "cannot reach a quorum"
+                                           : "deciding";
+        const Rpc::Json j = {{"healthy", !h.gated && !h.stalled && reachable},
+                             {"message", message},
+                             {"gated", h.gated},
+                             {"stalled", h.stalled},
+                             {"height", h.height},
+                             {"peers", h.peers},
+                             {"quorum", h.quorum}};
+        const std::lock_guard<std::mutex> lock(health_mu);
+        health = j;
+    };
+
     // ── the mesh ────────────────────────────────────────────────────────────
     std::map<std::uint32_t, PeerAddr> peers;
     for (std::size_t j = 0; j < addresses.size(); ++j)
@@ -602,6 +628,7 @@ int run(std::span<const Spec> specs, int argc, char** argv) {
         for (auto& raw : rpc.take_sent())
             if (first(raw)) host.gossip(kTxMsgType, raw);
         const Step pass = engine.step();
+        publish_health();
         for (auto& [seat, raws] : relayed)
             for (const auto& raw : raws)
                 if (first(raw)) (void)rpc.submit(self, raw);

@@ -415,6 +415,8 @@ void Rpc::network(Network n) {
 }
 void Rpc::about(Json j) { about_ = std::move(j); }
 
+void Rpc::consensus(std::function<Json()> report) { consensus_ = std::move(report); }
+
 void Rpc::start() {
     running_   = true;
     accepting_ = std::thread([this] { serve(); });
@@ -525,14 +527,19 @@ void Rpc::answer(int fd) {
             // node is a health report about a chain it does not run.
             const std::string live =
                 "chain " + (net_.served.empty() ? std::string("unknown") : net_.served.front()) + " live";
-            Json h = {
-                {"healthy", true},
-                {"checks", {
-                    {"bls", {{"message", "node has the correct BLS key"}, {"healthy", true}}},
-                    {"consensus", {{"message", "mesh healthy"}, {"healthy", true}}},
-                    {"chain", {{"message", live}, {"healthy", true}}}
-                }}
+            // The consensus check is the engine's own report — gated, stalled,
+            // the peers it hears against the quorum it needs — never a constant.
+            // The status stays 200 whatever it says: a readiness probe that took
+            // a gated validator off its Service would take it off the address
+            // its peers dial to anchor it, and it could never be lifted.
+            Json checks = {
+                {"bls", {{"message", "node has the correct BLS key"}, {"healthy", true}}},
+                {"chain", {{"message", live}, {"healthy", true}}}
             };
+            if (consensus_) checks["consensus"] = consensus_();
+            bool healthy = true;
+            for (const auto& [name, check] : checks.items()) healthy = healthy && check.value("healthy", false);
+            const Json h = {{"healthy", healthy}, {"checks", checks}};
             write_all(fd, response(200, "OK", h.dump()));
         } else if (chain.health && (methods_.count(chain.alias) != 0 || relays_.count(chain.alias) != 0)) {
             Json h = {

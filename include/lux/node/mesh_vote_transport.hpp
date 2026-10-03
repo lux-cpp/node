@@ -12,7 +12,8 @@
 //
 //   broadcast(v): this node's OWN vote. node.cpp relies on the transport echoing
 //     a node's own vote back so its gate counts it (the gate dedups by voter key),
-//     so we self-deliver through the sink, then write the ZAP frame to EVERY peer.
+//     so we self-deliver through the sink, then queue the ZAP frame for EVERY peer.
+//   gossip / send: queue a typed payload for every peer, or for one seat.
 //   pump(): drain every peer's socket (non-blocking) through its FrameReader,
 //     decode each complete vote frame, deliver via the sink. Returns the number
 //     of votes delivered (progress signal for the driver / observability).
@@ -23,15 +24,13 @@
 // whoever is left, so dropping a peer costs liveness nothing and removes every
 // way one socket can hold the node: an unbounded buffer (the reader is capped
 // and stops feeding once it rejects a stream), a corpse that is polled forever,
-// or a stalled reader that blocks broadcast (the host sets a send timeout, so a
-// write fails instead of hanging). Frames already reassembled are delivered
-// BEFORE the peer is dropped, so a validator that votes and then disconnects
-// still counts.
+// or a stalled reader (its own writer's send times out, and the peer is gone).
+// Frames already reassembled are delivered BEFORE the peer is dropped, so a
+// validator that votes and then disconnects still counts.
 //
-// Threading: in node each MeshVoteTransport is owned and driven by exactly one
-// thread (its host), so there is no shared-mutable consensus state. The per-peer
-// write mutex exists only to satisfy lux::zap::write_frame_locked's signature; it
-// is uncontended here.
+// Threading: each MeshVoteTransport is driven by exactly one thread — add, send,
+// gossip, pump and every handler run there. Each peer has one more, its writer,
+// which shares only that peer's bounded queue.
 
 #pragma once
 
@@ -40,17 +39,23 @@
 #include "lux/node/frame_reader.hpp"
 #include "lux/zap/wire.hpp"                    // write_frame_locked, strip_flags
 
+#include <atomic>
+#include <condition_variable>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
-#include <unistd.h>  // close
+#include <sys/socket.h>  // shutdown, setsockopt
+#include <sys/time.h>    // timeval
+#include <unistd.h>      // close
 
 namespace lux::node {
 
@@ -103,15 +108,25 @@ using VoteSink = std::function<void(const lux::consensus::SignedVote&)>;
 // (0x80) is its own type, so a question and its answer have two handlers.
 using Sink = std::function<void(std::uint32_t seat, const std::vector<std::uint8_t>& payload)>;
 
+// WHAT GOES TO A PEER WAITS IN ITS OWN QUEUE, AND ITS OWN THREAD WRITES IT
+// (lux-rs/node mesh.rs OUTBOUND_MAX / OUTBOUND_BYTES). A send puts one shared
+// copy of the payload on each peer's queue and returns: the thread that sends —
+// the engine — never waits on a socket, so a peer that stops reading costs its
+// own writer a write timeout and then its link, never the node a pass. Past
+// either bound the OLDEST frame is let go, which costs nothing a retry does not
+// say again.
+inline constexpr std::size_t kOutboundMax   = 256;
+inline constexpr std::size_t kOutboundBytes = 4 * std::size_t(kMaxMeshFrame);
+// How long one write may take before its peer is judged to have stopped
+// reading (mesh.rs WRITE_TIMEOUT). Set on the socket as the peer is added.
+inline constexpr int         kWriteTimeoutMs = 2000;
+
 class MeshVoteTransport : public lux::consensus::VoteTransport {
 public:
     explicit MeshVoteTransport(VoteSink sink) : sink_(std::move(sink)) { ignore_sigpipe(); }
 
-    // The transport owns its peer fds: close them when it dies.
-    ~MeshVoteTransport() override {
-        for (auto& p : peers_)
-            if (p->fd >= 0) ::close(p->fd);
-    }
+    // Each peer's writer is stopped and its socket closed with it.
+    ~MeshVoteTransport() override = default;
 
     MeshVoteTransport(const MeshVoteTransport&) = delete;
     MeshVoteTransport& operator=(const MeshVoteTransport&) = delete;
@@ -122,6 +137,10 @@ public:
     // stale one — keeping the old would lock it out until something noticed the
     // corpse. Only the holder of that seat's key can make this happen.
     void add_peer(int fd, std::uint32_t seat) {
+        timeval tv{};
+        tv.tv_sec  = kWriteTimeoutMs / 1000;
+        tv.tv_usec = (kWriteTimeoutMs % 1000) * 1000;
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         for (std::size_t i = 0; i < peers_.size(); ++i)
             if (peers_[i]->seat == seat) {
                 drop(i);
@@ -136,16 +155,11 @@ public:
     // here.
     void on(std::uint8_t type, Sink h) { sinks_[key(type)] = std::move(h); }
 
-    // Send one framed payload to the peer at `seat`. False when there is none,
-    // or it would not take the write (and is dropped).
+    // Queue one payload for the peer at `seat`. False when there is none, or its
+    // writer has already failed.
     bool send(std::uint32_t seat, std::uint8_t type, const std::vector<std::uint8_t>& payload) {
-        for (std::size_t i = 0; i < peers_.size(); ++i) {
-            if (peers_[i]->seat != seat) continue;
-            Peer& p = *peers_[i];
-            if (lux::zap::write_frame_locked(p.fd, p.wmu, type, payload.data(), payload.size())) return true;
-            drop(i);
-            return false;
-        }
+        for (auto& p : peers_)
+            if (p->seat == seat) return p->queue(type, std::make_shared<const std::vector<std::uint8_t>>(payload));
         return false;
     }
 
@@ -160,18 +174,12 @@ public:
     // may have missed everything said while it was away.
     std::size_t joined() const noexcept { return joined_; }
 
-    // Send one framed payload to every peer. No self-echo — a vote is echoed
-    // because the gate must count the originator's own, whereas a transaction
-    // this node already holds does not need to be handed back to itself.
+    // Queue one payload for every peer. No self-echo — a vote is echoed because
+    // the gate must count the originator's own, whereas a transaction this node
+    // already holds does not need to be handed back to itself.
     void gossip(std::uint8_t type, const std::vector<std::uint8_t>& payload) {
-        for (std::size_t i = 0; i < peers_.size();) {
-            Peer& p = *peers_[i];
-            if (lux::zap::write_frame_locked(p.fd, p.wmu, type, payload.data(), payload.size())) {
-                ++i;
-                continue;
-            }
-            drop(i);
-        }
+        const auto shared = std::make_shared<const std::vector<std::uint8_t>>(payload);
+        for (auto& p : peers_) (void)p->queue(type, shared);
     }
 
     std::size_t peer_count() const noexcept { return peers_.size(); }
@@ -181,19 +189,12 @@ public:
     // VoteTransport: disseminate this node's own ACCEPT vote.
     void broadcast(const lux::consensus::SignedVote& v) override {
         sink_(v);  // self-echo: the originator's own vote must reach its own gate
-        const std::vector<std::uint8_t> payload = lux::consensus::zap::encode_vote(v);
-        for (std::size_t i = 0; i < peers_.size();) {
-            Peer& p = *peers_[i];
-            const bool sent = lux::zap::write_frame_locked(p.fd, p.wmu,
-                                                           lux::consensus::zap::kVoteMsgType,
-                                                           payload.data(), payload.size());
-            if (sent) { ++i; continue; }
-            drop(i);  // the socket will not take our vote — that peer is gone
-        }
+        gossip(lux::consensus::zap::kVoteMsgType, lux::consensus::zap::encode_vote(v));
     }
 
     // Drain every peer; deliver each complete, structurally-valid vote frame.
-    // Returns the number of votes delivered this call. Never blocks.
+    // Returns the number of votes delivered this call. Never blocks. A peer
+    // whose writer failed is dropped here, on the driver's thread.
     std::size_t pump() {
         std::size_t delivered = 0;
         for (std::size_t i = 0; i < peers_.size();) {
@@ -224,12 +225,73 @@ public:
     }
 
 private:
+    struct Out {
+        std::uint8_t                                     type;
+        std::shared_ptr<const std::vector<std::uint8_t>> payload;
+    };
+
     struct Peer {
-        Peer(int f, std::uint32_t s) : fd(f), seat(s), rx(kMaxMeshFrame) {}
-        int fd;
-        std::uint32_t seat;
-        std::mutex wmu;  // serializes write_frame_locked on this fd (uncontended here)
-        FrameReader rx;  // this peer's reassembly buffer, capped at one vote frame
+        Peer(int f, std::uint32_t s) : fd(f), seat(s), rx(kMaxMeshFrame), writer([this] { write(); }) {}
+        ~Peer() {
+            {
+                const std::lock_guard<std::mutex> lock(mu);
+                stop = true;
+            }
+            cv.notify_one();
+            ::shutdown(fd, SHUT_RDWR);  // returns a write the writer is blocked in
+            writer.join();
+            ::close(fd);
+        }
+        Peer(const Peer&)            = delete;
+        Peer& operator=(const Peer&) = delete;
+
+        bool queue(std::uint8_t type, std::shared_ptr<const std::vector<std::uint8_t>> payload) {
+            if (failed.load()) return false;
+            {
+                const std::lock_guard<std::mutex> lock(mu);
+                bytes += payload->size();
+                out.push_back(Out{type, std::move(payload)});
+                while (out.size() > 1 && (out.size() > kOutboundMax || bytes > kOutboundBytes)) {
+                    bytes -= out.front().payload->size();
+                    out.pop_front();
+                }
+            }
+            cv.notify_one();
+            return true;
+        }
+
+        void write() {
+            for (;;) {
+                Out next;
+                {
+                    std::unique_lock<std::mutex> lock(mu);
+                    cv.wait(lock, [this] { return stop || !out.empty(); });
+                    if (stop) return;
+                    next = std::move(out.front());
+                    out.pop_front();
+                    bytes -= next.payload->size();
+                }
+                // A write the socket will not take within its send timeout is a
+                // peer that stopped reading: this writer stops, and the driver
+                // drops the peer on its next pump.
+                if (!lux::zap::write_frame_locked(fd, wmu, next.type, next.payload->data(), next.payload->size())) {
+                    failed.store(true);
+                    return;
+                }
+            }
+        }
+
+        int                     fd;
+        std::uint32_t           seat;
+        FrameReader             rx;  // this peer's reassembly buffer, capped at the link's frame
+        std::mutex              wmu;  // write_frame_locked's; only the writer writes
+        std::mutex              mu;   // guards out, bytes, stop
+        std::condition_variable cv;
+        std::deque<Out>         out;
+        std::size_t             bytes = 0;
+        bool                    stop  = false;
+        std::atomic<bool>       failed{false};
+        std::thread             writer;  // last: started once everything above exists
     };
 
     // A frame's dispatch key: its type with the response bit kept and the error
@@ -238,20 +300,20 @@ private:
         return static_cast<std::uint8_t>(raw & ~lux::zap::MsgErrorFlag);
     }
 
-    // THE eviction rule: the stream ended, or it broke the framing contract.
+    // THE eviction rule: the stream ended, it broke the framing contract, or its
+    // writer could not write.
     static bool dead(Drain d, const Peer& p) noexcept {
-        return d == Drain::Closed || p.rx.error();
+        return d == Drain::Closed || p.rx.error() || p.failed.load();
     }
 
     void drop(std::size_t i) {
-        if (peers_[i]->fd >= 0) ::close(peers_[i]->fd);
         peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(i));
         ++evicted_;
     }
 
     VoteSink sink_;
     std::map<std::uint8_t, Sink> sinks_;        // msg type → handler, for everything else
-    std::vector<std::unique_ptr<Peer>> peers_;  // unique_ptr: Peer holds a non-movable mutex
+    std::vector<std::unique_ptr<Peer>> peers_;  // unique_ptr: Peer holds a thread and mutexes
     std::size_t evicted_ = 0;
     std::size_t joined_  = 0;
 };

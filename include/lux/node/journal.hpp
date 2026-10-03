@@ -40,6 +40,10 @@
 
 namespace lux::node {
 
+// Sync a directory, so a file just created in it — or just removed — survives a
+// crash as a name, not only as blocks. False when it did not reach the device.
+[[nodiscard]] bool sync_dir(const std::filesystem::path& dir);
+
 class Journal {
 public:
     // Open (creating) the journal at `path` and read it back. Throws

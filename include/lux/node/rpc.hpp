@@ -96,6 +96,10 @@ public:
     // A plain GET / — what the node says about itself.
     void about(Json j);
 
+    // What /v1/health says about consensus, asked at every request: a JSON
+    // object with at least "healthy". Without it the check is not reported.
+    void consensus(std::function<Json()> report);
+
     void          start();
     void          stop();
     std::uint16_t port() const noexcept { return port_; }
@@ -142,6 +146,7 @@ private:
     std::map<std::string, std::pair<std::string, std::string>> relays_;  // alias → (addr, path)
     std::map<std::string, std::string>                         refused_; // method → why
     Json                                            about_;
+    std::function<Json()>                           consensus_;
     std::mutex                                      mu_;
     std::mutex                                      sent_mu_;
     std::vector<std::vector<std::uint8_t>>          sent_;

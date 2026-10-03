@@ -12,13 +12,18 @@
 //   - a block the chain refuses is never signed;
 //   - a node whose tip came off an export builds nothing in its own windows and
 //     signs nothing but its anchor, where the same node without the gate builds;
-//   - a chain that refuses to build does not stop the node.
+//   - a chain that refuses to build does not stop the node;
+//   - a gated node lifts its gate on a vote certificate at its own tip, and not
+//     on one for another block there;
+//   - a parent with a stale time opens no slot further than kReach windows
+//     back of this validator's own clock.
 
 #include "fake_chain.hpp"
 #include "lux/node/engine.hpp"
 #include "lux/node/host.hpp"
 #include "lux/node/journal.hpp"
 #include "lux/node/signer.hpp"
+#include "lux/zap/wire.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -263,6 +268,74 @@ int main() {
         bool       said   = false;
         for (const auto& e : events) said = said || e.text.find("building") != std::string::npos;
         check(refusing->calls >= 1 && said, "[4] the refusal reached the engine, which said so and went on");
+    }
+
+    // [5] A certificate on the tip itself lifts the gate, whatever its kind: the
+    // vote certificate the network decided the tip on is as good as an anchor.
+    // One for another block at that height is not.
+    for (const bool same : {true, false}) {
+        Rig         g(same ? "tipcert" : "tipcert-control", true);
+        const Id    block  = same ? g.store->tip : filled(0x7a);
+        lux::consensus::VotePosition pos{};
+        pos.chain_id            = g.chain;
+        pos.height              = kTip;
+        pos.block_id            = block;
+        pos.canonical_id        = block;
+        pos.parent_id           = Id{};  // the fake chain's imported tip has no parent
+        pos.parent_canonical_id = Id{};
+        pos.validator_set_root  = g.committee.root();
+        const Message m = vote_message(pos);
+        std::map<Node, Signature> sigs;
+        for (int i = 1; i < 4; ++i) sigs[g.signers[std::size_t(i)]->node()] = sign(m, {}, g.signers[std::size_t(i)]->secret()).sig;
+        const auto cert = certify(m, sigs, g.committee);
+        std::optional<std::uint64_t> asked;
+        g.peer->on(kAskMsgType, [&](std::uint32_t, const std::vector<std::uint8_t>& q) {
+            std::uint64_t from = 0;
+            for (int i = 0; i < 8; ++i) from = (from << 8) | q[std::size_t(i)];
+            asked = from;
+        });
+        const auto end = std::chrono::steady_clock::now() + 6 * kWindow;
+        bool       answered = false;
+        while (std::chrono::steady_clock::now() < end && !g.engine->caught_up()) {
+            (void)g.engine->step();
+            g.peer->pump();
+            if (asked && !answered) {
+                lux::zap::Writer w;
+                w.write_u64(*asked);
+                w.write_u64(kTip);
+                w.write_u32(1);
+                const std::vector<std::uint8_t> bytes{'I', 'M', 'P', 'O', 'R', 'T', 'E', 'D'};
+                w.write_bytes(bytes);
+                w.write_bytes(encode(*cert));
+                answered = g.peer->send(0, kAnswerMsgType, w.take());
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+        check(cert && asked && *asked == kTip, "[5] a gated node asks for its own tip's height");
+        if (same) check(g.engine->caught_up(), "[5] a vote certificate on its tip lifts the gate");
+        else check(!g.engine->caught_up(), "[5] control: a vote certificate on another block there does not");
+    }
+
+    // [6] A parent's time is its proposer's to choose, and a chain takes a time
+    // equal to its parent's: a tip from 2025 must not open every slot since. A
+    // proposal from a slot 40 windows past this validator's own time in the
+    // height is not looked at; one within kReach windows is.
+    {
+        Rig r("stale", false);
+        r.store->pending = false;
+        std::uint64_t far = 40, near = 2;
+        while (r.engine->proposer(kTip + 1, far) != r.committee.members()[1].node) ++far;
+        while (near <= kReach && r.engine->proposer(kTip + 1, near) != r.committee.members()[1].node) ++near;
+        r.run(50ms);
+        r.peer->gossip(kProposalMsgType, encode(r.proposal(far, r.store->tip, 5)));
+        r.run(3 * kWindow);
+        check(r.store->parses == 0, "[6] a slot " + std::to_string(far) +
+                                        " windows ahead, on a parent from 2025, is not looked at");
+        if (near <= kReach) {
+            r.peer->gossip(kProposalMsgType, encode(r.proposal(near, r.store->tip, 6)));
+            r.run(3 * kWindow);
+            check(r.store->parses == 1, "[6] control: slot " + std::to_string(near) + ", within reach, is");
+        }
     }
 
     std::printf("----------------------------------------------------------------------\n");

@@ -105,6 +105,10 @@ inline constexpr auto          kRetryMax      = std::chrono::milliseconds(16000)
 inline constexpr std::uint32_t kRetryAttempts = 8;
 inline constexpr std::uint64_t kEarly         = 1;
 inline constexpr std::uint64_t kSkew          = 2;
+// How many windows before this validator took a height up the tip's own time
+// may still open slots (engine.cpp wall): room for a validator that restarted
+// into a quiet height, and no more for a proposer that kept a stale time.
+inline constexpr std::uint64_t kReach         = 8;
 inline constexpr std::size_t   kSiblingsMax   = 64;
 inline constexpr std::size_t   kEach          = 16;
 inline constexpr std::uint32_t kJunkEach      = 16;
@@ -180,6 +184,18 @@ public:
     // The journal cannot write, and only a restart reopens it whole.
     bool          broken() const noexcept { return journal_.broken(); }
 
+    // What /v1/health says about this validator: whether it may sign (the
+    // import gate), whether a record it must keep before signing failed to
+    // reach the device lately, the height it is on and who it can hear.
+    struct Health {
+        bool          gated   = false;
+        bool          stalled = false;
+        std::uint64_t height  = 0;
+        std::size_t   peers   = 0;
+        std::uint32_t quorum  = 0;
+    };
+    Health health() const;
+
     // The position this node signs for a block. ONE definition, so a block
     // proposed and the same block followed produce the same message.
     lux::consensus::VotePosition position(const Block& b) const;
@@ -196,6 +212,7 @@ private:
         std::uint64_t                  height = 0;
         Id                             tip{};
         Clock::time_point              began;
+        std::chrono::system_clock::time_point entered;  // this validator's wall clock at entry
         std::uint64_t                  opened = 0;  // the tip's timestamp, seconds
         std::map<Id, Sibling>          siblings;    // by id: the first is the lowest
         std::optional<Clock::time_point> offered, closes;
@@ -242,6 +259,7 @@ private:
     std::uint64_t slot_of(const Instance& at) const;
     std::uint64_t wall(const Instance& at) const;
     Node          node_at(std::uint32_t seat) const;
+    Id            parent_of(const Id& id) const;
 
     Instance enter(std::uint64_t height, const Id& tip, Step& out);
     void     arrive(Instance& at, const Node& link, Arrival a, Step& out);
@@ -266,7 +284,7 @@ private:
     void     broadcast(const Statement& s);
     std::optional<Statement> say(const Message& m, Step& out, std::optional<Clock::time_point>& stalled);
     void     anchor_begin(Step& out);
-    void     anchor_statement(const Statement& s, const Claim& c, Step& out);
+    void     anchor_statement(const Statement& s, const Claim& c, const Node& link, Step& out);
     void     anchor_step(Step& out);
     bool     lift(Step& out);
 

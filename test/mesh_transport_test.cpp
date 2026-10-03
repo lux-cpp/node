@@ -24,9 +24,11 @@
 #include "lux/node/mesh_vote_transport.hpp"
 #include "lux/zap/wire.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -203,7 +205,52 @@ int main() {
         v.sig.fill(0x02);
         tx.broadcast(v);
         check(delivered == 1, "[4] broadcast still self-echoes to our own gate");
-        check(tx.peer_count() == 0, "[4] the unwritable peer was dropped by broadcast");
+        // The write fails on the peer's own writer; the driver drops it on the
+        // next pump.
+        for (int i = 0; i < 200 && tx.peer_count() != 0; ++i) {
+            tx.pump();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        check(tx.peer_count() == 0, "[4] the unwritable peer was dropped");
+    }
+
+    // [4b] a peer that stops reading never holds the thread that sends. Frames
+    // for it wait in its own queue — bounded, the oldest let go — and its writer
+    // times out and takes the peer with it; the honest peer beside it is sent
+    // everything, at once.
+    {
+        delivered = 0;
+        MeshVoteTransport tx(counting_sink);
+        Link stuck, honest;
+        tx.add_peer(stuck.ours, 1);
+        tx.add_peer(honest.ours, 2);
+        const std::vector<std::uint8_t> big(512 * 1024, 0x5a);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 64; ++i) tx.gossip(kTxMsgType, big);  // 32 MiB, far past what a socket buffers
+        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0).count();
+        // One blocked write would cost kWriteTimeoutMs; 64 of them, two minutes.
+        check(took < kWriteTimeoutMs / 4, "[4b] 64 half-MiB frames to a peer that reads nothing returned "
+                                          "without waiting on its socket (" + std::to_string(took) + " ms)");
+        // The honest peer reads its share while the stuck one reads nothing.
+        std::size_t got = 0;
+        std::uint8_t buf[65536];
+        const auto   until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (got < 4 * (big.size() + 5) && std::chrono::steady_clock::now() < until) {
+            const ssize_t n = ::recv(honest.theirs, buf, sizeof buf, MSG_DONTWAIT);
+            if (n > 0) got += std::size_t(n);
+            else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            tx.pump();
+        }
+        check(got >= 4 * (big.size() + 5), "[4b] the peer that reads was sent to meanwhile");
+        const auto gone = std::chrono::steady_clock::now() + std::chrono::milliseconds(3 * kWriteTimeoutMs);
+        while (tx.peer_count() == 2 && std::chrono::steady_clock::now() < gone) {
+            (void)::recv(honest.theirs, buf, sizeof buf, MSG_DONTWAIT);
+            tx.pump();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        check(tx.peer_count() == 1 && tx.members() == std::vector<std::uint32_t>{2},
+              "[4b] the peer that stopped reading was dropped when its writer timed out; the other stays");
     }
 
     // [5] eviction is per-peer: one hostile socket does not cost an honest one.

@@ -153,15 +153,48 @@ std::uint64_t Engine::slot_of(const Instance& at) const {
 }
 
 // This validator's own wall-clock slot at the height: windows since the tip's
-// timestamp. engine.rs:787.
+// timestamp (engine.rs:787), but never counted from further back than kReach
+// windows before this validator took the height up. The tip's time is its
+// proposer's to choose, and a chain accepts a time equal to the parent's, so a
+// stale parent — an imported tip, or a proposer that kept its parent's time —
+// would otherwise open every slot since then to whoever holds one, and let one
+// proposer claim a window whenever it liked. lux-rs/node counts from the tip's
+// time alone and has the same exposure.
 std::uint64_t Engine::wall(const Instance& at) const {
-    const auto now   = std::chrono::system_clock::now().time_since_epoch();
-    const auto since = now - std::chrono::seconds(at.opened);
-    if (since.count() <= 0) return 0;
-    return std::uint64_t(since / cfg_.window);
+    using std::chrono::duration_cast;
+    using std::chrono::system_clock;
+    const auto tip   = system_clock::time_point(std::chrono::seconds(at.opened));
+    const auto reach = duration_cast<system_clock::duration>(cfg_.window * std::int64_t(kReach));
+    const auto from  = std::max(tip, at.entered - reach);
+    const auto now   = system_clock::now();
+    if (now <= from) return 0;
+    return std::uint64_t(duration_cast<Duration>(now - from) / cfg_.window);
 }
 
 Node Engine::node_at(std::uint32_t seat) const { return cfg_.committee.members()[seat].node; }
+
+Id Engine::parent_of(const Id& id) const {
+    const std::lock_guard<std::mutex> lock(guard_);
+    try {
+        if (const auto b = vm_->get(id)) return b->parent();
+    } catch (const std::exception&) {
+    }
+    return Id{};
+}
+
+Engine::Health Engine::health() const {
+    Health h;
+    h.gated        = gated_;
+    const auto now = Clock::now();
+    const auto recent = [&](const std::optional<Clock::time_point>& t) {
+        return t && now - *t < cfg_.window * 5;
+    };
+    h.stalled = journal_.broken() || (at_ && recent(at_->stalled)) || (anchor_ && recent(anchor_->stalled));
+    h.height  = at_ ? at_->height - 1 : 0;
+    h.peers   = host_.peer_count();
+    h.quorum  = quorum();
+    return h;
+}
 
 std::optional<std::pair<std::uint64_t, std::uint64_t>> Engine::slot() const {
     if (!at_) return std::nullopt;
@@ -265,9 +298,10 @@ Step Engine::step() {
 // block it signed is offered again too, when it was kept. engine.rs:560.
 Engine::Instance Engine::enter(std::uint64_t height, const Id& tip, Step& out) {
     Instance at;
-    at.height = height;
-    at.tip    = tip;
-    at.began  = Clock::now();
+    at.height  = height;
+    at.tip     = tip;
+    at.began   = Clock::now();
+    at.entered = std::chrono::system_clock::now();
     {
         const std::lock_guard<std::mutex> lock(guard_);
         try {
@@ -340,7 +374,7 @@ void Engine::arrive(Instance& at, const Node& link, Arrival a, Step& out) {
     const auto claim = read(s.message);
     if (!claim) return;
     if (claim->kind == Kind::Anchor) {
-        anchor_statement(s, *claim, out);
+        anchor_statement(s, *claim, link, out);
         return;
     }
     const std::uint64_t h = claim->slot.height;
@@ -818,12 +852,21 @@ void Engine::anchor_begin(Step& out) {
     anchor_ = std::move(a);
 }
 
-void Engine::anchor_statement(const Statement& s, const Claim& c, Step&) {
+void Engine::anchor_statement(const Statement& s, const Claim& c, const Node& link, Step&) {
     if (!gated_ || !anchor_) return;
     Anchor& a = *anchor_;
     if (c.slot.chain != cfg_.chain || c.set_root != set_root_ || c.slot.height != a.height || c.block != a.tip)
         return;
-    if (a.sigs.count(s.node) || !verify(s, cfg_.committee)) return;
+    if (a.sigs.count(s.node)) return;
+    // The same budget a vote's signature is checked on: a link whose anchors
+    // fail their signature is not looked at again until the window turns.
+    if (const auto f = forged_.find(link);
+        f != forged_.end() && f->second.first == 0 && Clock::now() - f->second.second < settle())
+        return;
+    if (!verify(s, cfg_.committee)) {
+        (void)spend(forged_, link, kJunkEach, settle());
+        return;
+    }
     a.sigs.emplace(s.node, s.sig);
 }
 
@@ -1005,10 +1048,13 @@ void Engine::answered(std::uint32_t seat, const std::vector<std::uint8_t>& answe
         const auto c = read(cert->message);
         if (c->slot.chain != cfg_.chain || c->set_root != set_root_ || c->slot.height != h)
             return doubt(h, "a certificate for another place");
-        if (c->kind == Kind::Anchor) {
-            // An anchor is a certificate on a tip, not a block: it lifts the gate
-            // of a node whose imported tip it names, and is nothing to any other.
-            if (gated_ && h == height && c->block == tip) {
+        if (h == height) {
+            // ANY certificate on this node's own tip — the anchor α validators
+            // made on it, or the vote certificate the network decided it on — is
+            // a quorum saying the history this node holds ends where theirs
+            // does, and lifts the gate: the rule the constructor applies to the
+            // ledger. A vote certificate must name the tip's own parent too.
+            if (gated_ && c->block == tip && (c->kind == Kind::Anchor || c->parent == parent_of(tip))) {
                 if (!ledger_.at(h) && !ledger_.append(Record{h, tip, *cert})) return;
                 Event e;
                 e.what    = Event::What::Anchored;
@@ -1020,7 +1066,8 @@ void Engine::answered(std::uint32_t seat, const std::vector<std::uint8_t>& answe
             }
             continue;
         }
-        if (h <= height) continue;
+        // An anchor anywhere else names no block this node can take.
+        if (c->kind == Kind::Anchor || h < height) continue;
         if (h != height + 1 || c->parent != tip || c->slot.round != 0)
             return doubt(h, "a certificate that does not build on this tip");
         std::shared_ptr<Block> b;

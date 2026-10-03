@@ -3,6 +3,8 @@
 
 #include "lux/node/ledger.hpp"
 
+#include "lux/node/journal.hpp"  // sync_dir
+
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -51,13 +53,6 @@ std::vector<std::uint8_t> read_all(int fd) {
     return raw;
 }
 
-bool sync_dir(const std::filesystem::path& dir) {
-    const int d = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (d < 0) return false;
-    const bool ok = ::fsync(d) == 0;
-    ::close(d);
-    return ok;
-}
 
 // Write `bytes` to `path` durably: a temporary, synced, renamed over, the
 // directory synced.
@@ -71,7 +66,7 @@ bool replace_file(const std::filesystem::path& path, const std::vector<std::uint
         ::unlink(tmp.c_str());
         return false;
     }
-    return sync_dir(path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path());
+    return sync_dir(path.parent_path());
 }
 
 }  // namespace
@@ -82,6 +77,8 @@ Ledger Ledger::open(const std::filesystem::path& path) {
     if (l.fd_ < 0) throw std::runtime_error("ledger: cannot open " + path.string() + ": " + std::strerror(errno));
     if (::flock(l.fd_, LOCK_EX | LOCK_NB) != 0)
         throw std::runtime_error("ledger: " + path.string() + " is held by another process");
+    if (!sync_dir(path.parent_path()))
+        throw std::runtime_error("ledger: cannot sync the directory of " + path.string());
     const auto  raw = read_all(l.fd_);
     std::size_t at  = 0;
     for (;;) {

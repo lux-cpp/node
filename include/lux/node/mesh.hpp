@@ -32,11 +32,13 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -73,17 +75,28 @@ struct Link {
     std::function<std::optional<std::uint32_t>(const std::array<std::uint8_t, 20>&)> seat;
 };
 
-// Every blocking operation on a peer socket is bounded by this window, so no
-// single peer can hold the node: a handshake that never arrives times out, and a
-// peer that stops reading makes broadcast fail (and be evicted) rather than hang.
+// Every blocking operation on a linked peer's socket is bounded by this window,
+// so no single peer can hold the node: a peer that stops reading makes its own
+// writer fail (and the peer be evicted) rather than hang.
 inline constexpr int kPeerIoTimeoutMs = 2000;
 
-// How long ONE dial attempt may take. A dial that is refused fails at once, but
-// a dial that is dropped — a firewall, a host that is gone, a port bound and
-// never listened on — reports nothing and runs to its timeout. Giving such a
-// dial the whole remaining phase means the peers after it in index order are
-// never dialled at all, so each attempt gets a slice and an unreachable peer is
-// retried on the next round instead of consuming the round.
+// The WHOLE greeting, in either direction, is bounded by this — not each read.
+// A stranger that trickles a byte every second defeats a per-read timeout
+// forever; against one deadline it costs this much and no more
+// (lux-rs/node host.rs HANDSHAKE_TIMEOUT).
+inline constexpr int kHandshakeMs = 4000;
+
+// Inbound greetings run at once, each on its own thread and never on the
+// accepting one, at most this many in all and this many from one source
+// address: strangers that connect and say nothing hold a slot for kHandshakeMs
+// and never the door, and one address cannot fill every slot.
+inline constexpr std::size_t kHandshakesMax       = 16;
+inline constexpr std::size_t kHandshakesPerSource = 4;
+
+// How long ONE dial attempt may take to connect. A dial that is refused fails
+// at once, but a dial that is dropped — a firewall, a host that is gone —
+// reports nothing and runs to its timeout. A seat is dialed again no sooner
+// than this after its last attempt.
 inline constexpr int kDialAttemptMs = 250;
 
 class Mesh {
@@ -100,45 +113,53 @@ public:
     Mesh& operator=(const Mesh&) = delete;
 
     // Bind host:port (an IPv4 literal; "0.0.0.0" for every interface), listen,
-    // and start ACCEPTING: one thread takes inbound links, runs the greeting as
-    // the responder — bounded by kPeerIoTimeoutMs a read — and queues the
-    // proven ones for the driver. A stranger that connects and says nothing
-    // holds that thread for a timeout and never the driver. Returns the port
-    // actually bound (which resolves a requested 0). Throws std::runtime_error at
-    // the boundary on failure. Must precede connect().
+    // and start ACCEPTING: one thread takes connections and hands each to a
+    // greeting of its own (kHandshakesMax in all, kHandshakesPerSource from one
+    // address, each bounded by kHandshakeMs), which queues the seat it proves
+    // for the driver. Returns the port actually bound (which resolves a
+    // requested 0). Throws std::runtime_error at the boundary on failure, a host
+    // that is not an IPv4 address among them. Must precede connect().
     std::uint16_t listen_bind(const std::string& host, std::uint16_t port);
 
-    // Reach as many of `peers` as possible within ONE deadline that covers the
-    // whole phase. The lower-indexed end of each pair dials and the higher-
-    // indexed end accepts, so a pair has exactly one connection. Returns the
-    // number of peers connected (== the transport's peer_count()).
+    // Reach as many of `peers` as possible within ONE deadline. The lower-
+    // indexed end of each pair dials and the higher-indexed end accepts, so a
+    // pair has exactly one connection. Returns the number of peers connected
+    // (== the transport's peer_count()).
     std::size_t connect(const std::map<std::uint32_t, PeerAddr>& peers, int deadline_ms = 10000);
 
-    // Meet whoever is missing, once, without waiting on anyone who is not there:
-    // hand the transport every link the acceptor has proven, and dial each
-    // higher seat that holds no link. connect() is the opening rendezvous and
-    // it ENDS; without this a validator that restarted dials into a backlog
-    // nobody reads while its peers carry on holding a dead socket, and a node
-    // rejoins by taking certificates over the link it does not have
-    // (lux-rs/node host.rs sweep). A dial costs kDialAttemptMs at most when the
-    // peer is gone.
+    // Meet whoever is missing, without waiting on anyone: hand the transport
+    // every link a greeting has proven, and start a dial — on its own thread —
+    // to each higher seat that holds no link and has none in flight. connect()
+    // is the opening rendezvous and it ENDS; without this a validator that
+    // restarted dials into a backlog nobody reads while its peers hold a dead
+    // socket (lux-rs/node host.rs sweep). The caller's thread never waits on a
+    // peer here: not on a dial, not on a greeting, not on a name lookup.
     void sweep(const std::map<std::uint32_t, PeerAddr>& peers);
 
     std::uint32_t index() const noexcept { return index_; }
     std::uint16_t port()  const noexcept { return bound_port_; }
 
+    // Greetings in flight, inbound and outbound (observability and tests).
+    std::size_t greeting() const;
+
 private:
-    // The acceptor thread's loop.
+    struct Worker {
+        std::thread                        thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
+    // The accepting thread's loop.
     void accepting();
-    // Hand the transport what the acceptor proved: seats below this one only,
-    // since those are the ones that dial here.
+    // One greeting on its own thread: as the responder for an inbound `fd`
+    // from `source`, or — `expect` set — as the initiator dialing `to`.
+    void greet_in(int fd, std::string source);
+    void greet_out(std::uint32_t expect, PeerAddr to);
+    // Run `work` on a thread of its own, reaped once it is done. Holds mu_.
+    void spawn(std::function<void()> work);
+    // Join the greetings that are done. Holds mu_.
+    void reap();
+    // Hand the transport what the greetings proved. The driver's thread only.
     void take_arrivals();
-    // One dial attempt (no retry — the sweep owns the retry policy): resolve,
-    // non-blocking connect bounded by `wait_ms`, then the greeting as the
-    // initiator. `expect` is the seat this address was supposed to belong to; an
-    // address that turns out to belong to someone else is refused rather than
-    // believed. Returns the connected fd, or -1.
-    int dial_once(const PeerAddr& a, std::uint32_t expect, int wait_ms);
 
     std::uint32_t      index_;
     MeshVoteTransport& tx_;
@@ -146,10 +167,16 @@ private:
     int                listen_fd_  = -1;
     std::uint16_t      bound_port_ = 0;
 
-    std::mutex                                     arrived_mu_;
-    std::vector<std::pair<int, std::uint32_t>>     arrived_;  // (fd, proven seat)
-    std::atomic<bool>                              stopping_{false};
-    std::thread                                    acceptor_;
+    mutable std::mutex                                   mu_;
+    std::vector<std::pair<int, std::uint32_t>>           arrived_;  // (fd, proven seat)
+    std::vector<Worker>                                  workers_;
+    std::set<int>                                        inflight_;  // fds mid-greeting
+    std::map<std::string, std::size_t>                   sources_;   // inbound greetings by address
+    std::size_t                                          inbound_ = 0;
+    std::map<std::uint32_t, std::chrono::steady_clock::time_point> dialed_;  // last attempt
+    std::set<std::uint32_t>                              dialing_;
+    std::atomic<bool>                                    stopping_{false};
+    std::thread                                          acceptor_;
 };
 
 }  // namespace lux::node

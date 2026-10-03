@@ -124,6 +124,11 @@ for h in $(seq 1 "$height"); do
   done
 done
 (( fail == 0 )) && ok "every validator that is up accepted the same block at heights 1..$height"
+for i in "${live[@]}"; do
+  health="$(curl -s --max-time 5 "http://127.0.0.1:$((RPC + i))/v1/health")"
+  echo "$health" | grep -q '"consensus":{[^}]*"gated":false' && echo "$health" | grep -q '"healthy":true' \
+    && ok "seat $i: /v1/health says deciding, not gated" || bad "seat $i: /v1/health $health"
+done
 
 echo "== who built each block (a slot is a window at the height; each is one proposer's)"
 grep -h " led " "$TMP"/node*.log | sort -t' ' -k4,4n -u | sed 's/^/  /'

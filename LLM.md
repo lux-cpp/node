@@ -139,7 +139,7 @@ the constants are the same numbers.
 | clause | C++ | Rust |
 |---|---|---|
 | **Windower**: one proposer per (height, slot), MT19937-64 seeded `chainSource ^ height ^ Reverse64(slot)`, stake-weighted heap over validators sorted by node id — Go's windower.go:153/271-317, held to windower_test.go's vectors | `Windower::expected` | proposer.rs:79-236 |
-| **Slot clock**: windows since this validator took the height up; a proposal from a slot past `slot+EARLY(1)` is taken only if its slot is within `SKEW(2)` windows of this validator's wall-clock slot (windows since the tip's timestamp); once it has run, the local clock moves up to it and never past the wall-clock slot | `slot_of`, `wall`, `proposed` | engine.rs:455, 723-726, 776-782, 789 |
+| **Slot clock**: windows since this validator took the height up; a proposal from a slot past `slot+EARLY(1)` is taken only if its slot is within `SKEW(2)` windows of this validator's wall-clock slot; once it has run, the local clock moves up to it and never past the wall-clock slot. The wall-clock slot counts windows since the tip's timestamp **but from no further back than `kReach` (8) windows before this validator took the height up** — the one clause that is not Rust's (below) | `slot_of`, `wall`, `proposed` | engine.rs:455, 723-726, 776-782, 789 |
 | **A proposal is signed and checked**: ML-DSA-65 over `chain ‖ parent ‖ SHA-256(set ‖ parent ‖ height ‖ slot ‖ 0x42 ‖ key ‖ block)`, context `lux-node-proposal-v1`, verified against the slot's expected proposer before a byte is parsed | `proposal_header`, `proposed` | proposer.rs:45-77, engine.rs:727-742, host.rs:280 |
 | **Build only in your window**, only while nothing is live, bound or built at the height, and not while f+1 verified votes name a block you lack (until the retry gives up — then build) | `offer` | engine.rs:923-972 |
 | **One signature per height**: every statement goes through the journal first; a standing one is said again, never replaced | `say`, `Journal` | journal.rs:174, host.rs:221-270, engine.rs:1013-1020 |
@@ -157,13 +157,32 @@ and its answer 57|0x80; a transaction is msg 58 — Rust's ids and layouts. The
 greeting is still the LP-10602 handshake with 4-byte framing, which Rust does not
 speak, so the two do not share a link yet.
 
+**The slot clock's reach, and where Rust has the same flaw.** A tip's time is
+its proposer's to choose, and a chain takes a time equal to its parent's
+(cevm chain.hpp:2168, Go likewise). Counted from the tip's time alone —
+lux-rs/node engine.rs:786-794, and this node before the review — a stale
+parent opens every slot since then: after an anchor on an export from 2025, or
+behind a proposer that kept its parent's time, any validator could claim one of
+its own windows whenever it liked, move honest clocks up to it, and grind for
+the lowest id. Here the wall-clock slot counts from the later of the tip's time
+and `kReach` windows before this validator took the height up, so a stale
+parent opens at most `kReach + SKEW` windows past this validator's own time,
+and a validator restarted into a quiet height still takes a proposal up to
+`kReach` windows on (engine_test [6]: 46 windows ahead on a 2025 parent is not
+looked at, 3 windows ahead is). The same change belongs in engine.rs:786.
+
 **Why it is safe.** Two certificates at one height need α signers each, so
 2α − n > f signers in both — an honest validator signing twice at one height,
 which the journal refuses. The winner rule, the retry and the anchor decide which
 statement an honest validator makes, never whether it makes two. A height whose
 honest validators are bound to different blocks, none able to reach α, stays
 uncertified: the price of one signature a height (Go: "unrecoverable",
-engine.go:1716). With one seat of five down, α = 4 is every seat that is up.
+engine.go:1716). With one seat of five down, α = 4 is every seat that is up, and
+the down seat is counted forever among those who may still vote
+(`vote`, engine.cpp, the `open` term — engine.rs:996), so no sibling is ever shut
+out by arithmetic: two live seats that sign different blocks stall the height.
+That is Go's exposure (its winner is vote-blind, engine.go:2829) and Rust's, and
+the rule is left as theirs.
 
 **Hardening beyond the rule.** A statement is taken only on its signer's own
 link (nobody relays a vote), and a link whose statements fail their signature
@@ -225,8 +244,11 @@ signature: BLS12-381 min-pk, the consensus vote ciphersuite
   at height T (block H), synced; then the gate is removed and the removal
   synced. The node is a validator from T+1.
 - **A validator that was not there** (down, or late) asks its peers from its tip
-  (T, count 2); the anchor record at T lifts its gate when it names its own tip,
-  and a certified T+1 on its tip does the same. A validator that imported a
+  (T, count 2). ANY verified certificate on its own tip lifts its gate — the
+  anchor record at T, or the vote certificate a network decided T on (naming the
+  tip and the tip's parent; engine_test [5], against one for another block) — the
+  same rule the engine applies to its own ledger at start; a certified T+1 on
+  its tip does the same. A validator that imported a
   different tip signs a different message, never reaches α, and is never lifted
   by the others' records: correct, and safe.
 - **A restart** with the flag still set closes the gate again, and the engine
@@ -245,12 +267,22 @@ quorum is not yet reachable: it says so and goes on, and every other window
 seat that holds none — so a validator that starts before its peers, or restarts,
 is met again (lux-rs/node host.rs sweep).
 
-Per pair, the lower seat dials and the higher accepts. The acceptor runs on its
-own thread: it takes a connection, answers the LP-10602 greeting as the
-responder (each read bounded by `kPeerIoTimeoutMs`), and queues the proven seat;
-a stranger that connects and says nothing holds that thread for a timeout and
-never the engine. A second proven link from one seat REPLACES the first: a
-restarted validator proves its name afresh, and only the holder of that key can.
+Per pair, the lower seat dials and the higher accepts. THE DOOR ONLY TAKES AND
+HANDS ON: the accepting thread reads nothing; each greeting — inbound as the
+LP-10602 responder, outbound as the initiator, name lookup and connect included
+— runs on a thread of its own under ONE deadline for the whole greeting,
+`kHandshakeMs` (4 s, host.rs HANDSHAKE_TIMEOUT), not one per read. Inbound
+greetings are capped at `kHandshakesMax` (16) in flight and
+`kHandshakesPerSource` (4) from one address; past either a connection is closed
+at once. The driver's thread only takes proven links off a queue, so a sweep
+never waits on a peer. `acceptor_test` is the review's probe, asserting: a
+stranger trickling a byte every 1.5 s into a 16 000-byte greeting held the old
+acceptor for the dialer's whole 12 s; now the link forms in 20 ms and the
+stranger is cut at 4 s. Twelve silent strangers from one address take four
+slots and are closed at once past them; twenty from twenty addresses fill every
+slot and the link forms when their greetings expire (3.95 s). A second proven
+link from one seat REPLACES the first: a restarted validator proves its name
+afresh, and only the holder of that key can.
 
 The mesh listens on `--mesh-host` (default 127.0.0.1, like `--rpc-host`); a
 validator whose peers are other pods runs with `--mesh-host 0.0.0.0`. Its own
@@ -264,7 +296,14 @@ the machine's outward address, and shows a 127.0.0.1-bound one is not there.
 ## What one hostile peer can do (and what it costs)
 
 One eviction rule, in `MeshVoteTransport::dead`: a stream that closed, a framing
-violation, a socket that will not take a write — the peer is dropped. The link's
+violation, a writer that could not write — the peer is dropped. WHAT GOES TO A
+PEER WAITS IN ITS OWN QUEUE AND ITS OWN THREAD WRITES IT (mesh.rs
+OUTBOUND_MAX/OUTBOUND_BYTES): 256 frames and 4 links' worth of bytes at most,
+the oldest let go past either, one shared copy of a payload for every peer. The
+engine never waits on a socket; a peer that stops reading costs its own writer
+`kWriteTimeoutMs` (2 s) and then its link (mesh_transport_test [4b]: 32 MiB for
+a peer that reads nothing returns at once, the reading peer beside it is sent
+its share, and the stuck one is dropped). The link's
 frame cap is 2 MiB of block plus a proposal's head (mesh.rs LINK_MAX), far under
 ZAP's 16 MiB, and only a validator that proved its seat reaches the reader.
 Per link and pass, at most 8 proposals and 256 statements are queued; a
@@ -275,8 +314,16 @@ is remembered for the height; refused frames spend `JUNK_EACH` turns per
 ## Concurrency model
 
 The engine, the host, the transport and the plugin link are driven by ONE
-thread, `run()`'s loop. The acceptor thread shares only a locked queue of proven
-links. The RPC answers on its own threads and takes the chain lock (`guard`) for
+thread, `run()`'s loop. The accepting thread and the greeting threads share only
+a locked queue of proven links; each peer's writer shares only its own bounded
+queue.
+
+`/v1/health` carries the engine's own consensus check, published after every
+pass: `gated` (the import gate stands), `stalled` (a record it must keep before
+signing did not reach the device in the last five windows, or the journal is
+broken), `height`, `peers` against `quorum`, and `healthy` over all of them. The
+status stays 200: a readiness probe that took a gated validator off its Service
+would take it off the address its peers dial to anchor it. The RPC answers on its own threads and takes the chain lock (`guard`) for
 every call into the chain; the engine takes the same lock around each VM call and
 never while it waits.
 
@@ -361,6 +408,9 @@ takes α). Use a worktree pinned to the commit you mean and pass
   held proposal and the gate.
 - `engine_test` — one validator against a scripted peer, each refusal against a
   control that shows it is the thing tested.
+- `acceptor_test` — the review's probe of the door, asserting: a greeting has
+  one deadline, runs off the accepting thread, and is capped in all and per
+  source address.
 - `live_test` — five validators on real sockets, each on its own thread: the
   anchor on Zoo mainnet's tip and blocks on it; one seat down; one that imported
   another tip; one that restarts and catches up.
@@ -389,8 +439,11 @@ takes α). Use a worktree pinned to the commit you mean and pass
 
 Clean under ThreadSanitizer (`-DNODE_SANITIZE=thread`, run under `setarch -R`;
 instrumentation covers node + consensus, never blst/bls): `statement`,
-`mesh_transport`, `mesh_formation`, `engine` and `live` report no race — the
-last with five engines, five acceptor threads and a restart in one process.
+`mesh_transport`, `mesh_formation`, `acceptor`, `engine` and `live` report no
+race — the last with five engines and their greeting and writer threads in one
+process. libluxcrypto is a Go c-archive whose heap one OS thread maps and
+another uses under the Go runtime's own ordering, which TSan cannot see, so its
+`_cgo_`/`x_cgo_` frames are suppressed; they are not node's.
 
 ## Conformance to Go
 
@@ -573,7 +626,8 @@ consensus 9928599:
 | one seat down | `live_test` [2]: four of five carry the chain to 803; heights 800 and 802, whose first window is the missing seat's, are built in a later window; the seat starts, lifts its gate on the anchor its peers hold, catches up and goes on |
 | a seat that imported another tip | `live_test` [3]: the other four anchor and build to 805; it anchors nothing, decides nothing, stays gated at its own tip, and its journal holds one statement — its own anchor |
 | a seat restarts | `live_test` [4]: its journal reopens, its peers meet it again, it takes 804..808 on certificates and goes on to 811 with the others |
-| what one validator refuses | `engine_test`: a proposal signed for another's window is never parsed; a refused block is never signed; a gated node builds nothing in its own window and signs only its anchor; a chain that refuses to build does not stop it — each against a control |
+| what one validator refuses | `engine_test`: a proposal signed for another's window is never parsed; a refused block is never signed; a gated node builds nothing in its own window and signs only its anchor; a chain that refuses to build does not stop it; a vote certificate on the tip lifts the gate and one on another block does not; a slot 46 windows ahead on a 2025 parent is not looked at — each against a control |
+| a stranger cannot hold the door | `acceptor_test`: control 20 ms; one trickling stranger, 20 ms, and it is cut at 4 s; twelve silent from one address, 20 ms; twenty from twenty addresses, 3.95 s |
 | processes, the cevm plugin, Zoo mainnet's export | zooai/node `test/live.sh`: five `zood` processes import `zoo-mainnet-200200.rlp` and every one anchors 799 at `0xd6f92941…f72b8`; with seat 3 down four anchor, and seat 3 started later anchors on the ledger answer; a seat that imported the export cut at 798 anchors nothing and stays at 798 |
 | processes, the cevm plugin, transactions | `scripts/cluster.sh`: five `luxd` on the local chain, twelve transactions relayed across the mesh, every validator at height 12 with the same block hash at every height; with seat 2 held down, the same with four |
 | processes, the cevm plugin, an import continued | `scripts/cluster.sh luxd cevm -1 6`: cevm alone builds six blocks into an export (`local_export`); five `luxd` import it, all five anchor height 6, and blocks 7..12 are built on it with the same hash at every height on every seat; with seat 3 held down (`… 3 6`), four anchor and build the same |
@@ -627,9 +681,11 @@ implementation detail.
 - **Pruning.** The journal keeps every statement and reads them all at start
   (226 bytes a height); entries below the accepted tip can go.
 - **A split height.** A height whose honest signers are bound to different
-  blocks, none able to reach α, stays uncertified (Go: "unrecoverable"; left to
-  Nova, which this node does not run). With one seat of five down, α is every
-  seat that is up, so one late sibling at the wrong moment is enough.
+  blocks, none able to reach α, stays uncertified (Go: "unrecoverable",
+  engine.go:1716; left to Nova, which this node does not run). With one seat of
+  five down, α is every seat that is up and the down seat counts forever as one
+  that may still vote, so one late sibling at the wrong moment is enough — Go's
+  and Rust's exposure, kept.
 - **Sampling.** Every validator is polled; there is no photon sampling.
 - **P, X, Q and Z.** The `VM` seam is what they plug into; only the EVM runs.
 

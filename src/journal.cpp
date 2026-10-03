@@ -16,11 +16,24 @@
 
 namespace lux::node {
 
+bool sync_dir(const std::filesystem::path& dir) {
+    const auto at = dir.empty() ? std::filesystem::path(".") : dir;
+    const int  d  = ::open(at.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (d < 0) return false;
+    const bool ok = ::fsync(d) == 0;
+    ::close(d);
+    return ok;
+}
+
 Journal Journal::open(const std::filesystem::path& path) {
     Journal j;
     j.fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (j.fd_ < 0)
         throw std::runtime_error("journal: cannot open " + path.string() + ": " + std::strerror(errno));
+    // The name as well as the bytes: a journal created and then lost with its
+    // directory entry is a validator that forgot what it said.
+    if (!sync_dir(path.parent_path()))
+        throw std::runtime_error("journal: cannot sync the directory of " + path.string());
     if (::flock(j.fd_, LOCK_EX | LOCK_NB) != 0)
         throw std::runtime_error("journal: " + path.string() + " is held by another process");
 

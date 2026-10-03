@@ -250,6 +250,9 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #   wire_vector     the bytes on the wire, written from the spec and read off a socket
 #   mesh_transport  what one hostile or dead socket can do to this node
 #   mesh_formation  mesh setup is bounded, and a missing validator is not a dead cluster
+#   acceptor        a greeting has one deadline, runs off the accepting thread,
+#                   and is capped in all and per source: a stranger cannot hold
+#                   the door (the review's probe, asserting)
 #   windower        Go's proposer schedule, held to windower_test.go's vectors
 #   statement       the vote and the anchor, their domain, the journal both go
 #                   through, the certificate rule, the ledger and held records
@@ -276,7 +279,7 @@ target_compile_options(lux-join PRIVATE -Wall -Wextra)
 #                   and driven through a height over ZAP
 enable_testing()
 
-set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation hostile_decode set_root committee chain_route archive_proxy pq_handshake pq_vector run windower statement live engine)
+set(NODE_TESTS frame_reader wire_vector mesh_transport mesh_formation acceptor hostile_decode set_root committee chain_route archive_proxy pq_handshake pq_vector run windower statement live engine)
 foreach(_t ${NODE_TESTS})
     add_executable(${_t}_test test/${_t}_test.cpp)
     target_link_libraries(${_t}_test PRIVATE node)
